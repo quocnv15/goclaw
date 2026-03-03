@@ -1,0 +1,13 @@
+{
+  "folders": [
+    {
+      "path": "."
+    },
+    {
+      "path": "../ios-kit"
+    },
+    {
+      "path": "../ios-knowledge"
+    }
+  ]
+}
