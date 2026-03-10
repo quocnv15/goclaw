@@ -15,10 +15,42 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
+// filteredToolNames returns tool names after applying policy filters.
+// Used for system prompt so denied tools don't appear in ## Tooling section.
+func (l *Loop) filteredToolNames() []string {
+	if l.toolPolicy == nil {
+		return l.tools.List()
+	}
+	defs := l.toolPolicy.FilterTools(l.tools, l.id, l.provider.Name(), l.agentToolPolicy, nil, false, false)
+	names := make([]string, len(defs))
+	for i, d := range defs {
+		names[i] = d.Function.Name
+	}
+	return names
+}
+
+// buildMCPToolDescs extracts real descriptions for MCP tools from the registry.
+// Returns nil if no MCP tools are present.
+func (l *Loop) buildMCPToolDescs(toolNames []string) map[string]string {
+	descs := make(map[string]string)
+	for _, name := range toolNames {
+		if !strings.HasPrefix(name, "mcp_") || name == "mcp_tool_search" {
+			continue
+		}
+		if tool, ok := l.tools.Get(name); ok {
+			descs[name] = tool.Description()
+		}
+	}
+	if len(descs) == 0 {
+		return nil
+	}
+	return descs
+}
+
 // buildMessages constructs the full message list for an LLM request.
 // Returns the messages and whether BOOTSTRAP.md was present in context files
 // (used by the caller for auto-cleanup without an extra DB roundtrip).
-func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, summary, userMessage, extraSystemPrompt, sessionKey, channel, userID string, historyLimit int, skillFilter []string) ([]providers.Message, bool) {
+func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, summary, userMessage, extraSystemPrompt, sessionKey, channel, channelType, peerKind, userID string, historyLimit int, skillFilter []string) ([]providers.Message, bool) {
 	var messages []providers.Message
 
 	// Build full system prompt using the new builder (matching TS buildAgentSystemPrompt)
@@ -29,8 +61,10 @@ func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, s
 
 	_, hasSpawn := l.tools.Get("spawn")
 	_, hasSkillSearch := l.tools.Get("skill_search")
+	_, hasMCPToolSearch := l.tools.Get("mcp_tool_search")
+	_, hasKG := l.tools.Get("knowledge_graph_search")
 
-	// Per-user workspace: show the user's subdirectory in the system prompt (managed mode).
+	// Per-user workspace: show the user's subdirectory in the system prompt.
 	// Uses cached workspace from user_agent_profiles (includes channel isolation).
 	promptWorkspace := l.workspace
 	if l.agentUUID != uuid.Nil && userID != "" && l.workspace != "" {
@@ -51,7 +85,7 @@ func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, s
 		}
 	}
 
-	// Group writer restrictions: filter context files + inject prompt (managed mode only)
+	// Group writer restrictions: filter context files + inject prompt
 	if l.groupWriterCache != nil && strings.HasPrefix(userID, "group:") {
 		senderID := store.SenderIDFromContext(ctx)
 		writerPrompt, filtered := l.buildGroupWriterPrompt(ctx, userID, senderID, contextFiles)
@@ -64,23 +98,37 @@ func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, s
 		}
 	}
 
+	// Build MCP tool descriptions for inline mode (not search mode).
+	toolNames := l.filteredToolNames()
+	var mcpToolDescs map[string]string
+	if !hasMCPToolSearch {
+		mcpToolDescs = l.buildMCPToolDescs(toolNames)
+	}
+
 	systemPrompt := BuildSystemPrompt(SystemPromptConfig{
-		AgentID:        l.id,
-		Model:          l.model,
-		Workspace:      promptWorkspace,
-		Channel:        channel,
-		OwnerIDs:       l.ownerIDs,
-		Mode:           mode,
-		ToolNames:      l.tools.List(),
-		SkillsSummary:  l.resolveSkillsSummary(skillFilter),
-		HasMemory:      l.hasMemory,
-		HasSpawn:       l.tools != nil && hasSpawn,
-		HasSkillSearch: hasSkillSearch,
-		ContextFiles:   contextFiles,
-		ExtraPrompt:    extraSystemPrompt,
-		SandboxEnabled:        l.sandboxEnabled,
-		SandboxContainerDir:   l.sandboxContainerDir,
+		AgentID:                l.id,
+		Model:                  l.model,
+		Workspace:              promptWorkspace,
+		Channel:                channel,
+		ChannelType:            channelType,
+		PeerKind:               peerKind,
+		OwnerIDs:               l.ownerIDs,
+		Mode:                   mode,
+		ToolNames:              toolNames,
+		SkillsSummary:          l.resolveSkillsSummary(skillFilter),
+		HasMemory:              l.hasMemory,
+		HasSpawn:               l.tools != nil && hasSpawn,
+		HasSkillSearch:         hasSkillSearch,
+		HasMCPToolSearch:       hasMCPToolSearch,
+		HasKnowledgeGraph:      hasKG,
+		MCPToolDescs:           mcpToolDescs,
+		ContextFiles:           contextFiles,
+		AgentType:              l.agentType,
+		ExtraPrompt:            extraSystemPrompt,
+		SandboxEnabled:         l.sandboxEnabled,
+		SandboxContainerDir:    l.sandboxContainerDir,
 		SandboxWorkspaceAccess: l.sandboxWorkspaceAccess,
+		SelfEvolve:             l.selfEvolve,
 	})
 
 	messages = append(messages, providers.Message{
@@ -349,25 +397,47 @@ func (l *Loop) maybeSummarize(ctx context.Context, sessionKey string) {
 		summary := l.sessions.GetSummary(sessionKey)
 		toSummarize := history[:len(history)-keepLast]
 
-		var sb string
+		var sb strings.Builder
+		var mediaKinds []string
 		for _, m := range toSummarize {
 			if m.Role == "user" {
-				sb += fmt.Sprintf("user: %s\n", m.Content)
+				sb.WriteString(fmt.Sprintf("user: %s\n", m.Content))
 			} else if m.Role == "assistant" {
-				sb += fmt.Sprintf("assistant: %s\n", SanitizeAssistantContent(m.Content))
+				sb.WriteString(fmt.Sprintf("assistant: %s\n", SanitizeAssistantContent(m.Content)))
+			}
+			for _, ref := range m.MediaRefs {
+				mediaKinds = append(mediaKinds, ref.Kind)
 			}
 		}
 
-		prompt := "Provide a concise summary of this conversation, preserving key context:\n"
-		if summary != "" {
-			prompt += "Existing context: " + summary + "\n"
+		var prompt strings.Builder
+		prompt.WriteString("Provide a concise summary of this conversation, preserving key context:\n")
+		if len(mediaKinds) > 0 {
+			// Deduplicate and count media types for a compact note.
+			counts := make(map[string]int)
+			for _, k := range mediaKinds {
+				counts[k]++
+			}
+			prompt.WriteString("\nNote: user shared media files (")
+			first := true
+			for k, n := range counts {
+				if !first {
+					prompt.WriteString(", ")
+				}
+				prompt.WriteString(fmt.Sprintf("%d %s(s)", n, k))
+				first = false
+			}
+			prompt.WriteString(") which are no longer in context. Mention briefly if relevant.\n")
 		}
-		prompt += "\n" + sb
+		if summary != "" {
+			prompt.WriteString("Existing context: " + summary + "\n")
+		}
+		prompt.WriteString("\n" + sb.String())
 
 		resp, err := l.provider.Chat(sctx, providers.ChatRequest{
-			Messages: []providers.Message{{Role: "user", Content: prompt}},
+			Messages: []providers.Message{{Role: "user", Content: prompt.String()}},
 			Model:    l.model,
-			Options:  map[string]interface{}{"max_tokens": 1024, "temperature": 0.3},
+			Options:  map[string]any{"max_tokens": 1024, "temperature": 0.3},
 		})
 		if err != nil {
 			slog.Warn("summarization failed", "session", sessionKey, "error", err)
@@ -387,6 +457,17 @@ func (l *Loop) buildGroupWriterPrompt(ctx context.Context, groupID, senderID str
 	writers, err := l.groupWriterCache.ListWriters(ctx, l.agentUUID, groupID)
 	if err != nil || len(writers) == 0 {
 		return "", files // fail-open
+	}
+
+	// System-initiated runs (cron, delegate, subagent) have no sender ID.
+	// Allow reading, messaging, and tool use freely, but still protect
+	// identity files (SOUL.md, IDENTITY.md, etc.) from modification.
+	if senderID == "" {
+		var sb strings.Builder
+		sb.WriteString("## Group File Permissions\n\n")
+		sb.WriteString("This is a system-initiated run (cron/scheduled task). You may read files, send messages, and use tools freely.\n")
+		sb.WriteString("However, do NOT modify protected identity files (SOUL.md, IDENTITY.md, AGENTS.md, USER.md) unless explicitly instructed by the task.\n")
+		return sb.String(), files
 	}
 
 	numericID := strings.SplitN(senderID, "|", 2)[0]

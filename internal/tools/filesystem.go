@@ -17,8 +17,8 @@ import (
 // virtualSystemFiles are files dynamically injected into the system prompt.
 // They don't exist on disk — if the model tries to read them, return a hint.
 var virtualSystemFiles = map[string]string{
-	bootstrap.TeamFile:       "TEAM.md is already loaded in your system prompt. Refer to the TEAM.md section in your context above for team member information.",
-	bootstrap.DelegationFile: "DELEGATION.md is already loaded in your system prompt. Refer to the DELEGATION.md section in your context above for delegation instructions and available agents.",
+	bootstrap.TeamFile:         "TEAM.md is already loaded in your system prompt. Refer to the TEAM.md section in your context above for team member information.",
+	bootstrap.DelegationFile:   "DELEGATION.md is already loaded in your system prompt. Refer to the DELEGATION.md section in your context above for delegation instructions and available agents.",
 	bootstrap.AvailabilityFile: "AVAILABILITY.md is already loaded in your system prompt. Refer to the AVAILABILITY.md section in your context above for agent availability information.",
 }
 
@@ -26,25 +26,25 @@ var virtualSystemFiles = map[string]string{
 type ReadFileTool struct {
 	workspace        string
 	restrict         bool
-	allowedPrefixes  []string              // extra allowed path prefixes (e.g. skills dirs)
-	deniedPrefixes   []string              // path prefixes to deny access to (e.g. .goclaw)
-	sandboxMgr       sandbox.Manager       // nil = direct host access
-	contextFileIntc  *ContextFileInterceptor // nil = no virtual FS routing (standalone mode)
-	memIntc          *MemoryInterceptor      // nil = no memory routing (standalone mode)
-	groupWriterCache *store.GroupWriterCache  // nil = no group read restriction (standalone mode)
+	allowedPrefixes  []string                // extra allowed path prefixes (e.g. skills dirs)
+	deniedPrefixes   []string                // path prefixes to deny access to (e.g. .goclaw)
+	sandboxMgr       sandbox.Manager         // nil = direct host access
+	contextFileIntc  *ContextFileInterceptor // nil = no virtual FS routing
+	memIntc          *MemoryInterceptor      // nil = no memory routing
+	groupWriterCache *store.GroupWriterCache // nil = no group read restriction
 }
 
-// SetContextFileInterceptor enables virtual FS routing for context files (managed mode).
+// SetContextFileInterceptor enables virtual FS routing for context files.
 func (t *ReadFileTool) SetContextFileInterceptor(intc *ContextFileInterceptor) {
 	t.contextFileIntc = intc
 }
 
-// SetMemoryInterceptor enables virtual FS routing for memory files (managed mode).
+// SetMemoryInterceptor enables virtual FS routing for memory files.
 func (t *ReadFileTool) SetMemoryInterceptor(intc *MemoryInterceptor) {
 	t.memIntc = intc
 }
 
-// SetGroupWriterCache enables group read restriction for SOUL.md/AGENTS.md (managed mode).
+// SetGroupWriterCache enables group read restriction for SOUL.md/AGENTS.md.
 func (t *ReadFileTool) SetGroupWriterCache(c *store.GroupWriterCache) {
 	t.groupWriterCache = c
 }
@@ -73,11 +73,11 @@ func (t *ReadFileTool) SetSandboxKey(key string) {}
 
 func (t *ReadFileTool) Name() string        { return "read_file" }
 func (t *ReadFileTool) Description() string { return "Read the contents of a file" }
-func (t *ReadFileTool) Parameters() map[string]interface{} {
-	return map[string]interface{}{
+func (t *ReadFileTool) Parameters() map[string]any {
+	return map[string]any{
 		"type": "object",
-		"properties": map[string]interface{}{
-			"path": map[string]interface{}{
+		"properties": map[string]any{
+			"path": map[string]any{
 				"type":        "string",
 				"description": "Path to the file to read",
 			},
@@ -86,13 +86,13 @@ func (t *ReadFileTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *ReadFileTool) Execute(ctx context.Context, args map[string]interface{}) *Result {
+func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result {
 	path, _ := args["path"].(string)
 	if path == "" {
 		return ErrorResult("path is required")
 	}
 
-	// Group read restriction: block non-writers from reading SOUL.md/AGENTS.md (managed mode)
+	// Group read restriction: block non-writers from reading SOUL.md/AGENTS.md
 	if t.groupWriterCache != nil {
 		base := filepath.Base(path)
 		if base == bootstrap.SoulFile || base == bootstrap.AgentsFile {
@@ -102,7 +102,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]interface{})
 		}
 	}
 
-	// Virtual FS: route context files to DB (managed mode)
+	// Virtual FS: route context files to DB
 	if t.contextFileIntc != nil {
 		if content, handled, err := t.contextFileIntc.ReadFile(ctx, path); handled {
 			if err != nil {
@@ -122,7 +122,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]interface{})
 		return SilentResult(hint)
 	}
 
-	// Virtual FS: route memory files to DB (managed mode)
+	// Virtual FS: route memory files to DB
 	if t.memIntc != nil {
 		if content, handled, err := t.memIntc.ReadFile(ctx, path); handled {
 			if err != nil {
@@ -141,7 +141,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]interface{})
 		return t.executeInSandbox(ctx, path, sandboxKey)
 	}
 
-	// Host execution — use per-user workspace from context if available (managed mode)
+	// Host execution — use per-user workspace from context if available
 	workspace := ToolWorkspaceFromCtx(ctx)
 	if workspace == "" {
 		workspace = t.workspace

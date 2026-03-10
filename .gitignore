@@ -19,7 +19,7 @@ app
 browser-poc
 openclaw-go
 goclaw
-config.json
+/config.json
 prompt.md
 *.bk.*
 
@@ -37,3 +37,8 @@ deploy-*.sh
 
 docs/technical-diaries
 plans
+release-manifest.json
+k8s/
+
+# Test credentials (never commit)
+tests/**/creds.json

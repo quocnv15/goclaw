@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,39 +15,34 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/scheduler"
 	"github.com/nextlevelbuilder/goclaw/internal/sessions"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
-
-// makeSchedulerRunFunc creates the RunFunc for the scheduler.
-// It extracts the agentID from the session key and routes to the correct agent loop.
-func makeSchedulerRunFunc(agents *agent.Router, cfg *config.Config) scheduler.RunFunc {
-	return func(ctx context.Context, req agent.RunRequest) (*agent.RunResult, error) {
-		// Extract agentID from session key (format: agent:{agentId}:{rest})
-		agentID := cfg.ResolveDefaultAgentID()
-		if parts := strings.SplitN(req.SessionKey, ":", 3); len(parts) >= 2 && parts[0] == "agent" {
-			agentID = parts[1]
-		}
-
-		loop, err := agents.Get(agentID)
-		if err != nil {
-			return nil, fmt.Errorf("agent %s not found: %w", agentID, err)
-		}
-		return loop.Run(ctx, req)
-	}
-}
 
 // consumeInboundMessages reads inbound messages from channels (Telegram, Discord, etc.)
 // and routes them through the scheduler/agent loop, then publishes the response back.
 // Also handles subagent announcements: routes them through the parent agent's session
 // (matching TS subagent-announce.ts pattern) so the agent can reformulate for the user.
-func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents *agent.Router, cfg *config.Config, sched *scheduler.Scheduler, channelMgr *channels.Manager, teamStore store.TeamStore) {
+func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents *agent.Router, cfg *config.Config, sched *scheduler.Scheduler, channelMgr *channels.Manager, teamStore store.TeamStore, quotaChecker *channels.QuotaChecker, delegateMgr *tools.DelegateManager, sessStore store.SessionStore, agentStore store.AgentStore, contactCollector *store.ContactCollector) {
 	slog.Info("inbound message consumer started")
 
 	// Inbound message deduplication (matching TS src/infra/dedupe.ts + inbound-dedupe.ts).
 	// TTL=20min, max=5000 entries — prevents webhook retries / double-taps from duplicating agent runs.
 	dedupe := bus.NewDedupeCache(20*time.Minute, 5000)
+
+	// Per-session announce serialization: prevents concurrent announce runs from
+	// reading stale session history. Without this, Announce #2 can start while
+	// Announce #1 is still running, read history that doesn't include Announce #1's
+	// messages (written only after agent loop completes), and generate responses
+	// with wrong context (e.g. "waiting for Tiểu La" when Tiểu La already finished).
+	var announceMu sync.Map // sessionKey → *sync.Mutex
+	getAnnounceMu := func(key string) *sync.Mutex {
+		v, _ := announceMu.LoadOrStore(key, &sync.Mutex{})
+		return v.(*sync.Mutex)
+	}
 
 	// processNormalMessage handles routing, scheduling, and response delivery for a single
 	// (possibly merged) inbound message. Called directly by the debouncer's flush callback.
@@ -57,7 +53,7 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			agentID = resolveAgentRoute(cfg, msg.Channel, msg.ChatID, msg.PeerKind)
 		}
 
-		// Check handoff routing override (managed mode only)
+		// Check handoff routing override
 		if teamStore != nil && msg.AgentID == "" {
 			if route, _ := teamStore.GetHandoffRoute(ctx, msg.Channel, msg.ChatID); route != nil {
 				agentID = route.ToAgentKey
@@ -66,7 +62,8 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			}
 		}
 
-		if _, err := agents.Get(agentID); err != nil {
+		agentLoop, err := agents.Get(agentID)
+		if err != nil {
 			slog.Warn("inbound: agent not found", "agent", agentID, "channel", msg.Channel)
 			return
 		}
@@ -112,6 +109,54 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			userID = fmt.Sprintf("group:%s:%s", msg.Channel, groupID)
 		}
 
+		// Persist friendly names from channel metadata into session + user profile.
+		sessionMeta := extractSessionMetadata(msg, peerKind)
+		if len(sessionMeta) > 0 {
+			sessStore.SetSessionMetadata(sessionKey, sessionMeta)
+			if agentStore != nil {
+				if agentUUID, err := uuid.Parse(agentID); err == nil && agentUUID != uuid.Nil {
+					_ = agentStore.UpdateUserProfileMetadata(ctx, agentUUID, userID, sessionMeta)
+				}
+			}
+		}
+
+		// Auto-collect channel contacts for the contact selector.
+		if contactCollector != nil && msg.SenderID != "" {
+			senderNumericID := msg.SenderID
+			if idx := strings.IndexByte(senderNumericID, '|'); idx > 0 {
+				senderNumericID = senderNumericID[:idx]
+			}
+			channelType := channelMgr.ChannelTypeForName(msg.Channel)
+			if channelType == "" {
+				channelType = msg.Channel // fallback to instance name
+			}
+			displayName := sessionMeta["display_name"]
+			username := sessionMeta["username"]
+			contactCollector.EnsureContact(ctx, channelType, msg.Channel, senderNumericID, userID, displayName, username, peerKind)
+		}
+
+		// --- Quota check ---
+		if quotaChecker != nil {
+			qResult := quotaChecker.Check(ctx, userID, msg.Channel, agentLoop.ProviderName())
+			if !qResult.Allowed {
+				slog.Warn("security.quota_exceeded",
+					"user_id", userID,
+					"channel", msg.Channel,
+					"window", qResult.Window,
+					"used", qResult.Used,
+					"limit", qResult.Limit,
+				)
+				msgBus.PublishOutbound(bus.OutboundMessage{
+					Channel:  msg.Channel,
+					ChatID:   msg.ChatID,
+					Content:  formatQuotaExceeded(qResult),
+					Metadata: msg.Metadata,
+				})
+				return
+			}
+			quotaChecker.Increment(userID)
+		}
+
 		slog.Info("inbound: scheduling message (main lane)",
 			"channel", msg.Channel,
 			"chat_id", msg.ChatID,
@@ -122,11 +167,9 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 		)
 
 		// Enable streaming when the channel supports it (so agent emits chunk events).
-		// Group chats: streaming disabled (concurrent runs would interleave chunks).
-		enableStream := channelMgr != nil && channelMgr.IsStreamingChannel(msg.Channel)
-		if peerKind == string(sessions.PeerGroup) {
-			enableStream = false
-		}
+		// The channel decides per chat type via separate dm_stream / group_stream flags.
+		isGroup := peerKind == string(sessions.PeerGroup)
+		enableStream := channelMgr != nil && channelMgr.IsStreamingChannel(msg.Channel, isGroup)
 
 		// Group chats allow concurrent runs (multiple users can chat simultaneously).
 		maxConcurrent := 1
@@ -136,19 +179,32 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 
 		runID := fmt.Sprintf("inbound-%s-%s-%s", msg.Channel, msg.ChatID, uuid.NewString()[:8])
 
+		// Build outbound metadata for reply-to + thread routing BEFORE RegisterRun
+		// so block.reply handler can use it for routing intermediate messages.
+		outMeta := make(map[string]string)
+		if isGroup {
+			if mid := msg.Metadata["message_id"]; mid != "" {
+				outMeta["reply_to_message_id"] = mid
+			}
+		}
+		for _, k := range []string{"message_thread_id", "local_key", "placeholder_key", "group_id"} {
+			if v := msg.Metadata[k]; v != "" {
+				outMeta[k] = v
+			}
+		}
+
 		// Register run with channel manager for streaming/reaction event forwarding.
 		// Use localKey (composite key with topic suffix) so streaming/reaction events
 		// route to the correct per-topic state in the channel.
-		messageID := 0
-		if mid := msg.Metadata["message_id"]; mid != "" {
-			fmt.Sscanf(mid, "%d", &messageID)
-		}
+		messageID := msg.Metadata["message_id"]
 		chatIDForRun := msg.ChatID
 		if lk := msg.Metadata["local_key"]; lk != "" {
 			chatIDForRun = lk
 		}
+		blockReply := channelMgr != nil && channelMgr.ResolveBlockReply(msg.Channel, cfg.Gateway.BlockReply)
+		toolStatus := cfg.Gateway.ToolStatus == nil || *cfg.Gateway.ToolStatus // default true
 		if channelMgr != nil {
-			channelMgr.RegisterRun(runID, msg.Channel, chatIDForRun, messageID)
+			channelMgr.RegisterRun(runID, msg.Channel, chatIDForRun, messageID, outMeta, enableStream, blockReply, toolStatus)
 		}
 
 		// Group-aware system prompt: help the LLM adapt tone and behavior for group chats.
@@ -177,11 +233,52 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 
 		// Delegation announces carry media as ForwardMedia (not deleted, forwarded to output).
 		// User-uploaded media goes in Media (loaded as images for LLM, then deleted).
-		var reqMedia, fwdMedia []string
+		var reqMedia, fwdMedia []bus.MediaFile
 		if msg.Metadata["delegation_id"] != "" || msg.Metadata["subagent_id"] != "" {
 			fwdMedia = msg.Media
 		} else {
 			reqMedia = msg.Media
+		}
+
+		// Intent classify fast-path: when agent is busy on DM, classify user intent
+		// to detect status queries, cancel requests, etc. without queueing.
+		// Only for DM (maxConcurrent=1) where messages queue behind the active run.
+		intentClassifyEnabled := cfg.Agents.Defaults.IntentClassify == nil || *cfg.Agents.Defaults.IntentClassify
+		if intentClassifyEnabled && maxConcurrent == 1 && agents.IsSessionBusy(sessionKey) {
+			if loop, ok := agentLoop.(*agent.Loop); ok && loop.Provider() != nil {
+				locale := msg.Metadata["locale"]
+				if locale == "" {
+					locale = "en"
+				}
+				intent := agent.ClassifyIntent(ctx, loop.Provider(), loop.Model(), msg.Content)
+				switch intent {
+				case agent.IntentStatusQuery:
+					status := agents.GetActivity(sessionKey)
+					reply := agent.FormatStatusReply(status, locale)
+					msgBus.PublishOutbound(bus.OutboundMessage{
+						Channel:  msg.Channel,
+						ChatID:   msg.ChatID,
+						Content:  reply,
+						Metadata: outMeta,
+					})
+					return
+				case agent.IntentCancel:
+					aborted := agents.AbortRunsForSession(sessionKey)
+					if len(aborted) > 0 {
+						slog.Info("inbound: cancelled runs via intent classify",
+							"session", sessionKey, "aborted", aborted)
+						msgBus.PublishOutbound(bus.OutboundMessage{
+							Channel:  msg.Channel,
+							ChatID:   msg.ChatID,
+							Content:  i18n.T(locale, i18n.MsgCancelledReply),
+							Metadata: outMeta,
+						})
+					}
+					return
+				default:
+					// steer / new_task → queue as normal
+				}
+			}
 		}
 
 		// Schedule through main lane (per-session concurrency controlled by maxConcurrent)
@@ -191,6 +288,7 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			Media:             reqMedia,
 			ForwardMedia:      fwdMedia,
 			Channel:           msg.Channel,
+			ChannelType:       resolveChannelType(channelMgr, msg.Channel),
 			ChatID:            msg.ChatID,
 			PeerKind:          peerKind,
 			LocalKey:          msg.Metadata["local_key"],
@@ -206,20 +304,8 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			MaxConcurrent: maxConcurrent,
 		})
 
-		// Build outbound metadata for reply-to + thread routing.
-		// message_id → reply_to_message_id so Send() replies to user's message.
-		outMeta := make(map[string]string)
-		if mid := msg.Metadata["message_id"]; mid != "" {
-			outMeta["reply_to_message_id"] = mid
-		}
-		for _, k := range []string{"message_thread_id", "local_key", "placeholder_key"} {
-			if v := msg.Metadata[k]; v != "" {
-				outMeta[k] = v
-			}
-		}
-
 		// Handle result asynchronously to not block the flush callback.
-		go func(channel, chatID, session, rID string, meta map[string]string) {
+		go func(channel, chatID, session, rID string, meta map[string]string, blockReplyEnabled bool) {
 			outcome := <-outCh
 
 			// Clean up run tracking (in case HandleAgentEvent didn't fire for terminal events)
@@ -267,6 +353,21 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 				return
 			}
 
+			// Dedup: if block replies were delivered and the final content matches the last
+			// block reply, suppress the final message to avoid duplicate delivery.
+			// Only applies when blockReply is enabled (otherwise nothing was delivered).
+			if blockReplyEnabled && outcome.Result.BlockReplies > 0 && outcome.Result.Content == outcome.Result.LastBlockReply && len(outcome.Result.Media) == 0 {
+				slog.Debug("inbound: dedup final message (matches last block reply)",
+					"channel", channel, "run_id", rID)
+				msgBus.PublishOutbound(bus.OutboundMessage{
+					Channel:  channel,
+					ChatID:   chatID,
+					Content:  "",
+					Metadata: meta,
+				})
+				return
+			}
+
 			// Publish response back to the channel
 			outMsg := bus.OutboundMessage{
 				Channel:  channel,
@@ -275,22 +376,10 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 				Metadata: meta,
 			}
 
-			// Convert media results from agent run to outbound media attachments
-			for _, mr := range outcome.Result.Media {
-				outMsg.Media = append(outMsg.Media, bus.MediaAttachment{
-					URL:         mr.Path,
-					ContentType: mr.ContentType,
-				})
-				if mr.AsVoice {
-					if outMsg.Metadata == nil {
-						outMsg.Metadata = make(map[string]string)
-					}
-					outMsg.Metadata["audio_as_voice"] = "true"
-				}
-			}
+			appendMediaToOutbound(&outMsg, outcome.Result.Media)
 
 			msgBus.PublishOutbound(outMsg)
-		}(msg.Channel, msg.ChatID, sessionKey, runID, outMeta)
+		}(msg.Channel, msg.ChatID, sessionKey, runID, outMeta, blockReply)
 	}
 
 	// Inbound debounce: merge rapid messages from the same sender before processing.
@@ -328,6 +417,7 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			origChannel := msg.Metadata["origin_channel"]
 			origPeerKind := msg.Metadata["origin_peer_kind"]
 			origLocalKey := msg.Metadata["origin_local_key"]
+			origChannelType := resolveChannelType(channelMgr, origChannel)
 			parentAgent := msg.Metadata["parent_agent"]
 			if parentAgent == "" {
 				parentAgent = "default"
@@ -341,11 +431,13 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 				continue
 			}
 
-			// Use SAME session as user's original chat so agent has context.
-			sessionKey := sessions.BuildScopedSessionKey(parentAgent, origChannel, sessions.PeerKind(origPeerKind), msg.ChatID, cfg.Sessions.Scope, cfg.Sessions.DmScope, cfg.Sessions.MainKey)
-
-			// Override session key for forum topics / DM threads (same logic as main lane).
-			sessionKey = overrideSessionKeyFromLocalKey(sessionKey, origLocalKey, parentAgent, origChannel, msg.ChatID, origPeerKind)
+			// Use exact origin session key if available (WS uses non-standard format).
+			sessionKey := msg.Metadata["origin_session_key"]
+			if sessionKey == "" {
+				// Fallback: rebuild session key from origin metadata (works for Telegram, Discord, etc.)
+				sessionKey = sessions.BuildScopedSessionKey(parentAgent, origChannel, sessions.PeerKind(origPeerKind), msg.ChatID, cfg.Sessions.Scope, cfg.Sessions.DmScope, cfg.Sessions.MainKey)
+				sessionKey = overrideSessionKeyFromLocalKey(sessionKey, origLocalKey, parentAgent, origChannel, msg.ChatID, origPeerKind)
+			}
 
 			slog.Info("subagent announce → scheduler (subagent lane)",
 				"subagent", msg.SenderID,
@@ -371,26 +463,50 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			// Build outbound metadata for topic/thread routing.
 			outMeta := buildAnnounceOutMeta(origLocalKey)
 
-			// Schedule through subagent lane
-			outCh := sched.Schedule(ctx, scheduler.LaneSubagent, agent.RunRequest{
+			// Build request before goroutine to capture msg fields.
+			// WS channel has no outbound handler — media converted to markdown URLs
+			// and appended to the assistant response via ContentSuffix, which the
+			// agent loop applies BEFORE saving to session and emitting run.completed.
+			fwdMedia := msg.Media
+			contentSuffix := ""
+			if origChannel == "ws" && len(msg.Media) > 0 {
+				contentSuffix = mediaToMarkdownFromPaths(msg.Media, cfg)
+				fwdMedia = nil // WS: images delivered via ContentSuffix, not ForwardMedia
+			}
+
+			announceReq := agent.RunRequest{
 				SessionKey:       sessionKey,
 				Message:          msg.Content,
-				ForwardMedia:     msg.Media,
+				ForwardMedia:     fwdMedia,
+				ContentSuffix:    contentSuffix,
 				Channel:          origChannel,
+				ChannelType:      origChannelType,
 				ChatID:           msg.ChatID,
 				PeerKind:         origPeerKind,
 				LocalKey:         origLocalKey,
 				UserID:           announceUserID,
 				RunID:            fmt.Sprintf("announce-%s", msg.SenderID),
+				RunKind:          "announce",
+				HideInput:        true, // don't persist raw system message in chat history
 				Stream:           false,
 				ParentTraceID:    parentTraceID,
 				ParentRootSpanID: parentRootSpanID,
-			})
+			}
+			// Handle announce asynchronously with per-session serialization.
+			// The mutex ensures concurrent announces for the same session wait for
+			// each other, so each reads up-to-date session history.
+			go func(sessionKey, origCh, chatID, senderID, label string, meta map[string]string, req agent.RunRequest) {
+				mu := getAnnounceMu(sessionKey)
+				mu.Lock()
+				defer mu.Unlock()
 
-			// Handle result asynchronously to not block the consumer loop
-			go func(origCh, chatID, senderID, label string, meta map[string]string) {
+				outCh := sched.Schedule(ctx, scheduler.LaneSubagent, req)
 				outcome := <-outCh
 				if outcome.Err != nil {
+					if errors.Is(outcome.Err, context.Canceled) {
+						slog.Info("subagent announce: run cancelled", "subagent", senderID)
+						return
+					}
 					slog.Error("subagent announce: agent run failed", "error", outcome.Err)
 					msgBus.PublishOutbound(bus.OutboundMessage{
 						Channel:  origCh,
@@ -416,20 +532,16 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 				if isSilent {
 					announceContent = "" // suppress NO_REPLY text but still send media
 				}
+
 				outMsg := bus.OutboundMessage{
 					Channel:  origCh,
 					ChatID:   chatID,
 					Content:  announceContent,
 					Metadata: meta,
 				}
-				for _, mr := range outcome.Result.Media {
-					outMsg.Media = append(outMsg.Media, bus.MediaAttachment{
-						URL:         mr.Path,
-						ContentType: mr.ContentType,
-					})
-				}
+				appendMediaToOutbound(&outMsg, outcome.Result.Media)
 				msgBus.PublishOutbound(outMsg)
-			}(origChannel, msg.ChatID, msg.SenderID, msg.Metadata["subagent_label"], outMeta)
+			}(sessionKey, origChannel, msg.ChatID, msg.SenderID, msg.Metadata["subagent_label"], outMeta, announceReq)
 			continue
 		}
 
@@ -439,6 +551,7 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			origChannel := msg.Metadata["origin_channel"]
 			origPeerKind := msg.Metadata["origin_peer_kind"]
 			origLocalKey := msg.Metadata["origin_local_key"]
+			origChannelType := resolveChannelType(channelMgr, origChannel)
 			parentAgent := msg.Metadata["parent_agent"]
 			if parentAgent == "" {
 				parentAgent = "default"
@@ -452,10 +565,13 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 				continue
 			}
 
-			sessionKey := sessions.BuildScopedSessionKey(parentAgent, origChannel, sessions.PeerKind(origPeerKind), msg.ChatID, cfg.Sessions.Scope, cfg.Sessions.DmScope, cfg.Sessions.MainKey)
-
-			// Override session key for forum topics / DM threads.
-			sessionKey = overrideSessionKeyFromLocalKey(sessionKey, origLocalKey, parentAgent, origChannel, msg.ChatID, origPeerKind)
+			// Use exact origin session key if available (WS uses non-standard format).
+			sessionKey := msg.Metadata["origin_session_key"]
+			if sessionKey == "" {
+				// Fallback: rebuild session key from origin metadata (works for Telegram, Discord, etc.)
+				sessionKey = sessions.BuildScopedSessionKey(parentAgent, origChannel, sessions.PeerKind(origPeerKind), msg.ChatID, cfg.Sessions.Scope, cfg.Sessions.DmScope, cfg.Sessions.MainKey)
+				sessionKey = overrideSessionKeyFromLocalKey(sessionKey, origLocalKey, parentAgent, origChannel, msg.ChatID, origPeerKind)
+			}
 
 			slog.Info("delegate announce → scheduler (delegate lane)",
 				"delegation", msg.SenderID,
@@ -480,24 +596,47 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			// Build outbound metadata for topic/thread routing.
 			outMeta := buildAnnounceOutMeta(origLocalKey)
 
-			outCh := sched.Schedule(ctx, scheduler.LaneDelegate, agent.RunRequest{
+			// WS channel has no outbound handler — media injected into session after run.
+			// WS channel has no outbound handler — media delivered via ContentSuffix.
+			fwdMedia := msg.Media
+			contentSuffix := ""
+			if origChannel == "ws" && len(msg.Media) > 0 {
+				contentSuffix = mediaToMarkdownFromPaths(msg.Media, cfg)
+				fwdMedia = nil // WS: images delivered via ContentSuffix, not ForwardMedia
+			}
+
+			announceReq := agent.RunRequest{
 				SessionKey:       sessionKey,
 				Message:          msg.Content,
-				ForwardMedia:     msg.Media,
+				ForwardMedia:     fwdMedia,
+				ContentSuffix:    contentSuffix,
 				Channel:          origChannel,
+				ChannelType:      origChannelType,
 				ChatID:           msg.ChatID,
 				PeerKind:         origPeerKind,
 				LocalKey:         origLocalKey,
 				UserID:           announceUserID,
 				RunID:            fmt.Sprintf("delegate-announce-%s", msg.Metadata["delegation_id"]),
+				RunKind:          "announce",
+				HideInput:        true, // don't persist raw system message in chat history
 				Stream:           false,
 				ParentTraceID:    parentTraceID,
 				ParentRootSpanID: parentRootSpanID,
-			})
+			}
 
-			go func(origCh, chatID, senderID string, meta map[string]string) {
+			// Same per-session serialization as subagent announce above.
+			go func(sessionKey, origCh, chatID, senderID string, meta map[string]string, req agent.RunRequest) {
+				mu := getAnnounceMu(sessionKey)
+				mu.Lock()
+				defer mu.Unlock()
+
+				outCh := sched.Schedule(ctx, scheduler.LaneDelegate, req)
 				outcome := <-outCh
 				if outcome.Err != nil {
+					if errors.Is(outcome.Err, context.Canceled) {
+						slog.Info("delegate announce: run cancelled", "delegation", senderID)
+						return
+					}
 					slog.Error("delegate announce: agent run failed", "error", outcome.Err)
 					msgBus.PublishOutbound(bus.OutboundMessage{
 						Channel:  origCh,
@@ -512,24 +651,21 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 					slog.Info("delegate announce: suppressed silent/empty reply", "delegation", senderID)
 					return
 				}
+
 				announceContent := outcome.Result.Content
 				if isSilent {
 					announceContent = "" // suppress NO_REPLY text but still send media
 				}
+
 				outMsg := bus.OutboundMessage{
 					Channel:  origCh,
 					ChatID:   chatID,
 					Content:  announceContent,
 					Metadata: meta,
 				}
-				for _, mr := range outcome.Result.Media {
-					outMsg.Media = append(outMsg.Media, bus.MediaAttachment{
-						URL:         mr.Path,
-						ContentType: mr.ContentType,
-					})
-				}
+				appendMediaToOutbound(&outMsg, outcome.Result.Media)
 				msgBus.PublishOutbound(outMsg)
-			}(origChannel, msg.ChatID, msg.SenderID, outMeta)
+			}(sessionKey, origChannel, msg.ChatID, msg.SenderID, outMeta, announceReq)
 			continue
 		}
 
@@ -539,6 +675,7 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			origChannel := msg.Metadata["origin_channel"]
 			origPeerKind := msg.Metadata["origin_peer_kind"]
 			origLocalKey := msg.Metadata["origin_local_key"]
+			origChannelType := resolveChannelType(channelMgr, origChannel)
 			targetAgent := msg.AgentID
 			if targetAgent == "" {
 				targetAgent = cfg.ResolveDefaultAgentID()
@@ -569,15 +706,16 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			outMeta := buildAnnounceOutMeta(origLocalKey)
 
 			outCh := sched.Schedule(ctx, scheduler.LaneDelegate, agent.RunRequest{
-				SessionKey: sessionKey,
-				Message:    msg.Content,
-				Channel:    origChannel,
-				ChatID:     msg.ChatID,
-				PeerKind:   origPeerKind,
-				LocalKey:   origLocalKey,
-				UserID:     announceUserID,
-				RunID:      fmt.Sprintf("handoff-%s", msg.Metadata["handoff_id"]),
-				Stream:     false,
+				SessionKey:  sessionKey,
+				Message:     msg.Content,
+				Channel:     origChannel,
+				ChannelType: origChannelType,
+				ChatID:      msg.ChatID,
+				PeerKind:    origPeerKind,
+				LocalKey:    origLocalKey,
+				UserID:      announceUserID,
+				RunID:       fmt.Sprintf("handoff-%s", msg.Metadata["handoff_id"]),
+				Stream:      false,
 			})
 
 			go func(origCh, chatID string, meta map[string]string) {
@@ -586,15 +724,17 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 					slog.Error("handoff announce: agent run failed", "error", outcome.Err)
 					return
 				}
-				if outcome.Result.Content == "" || agent.IsSilentReply(outcome.Result.Content) {
+				if (outcome.Result.Content == "" && len(outcome.Result.Media) == 0) || agent.IsSilentReply(outcome.Result.Content) {
 					return
 				}
-				msgBus.PublishOutbound(bus.OutboundMessage{
+				outMsg := bus.OutboundMessage{
 					Channel:  origCh,
 					ChatID:   chatID,
 					Content:  outcome.Result.Content,
 					Metadata: meta,
-				})
+				}
+				appendMediaToOutbound(&outMsg, outcome.Result.Media)
+				msgBus.PublishOutbound(outMsg)
 			}(origChannel, msg.ChatID, outMeta)
 			continue
 		}
@@ -605,6 +745,7 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			origChannel := msg.Metadata["origin_channel"]
 			origPeerKind := msg.Metadata["origin_peer_kind"]
 			origLocalKey := msg.Metadata["origin_local_key"]
+			origChannelType := resolveChannelType(channelMgr, origChannel)
 			targetAgent := msg.AgentID // team_message sets AgentID to the target agent key
 			if targetAgent == "" {
 				targetAgent = cfg.ResolveDefaultAgentID()
@@ -635,15 +776,16 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			outMeta := buildAnnounceOutMeta(origLocalKey)
 
 			outCh := sched.Schedule(ctx, scheduler.LaneDelegate, agent.RunRequest{
-				SessionKey: sessionKey,
-				Message:    msg.Content,
-				Channel:    origChannel,
-				ChatID:     msg.ChatID,
-				PeerKind:   origPeerKind,
-				LocalKey:   origLocalKey,
-				UserID:     announceUserID,
-				RunID:      fmt.Sprintf("teammate-%s-%s", msg.Metadata["from_agent"], msg.Metadata["to_agent"]),
-				Stream:     false,
+				SessionKey:  sessionKey,
+				Message:     msg.Content,
+				Channel:     origChannel,
+				ChannelType: origChannelType,
+				ChatID:      msg.ChatID,
+				PeerKind:    origPeerKind,
+				LocalKey:    origLocalKey,
+				UserID:      announceUserID,
+				RunID:       fmt.Sprintf("teammate-%s-%s", msg.Metadata["from_agent"], msg.Metadata["to_agent"]),
+				Stream:      false,
 			})
 
 			go func(origCh, chatID, senderID string, meta map[string]string) {
@@ -652,18 +794,20 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 					slog.Error("teammate message: agent run failed", "error", outcome.Err)
 					return
 				}
-				if outcome.Result.Content == "" || agent.IsSilentReply(outcome.Result.Content) {
+				if (outcome.Result.Content == "" && len(outcome.Result.Media) == 0) || agent.IsSilentReply(outcome.Result.Content) {
 					slog.Info("teammate message: suppressed silent/empty reply", "from", senderID)
 					return
 				}
 				// Deliver response to origin channel (same as delegate/subagent announce).
 				// This allows the lead to respond to users after receiving teammate updates.
-				msgBus.PublishOutbound(bus.OutboundMessage{
+				outMsg := bus.OutboundMessage{
 					Channel:  origCh,
 					ChatID:   chatID,
 					Content:  outcome.Result.Content,
 					Metadata: meta,
-				})
+				}
+				appendMediaToOutbound(&outMsg, outcome.Result.Media)
+				msgBus.PublishOutbound(outMsg)
 			}(origChannel, msg.ChatID, msg.SenderID, outMeta)
 			continue
 		}
@@ -698,6 +842,13 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 			var cancelled bool
 			if cmd == "stopall" {
 				cancelled = sched.CancelSession(sessionKey)
+				// Also cancel async delegations for this chat (they bypass the scheduler)
+				if delegateMgr != nil {
+					dc := delegateMgr.CancelForOrigin(msg.Channel, msg.ChatID)
+					if dc > 0 {
+						cancelled = true
+					}
+				}
 				slog.Info("inbound: /stopall command", "session", sessionKey, "cancelled", cancelled)
 			} else {
 				cancelled = sched.CancelOneSession(sessionKey)
@@ -733,65 +884,19 @@ func consumeInboundMessages(ctx context.Context, msgBus *bus.MessageBus, agents 
 	}
 }
 
-// resolveAgentRoute determines which agent should handle a message
-// based on config bindings. Priority: peer → channel → default.
-// Matching TS resolve-route.ts binding resolution.
-func resolveAgentRoute(cfg *config.Config, channel, chatID, peerKind string) string {
-	for _, binding := range cfg.Bindings {
-		match := binding.Match
-		if match.Channel != channel {
-			continue
-		}
-
-		// Peer-level match (most specific)
-		if match.Peer != nil {
-			if match.Peer.Kind == peerKind && match.Peer.ID == chatID {
-				return config.NormalizeAgentID(binding.AgentID)
+// appendMediaToOutbound converts agent MediaResults to outbound MediaAttachments
+// on the given OutboundMessage. Handles voice annotation when applicable.
+func appendMediaToOutbound(msg *bus.OutboundMessage, media []agent.MediaResult) {
+	for _, mr := range media {
+		msg.Media = append(msg.Media, bus.MediaAttachment{
+			URL:         mr.Path,
+			ContentType: mr.ContentType,
+		})
+		if mr.AsVoice {
+			if msg.Metadata == nil {
+				msg.Metadata = make(map[string]string)
 			}
-			continue // has peer constraint but doesn't match — skip
-		}
-
-		// Channel-level match (least specific, no peer constraint)
-		return config.NormalizeAgentID(binding.AgentID)
-	}
-
-	return cfg.ResolveDefaultAgentID()
-}
-
-// overrideSessionKeyFromLocalKey extracts topic/thread ID from the composite
-// local_key and returns the correct session key for forum topics or DM threads.
-// If localKey is empty or has no suffix, the original sessionKey is returned unchanged.
-func overrideSessionKeyFromLocalKey(sessionKey, localKey, agentID, channel, chatID, peerKind string) string {
-	if localKey == "" {
-		return sessionKey
-	}
-	if idx := strings.Index(localKey, ":topic:"); idx > 0 && peerKind == string(sessions.PeerGroup) {
-		var topicID int
-		fmt.Sscanf(localKey[idx+7:], "%d", &topicID)
-		if topicID > 0 {
-			return sessions.BuildGroupTopicSessionKey(agentID, channel, chatID, topicID)
-		}
-	} else if idx := strings.Index(localKey, ":thread:"); idx > 0 && peerKind == string(sessions.PeerDirect) {
-		var threadID int
-		fmt.Sscanf(localKey[idx+8:], "%d", &threadID)
-		if threadID > 0 {
-			return sessions.BuildDMThreadSessionKey(agentID, channel, chatID, threadID)
+			msg.Metadata["audio_as_voice"] = "true"
 		}
 	}
-	return sessionKey
-}
-
-// buildAnnounceOutMeta builds outbound metadata for announce messages so that
-// Send() can route replies to the correct forum topic or DM thread.
-func buildAnnounceOutMeta(localKey string) map[string]string {
-	if localKey == "" {
-		return nil
-	}
-	meta := map[string]string{"local_key": localKey}
-	if idx := strings.Index(localKey, ":topic:"); idx > 0 {
-		meta["message_thread_id"] = localKey[idx+7:]
-	} else if idx := strings.Index(localKey, ":thread:"); idx > 0 {
-		meta["message_thread_id"] = localKey[idx+8:]
-	}
-	return meta
 }

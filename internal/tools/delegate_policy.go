@@ -5,8 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 
+	"github.com/google/uuid"
+
+	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/hooks"
+	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
 func checkUserPermission(settings json.RawMessage, userID string) error {
@@ -17,16 +22,12 @@ func checkUserPermission(settings json.RawMessage, userID string) error {
 	if json.Unmarshal(settings, &s) != nil {
 		return nil // malformed = fail open
 	}
-	for _, denied := range s.UserDeny {
-		if denied == userID {
-			return fmt.Errorf("you are not authorized to use this delegation link")
-		}
+	if slices.Contains(s.UserDeny, userID) {
+		return fmt.Errorf("you are not authorized to use this delegation link")
 	}
 	if len(s.UserAllow) > 0 {
-		for _, allowed := range s.UserAllow {
-			if allowed == userID {
-				return nil
-			}
+		if slices.Contains(s.UserAllow, userID) {
+			return nil
 		}
 		return fmt.Errorf("you are not authorized to use this delegation link")
 	}
@@ -36,10 +37,11 @@ func checkUserPermission(settings json.RawMessage, userID string) error {
 // teamAccessSettings defines access control rules stored in agent_teams.settings JSONB.
 // Empty/nil lists mean "no restriction". Deny lists take precedence over allow lists.
 type teamAccessSettings struct {
-	AllowUserIDs  []string `json:"allow_user_ids"`
-	DenyUserIDs   []string `json:"deny_user_ids"`
-	AllowChannels []string `json:"allow_channels"`
-	DenyChannels  []string `json:"deny_channels"`
+	AllowUserIDs          []string `json:"allow_user_ids"`
+	DenyUserIDs           []string `json:"deny_user_ids"`
+	AllowChannels         []string `json:"allow_channels"`
+	DenyChannels          []string `json:"deny_channels"`
+	ProgressNotifications *bool    `json:"progress_notifications,omitempty"`
 }
 
 // checkTeamAccess validates whether a user/channel combination is authorized
@@ -62,19 +64,11 @@ func checkTeamAccess(settings json.RawMessage, userID, channel string) error {
 
 	// User check: deny > allow
 	if userID != "" {
-		for _, denied := range s.DenyUserIDs {
-			if denied == userID {
-				return fmt.Errorf("user not authorized for this team")
-			}
+		if slices.Contains(s.DenyUserIDs, userID) {
+			return fmt.Errorf("user not authorized for this team")
 		}
 		if len(s.AllowUserIDs) > 0 {
-			found := false
-			for _, allowed := range s.AllowUserIDs {
-				if allowed == userID {
-					found = true
-					break
-				}
-			}
+			found := slices.Contains(s.AllowUserIDs, userID)
 			if !found {
 				return fmt.Errorf("user not authorized for this team")
 			}
@@ -83,19 +77,11 @@ func checkTeamAccess(settings json.RawMessage, userID, channel string) error {
 
 	// Channel check: deny > allow
 	if channel != "" {
-		for _, denied := range s.DenyChannels {
-			if denied == channel {
-				return fmt.Errorf("channel %q not authorized for this team", channel)
-			}
+		if slices.Contains(s.DenyChannels, channel) {
+			return fmt.Errorf("channel %q not authorized for this team", channel)
 		}
 		if len(s.AllowChannels) > 0 {
-			found := false
-			for _, allowed := range s.AllowChannels {
-				if allowed == channel {
-					found = true
-					break
-				}
-			}
+			found := slices.Contains(s.AllowChannels, channel)
 			if !found {
 				return fmt.Errorf("channel %q not authorized for this team", channel)
 			}
@@ -129,6 +115,20 @@ func parseQualityGates(otherConfig json.RawMessage) []hooks.HookConfig {
 		return nil
 	}
 	return cfg.QualityGates
+}
+
+func parseProgressNotifications(settings json.RawMessage, globalDefault bool) bool {
+	if len(settings) == 0 {
+		return globalDefault
+	}
+	var s teamAccessSettings
+	if json.Unmarshal(settings, &s) != nil {
+		return globalDefault
+	}
+	if s.ProgressNotifications != nil {
+		return *s.ProgressNotifications
+	}
+	return globalDefault
 }
 
 // applyQualityGates evaluates quality gates on a delegation result.
@@ -203,6 +203,36 @@ func (dm *DelegateManager) applyQualityGates(
 			slog.Info("quality_gate: retrying delegation",
 				"type", gate.Type, "delegation", task.ID,
 				"attempt", attempt+1, "max_retries", retries)
+
+			// Emit quality gate retry event for WS visibility.
+			if dm.msgBus != nil {
+				dm.msgBus.Broadcast(bus.Event{
+					Name: protocol.EventQualityGateRetry,
+					Payload: protocol.QualityGateRetryPayload{
+						DelegationID:   task.ID,
+						TargetAgentKey: task.TargetAgentKey,
+						UserID:         task.UserID,
+						Channel:        task.OriginChannel,
+						ChatID:         task.OriginChatID,
+						TeamID: func() string {
+							if task.TeamID != uuid.Nil {
+								return task.TeamID.String()
+							}
+							return ""
+						}(),
+						TeamTaskID: func() string {
+							if task.TeamTaskID != uuid.Nil {
+								return task.TeamTaskID.String()
+							}
+							return ""
+						}(),
+						GateType:   string(gate.Type),
+						Attempt:    attempt + 1,
+						MaxRetries: retries,
+						Feedback:   hookResult.Feedback,
+					},
+				})
+			}
 
 			feedbackMsg := fmt.Sprintf(
 				"[Quality Gate Feedback — Retry %d/%d]\n"+

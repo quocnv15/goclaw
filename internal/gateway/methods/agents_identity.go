@@ -36,11 +36,11 @@ func (m *AgentsMethods) handleIdentityGet(_ context.Context, client *gateway.Cli
 		}
 	}
 
-	result := map[string]interface{}{
+	result := map[string]any{
 		"agentId": params.AgentID,
 	}
 
-	if m.isManaged && m.agentStore != nil {
+	if m.agentStore != nil {
 		// --- Managed mode: read identity from DB ---
 		ctx := context.Background()
 		ag, err := m.agentStore.GetByKey(ctx, params.AgentID)
@@ -70,7 +70,7 @@ func (m *AgentsMethods) handleIdentityGet(_ context.Context, client *gateway.Cli
 			}
 		}
 	} else {
-		// --- Standalone mode: config + filesystem ---
+		// --- Fallback: config + filesystem ---
 		result["name"] = m.cfg.ResolveDisplayName(params.AgentID)
 
 		if spec, ok := m.cfg.Agents.List[params.AgentID]; ok && spec.Identity != nil {
@@ -106,7 +106,7 @@ func (m *AgentsMethods) handleIdentityGet(_ context.Context, client *gateway.Cli
 // parseIdentityContent parses IDENTITY.md content string and extracts Key: Value fields.
 func parseIdentityContent(content string) map[string]string {
 	result := make(map[string]string)
-	for _, line := range strings.Split(content, "\n") {
+	for line := range strings.SplitSeq(content, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "#") || line == "" {
 			continue

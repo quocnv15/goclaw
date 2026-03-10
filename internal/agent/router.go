@@ -8,7 +8,7 @@ import (
 )
 
 // ResolverFunc is called when an agent isn't found in the cache.
-// Used in managed mode to lazy-create agents from DB.
+// Used to lazy-create agents from DB.
 type ResolverFunc func(agentKey string) (Agent, error)
 
 const defaultRouterTTL = 10 * time.Minute
@@ -19,15 +19,26 @@ type agentEntry struct {
 	cachedAt time.Time
 }
 
+// AgentActivityStatus tracks the current phase of a running agent for status queries.
+type AgentActivityStatus struct {
+	RunID     string
+	Phase     string // "thinking", "tool_exec", "compacting"
+	Tool      string // current tool name (when Phase == "tool_exec")
+	Iteration int
+	StartedAt time.Time
+}
+
 // Router manages multiple agent Loop instances.
 // Each agent has a unique ID and its own provider/model/tools config.
-// In managed mode, cached Loops expire after TTL (safety net for multi-instance).
+// Cached Loops expire after TTL (safety net for multi-instance).
 type Router struct {
-	agents     map[string]*agentEntry
-	mu         sync.RWMutex
-	activeRuns sync.Map // runID → *ActiveRun
-	resolver   ResolverFunc // optional: lazy creation from DB (managed mode)
-	ttl        time.Duration
+	agents        map[string]*agentEntry
+	mu            sync.RWMutex
+	activeRuns    sync.Map     // runID → *ActiveRun
+	sessionRuns   sync.Map     // sessionKey → runID (secondary index for O(1) IsSessionBusy)
+	agentActivity sync.Map     // sessionKey → *AgentActivityStatus
+	resolver      ResolverFunc // optional: lazy creation from DB
+	ttl           time.Duration
 }
 
 func NewRouter() *Router {
@@ -37,7 +48,7 @@ func NewRouter() *Router {
 	}
 }
 
-// SetResolver sets a resolver function for lazy agent creation (managed mode).
+// SetResolver sets a resolver function for lazy agent creation.
 func (r *Router) SetResolver(fn ResolverFunc) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -51,7 +62,7 @@ func (r *Router) Register(ag Agent) {
 	r.agents[ag.ID()] = &agentEntry{agent: ag, cachedAt: time.Now()}
 }
 
-// Get returns an agent by ID. In managed mode, lazy-creates from DB via resolver.
+// Get returns an agent by ID. Lazy-creates from DB via resolver if needed.
 // Cached entries expire after TTL as a safety net for multi-instance deployments.
 func (r *Router) Get(agentID string) (Agent, error) {
 	r.mu.RLock()
@@ -70,7 +81,7 @@ func (r *Router) Get(agentID string) (Agent, error) {
 		r.mu.Unlock()
 	}
 
-	// Try resolver (managed mode: create from DB)
+	// Try resolver (create from DB)
 	if resolver != nil {
 		ag, err := resolver(agentID)
 		if err != nil {
@@ -130,6 +141,16 @@ func (r *Router) ListInfo() []AgentInfo {
 	return infos
 }
 
+// IsRunning checks if a specific agent is currently running (cached in router).
+func (r *Router) IsRunning(agentID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if entry, ok := r.agents[agentID]; ok {
+		return entry.agent.IsRunning()
+	}
+	return false
+}
+
 // --- Active Run Tracking (matching TS chat-abort.ts) ---
 
 // ActiveRun tracks a running agent invocation so it can be aborted via chat.abort.
@@ -150,10 +171,15 @@ func (r *Router) RegisterRun(runID, sessionKey, agentID string, cancel context.C
 		Cancel:     cancel,
 		StartedAt:  time.Now(),
 	})
+	r.sessionRuns.Store(sessionKey, runID)
 }
 
 // UnregisterRun removes a completed/cancelled run from tracking.
 func (r *Router) UnregisterRun(runID string) {
+	if val, ok := r.activeRuns.Load(runID); ok {
+		run := val.(*ActiveRun)
+		r.sessionRuns.Delete(run.SessionKey)
+	}
 	r.activeRuns.Delete(runID)
 }
 
@@ -173,6 +199,7 @@ func (r *Router) AbortRun(runID, sessionKey string) bool {
 	}
 
 	run.Cancel()
+	r.sessionRuns.Delete(run.SessionKey)
 	r.activeRuns.Delete(runID)
 	return true
 }
@@ -189,15 +216,58 @@ func (r *Router) InvalidateUserWorkspace(userID string) {
 	}
 }
 
+// SessionKeyForRun returns the session key associated with a run ID, or "" if not found.
+func (r *Router) SessionKeyForRun(runID string) string {
+	val, ok := r.activeRuns.Load(runID)
+	if !ok {
+		return ""
+	}
+	return val.(*ActiveRun).SessionKey
+}
+
+// UpdateActivity records the current phase of a running agent for status queries.
+// Called from the bus subscriber on agent.activity events.
+func (r *Router) UpdateActivity(sessionKey, runID, phase, tool string, iteration int) {
+	r.agentActivity.Store(sessionKey, &AgentActivityStatus{
+		RunID:     runID,
+		Phase:     phase,
+		Tool:      tool,
+		Iteration: iteration,
+		StartedAt: time.Now(),
+	})
+}
+
+// ClearActivity removes the activity status for a session (on run completion).
+func (r *Router) ClearActivity(sessionKey string) {
+	r.agentActivity.Delete(sessionKey)
+}
+
+// GetActivity returns the current activity status for a session, or nil if idle.
+func (r *Router) GetActivity(sessionKey string) *AgentActivityStatus {
+	val, ok := r.agentActivity.Load(sessionKey)
+	if !ok {
+		return nil
+	}
+	return val.(*AgentActivityStatus)
+}
+
+// IsSessionBusy returns true if there's an active run for the given session key.
+// O(1) via sessionRuns secondary index.
+func (r *Router) IsSessionBusy(sessionKey string) bool {
+	_, ok := r.sessionRuns.Load(sessionKey)
+	return ok
+}
+
 // AbortRunsForSession cancels all active runs for a session key.
 // Returns the list of aborted run IDs.
 func (r *Router) AbortRunsForSession(sessionKey string) []string {
 	var aborted []string
-	r.activeRuns.Range(func(key, val interface{}) bool {
+	r.activeRuns.Range(func(key, val any) bool {
 		run := val.(*ActiveRun)
 		if run.SessionKey == sessionKey {
 			run.Cancel()
 			r.activeRuns.Delete(key)
+			r.sessionRuns.Delete(sessionKey)
 			aborted = append(aborted, run.RunID)
 		}
 		return true

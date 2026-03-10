@@ -24,8 +24,8 @@ type Channel struct {
 	bot              *telego.Bot
 	config           config.TelegramConfig
 	pairingService   store.PairingStore
-	agentStore       store.AgentStore // for group file writer management (nil in standalone)
-	teamStore        store.TeamStore  // for /tasks, /task_detail commands (nil in standalone)
+	agentStore       store.AgentStore // for group file writer management (nil if not configured)
+	teamStore        store.TeamStore  // for /tasks, /task_detail commands (nil if not configured)
 	placeholders     sync.Map         // localKey string → messageID int
 	stopThinking     sync.Map         // localKey string → *thinkingCancel
 	typingCtrls      sync.Map         // localKey string → *typing.Controller
@@ -55,7 +55,7 @@ func (c *thinkingCancel) Cancel() {
 // pairingSvc is optional (nil = fall back to allowlist only).
 // agentStore is optional (nil = group file writer commands disabled).
 // teamStore is optional (nil = /tasks, /task_detail commands disabled).
-func New(cfg config.TelegramConfig, msgBus *bus.MessageBus, pairingSvc store.PairingStore, agentStore store.AgentStore, teamStore store.TeamStore) (*Channel, error) {
+func New(cfg config.TelegramConfig, msgBus *bus.MessageBus, pairingSvc store.PairingStore, agentStore store.AgentStore, teamStore store.TeamStore, pendingStore store.PendingMessageStore) (*Channel, error) {
 	var opts []telego.BotOption
 
 	if cfg.Proxy != "" {
@@ -75,7 +75,7 @@ func New(cfg config.TelegramConfig, msgBus *bus.MessageBus, pairingSvc store.Pai
 		return nil, fmt.Errorf("create telegram bot: %w", err)
 	}
 
-	base := channels.NewBaseChannel("telegram", msgBus, cfg.AllowFrom)
+	base := channels.NewBaseChannel(channels.TypeTelegram, msgBus, cfg.AllowFrom)
 	base.ValidatePolicy(cfg.DMPolicy, cfg.GroupPolicy)
 
 	requireMention := true
@@ -95,7 +95,7 @@ func New(cfg config.TelegramConfig, msgBus *bus.MessageBus, pairingSvc store.Pai
 		pairingService: pairingSvc,
 		agentStore:     agentStore,
 		teamStore:      teamStore,
-		groupHistory:   channels.NewPendingHistory(),
+		groupHistory:   channels.MakeHistory(channels.TypeTelegram, pendingStore),
 		historyLimit:   historyLimit,
 		requireMention: requireMention,
 	}, nil
@@ -126,6 +126,7 @@ func (c *Channel) Start(ctx context.Context) error {
 	}
 
 	c.SetRunning(true)
+	c.groupHistory.StartFlusher()
 	slog.Info("telegram bot connected", "username", c.bot.Username())
 
 	// Register bot menu commands with retry.
@@ -185,10 +186,29 @@ func (c *Channel) Start(ctx context.Context) error {
 	return nil
 }
 
-// StreamEnabled reports whether streaming is active for this channel.
-// Returns true only when stream_mode is "partial".
-func (c *Channel) StreamEnabled() bool {
-	return c.config.StreamMode == "partial"
+// StreamEnabled reports whether streaming is active for the given chat type.
+// Controlled by separate dm_stream / group_stream config flags (both default false).
+//
+// DM streaming: edits "Thinking..." placeholder progressively via editMessageText.
+// Group streaming: sends a new message, edits progressively, hands off to Send().
+//
+// Both are disabled by default. sendMessageDraft (draft transport) code exists in the
+// codebase but is not used pending Telegram client-side fixes:
+//   - tdesktop#10315, bugs.telegram.org/c/561 — "reply to deleted message" artifacts
+//   - openclaw/openclaw#7803, openclaw/openclaw#32180 — community tracking
+func (c *Channel) StreamEnabled(isGroup bool) bool {
+	if isGroup {
+		return c.config.GroupStream != nil && *c.config.GroupStream
+	}
+	return c.config.DMStream != nil && *c.config.DMStream
+}
+
+// BlockReplyEnabled returns the per-channel block_reply override (nil = inherit gateway default).
+func (c *Channel) BlockReplyEnabled() *bool { return c.config.BlockReply }
+
+// SetPendingCompaction configures LLM-based auto-compaction for pending messages.
+func (c *Channel) SetPendingCompaction(cfg *channels.CompactionConfig) {
+	c.groupHistory.SetCompactionConfig(cfg)
 }
 
 // Stop shuts down the Telegram bot by cancelling the long polling context
@@ -196,6 +216,7 @@ func (c *Channel) StreamEnabled() bool {
 func (c *Channel) Stop(_ context.Context) error {
 	slog.Info("stopping telegram bot")
 	c.SetRunning(false)
+	c.groupHistory.StopFlusher()
 
 	if c.pollCancel != nil {
 		c.pollCancel()

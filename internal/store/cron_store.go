@@ -19,7 +19,7 @@ type CronJob struct {
 
 // CronSchedule defines when a job should run.
 type CronSchedule struct {
-	Kind    string `json:"kind"`              // "at", "every", "cron"
+	Kind    string `json:"kind"` // "at", "every", "cron"
 	AtMS    *int64 `json:"atMs,omitempty"`
 	EveryMS *int64 `json:"everyMs,omitempty"`
 	Expr    string `json:"expr,omitempty"`
@@ -46,11 +46,14 @@ type CronJobState struct {
 
 // CronRunLogEntry records a job execution.
 type CronRunLogEntry struct {
-	Ts      int64  `json:"ts"`
-	JobID   string `json:"jobId"`
-	Status  string `json:"status,omitempty"`
-	Error   string `json:"error,omitempty"`
-	Summary string `json:"summary,omitempty"`
+	Ts           int64  `json:"ts"`
+	JobID        string `json:"jobId"`
+	Status       string `json:"status,omitempty"`
+	Error        string `json:"error,omitempty"`
+	Summary      string `json:"summary,omitempty"`
+	DurationMS   int64  `json:"durationMs,omitempty"`
+	InputTokens  int    `json:"inputTokens,omitempty"`
+	OutputTokens int    `json:"outputTokens,omitempty"`
 }
 
 // CronJobResult is the output of a cron job handler execution.
@@ -74,6 +77,15 @@ type CronJobPatch struct {
 	DeleteAfterRun *bool         `json:"deleteAfterRun,omitempty"`
 }
 
+// CronEvent represents a job lifecycle event sent to subscribers.
+type CronEvent struct {
+	Action  string `json:"action"` // "running", "completed", "error"
+	JobID   string `json:"jobId"`
+	JobName string `json:"jobName,omitempty"`
+	Status  string `json:"status,omitempty"` // final status for completed/error
+	Error   string `json:"error,omitempty"`
+}
+
 // CronStore manages scheduled jobs.
 type CronStore interface {
 	AddJob(name string, schedule CronSchedule, message string, deliver bool, channel, to, agentID, userID string) (*CronJob, error)
@@ -82,8 +94,8 @@ type CronStore interface {
 	RemoveJob(jobID string) error
 	UpdateJob(jobID string, patch CronJobPatch) (*CronJob, error)
 	EnableJob(jobID string, enabled bool) error
-	GetRunLog(jobID string, limit int) []CronRunLogEntry
-	Status() map[string]interface{}
+	GetRunLog(jobID string, limit, offset int) ([]CronRunLogEntry, int)
+	Status() map[string]any
 
 	// Lifecycle
 	Start() error
@@ -91,7 +103,9 @@ type CronStore interface {
 
 	// Job execution
 	SetOnJob(handler func(job *CronJob) (*CronJobResult, error))
+	SetOnEvent(handler func(event CronEvent))
 	RunJob(jobID string, force bool) (ran bool, reason string, err error)
+	SetDefaultTimezone(tz string)
 
 	// Due job detection (for scheduler)
 	GetDueJobs(now time.Time) []CronJob

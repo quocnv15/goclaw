@@ -2,17 +2,24 @@ package bus
 
 import "context"
 
+// MediaFile represents an inbound media file with its MIME type.
+// Used throughout the media pipeline to preserve content type from channel download to storage.
+type MediaFile struct {
+	Path     string `json:"path"`
+	MimeType string `json:"mime_type,omitempty"` // e.g. "application/pdf", "image/jpeg"
+}
+
 // InboundMessage represents a message received from a channel (Telegram, Discord, etc.)
 type InboundMessage struct {
 	Channel      string            `json:"channel"`
 	SenderID     string            `json:"sender_id"`
 	ChatID       string            `json:"chat_id"`
 	Content      string            `json:"content"`
-	Media        []string          `json:"media,omitempty"`
-	SessionKey   string            `json:"session_key"`           // deprecated: gateway builds canonical key
-	PeerKind     string            `json:"peer_kind,omitempty"`   // "direct" or "group" (used for session key)
-	AgentID      string            `json:"agent_id,omitempty"`    // target agent (for multi-agent routing)
-	UserID       string            `json:"user_id,omitempty"`     // external user ID for per-user scoping (memory, bootstrap)
+	Media        []MediaFile       `json:"media,omitempty"`
+	SessionKey   string            `json:"session_key"`             // deprecated: gateway builds canonical key
+	PeerKind     string            `json:"peer_kind,omitempty"`     // "direct" or "group" (used for session key)
+	AgentID      string            `json:"agent_id,omitempty"`      // target agent (for multi-agent routing)
+	UserID       string            `json:"user_id,omitempty"`       // external user ID for per-user scoping (memory, bootstrap)
 	HistoryLimit int               `json:"history_limit,omitempty"` // max turns to keep in context (0=unlimited, from channel config)
 	ToolAllow    []string          `json:"tool_allow,omitempty"`    // per-group tool allow list (nil = no restriction)
 	Metadata     map[string]string `json:"metadata,omitempty"`
@@ -31,13 +38,13 @@ type OutboundMessage struct {
 type MediaAttachment struct {
 	URL         string `json:"url"`                    // file path or URL
 	ContentType string `json:"content_type,omitempty"` // MIME type (e.g. "image/jpeg", "video/mp4")
-	Caption     string `json:"caption,omitempty"`       // optional caption for media
+	Caption     string `json:"caption,omitempty"`      // optional caption for media
 }
 
 // Event represents a server-side event to broadcast to WebSocket clients.
 type Event struct {
-	Name    string      `json:"name"`              // event name (e.g. "agent", "chat", "health")
-	Payload interface{} `json:"payload,omitempty"`
+	Name    string `json:"name"` // event name (e.g. "agent", "chat", "health")
+	Payload any    `json:"payload,omitempty"`
 }
 
 // Cache invalidation kind constants.
@@ -50,9 +57,10 @@ const (
 	CacheKindChannelInstances = "channel_instances"
 	CacheKindBuiltinTools     = "builtin_tools"
 	CacheKindTeam             = "team"
-	CacheKindUserWorkspace       = "user_workspace"
-	CacheKindGroupFileWriters    = "group_file_writers"
-	CacheKindSkillGrants         = "skill_grants"
+	CacheKindUserWorkspace    = "user_workspace"
+	CacheKindGroupFileWriters = "group_file_writers"
+	CacheKindSkillGrants      = "skill_grants"
+	CacheKindMCP              = "mcp"
 )
 
 // Topic constants for msgBus.Subscribe() / Broadcast().
@@ -65,11 +73,34 @@ const (
 	TopicCacheBuiltinTools     = "cache:builtin_tools"
 	TopicCacheTeam             = "cache:team"
 	TopicCacheUserWorkspace    = "cache:user_workspace"
-	TopicCacheChannelInstances    = "cache:channel_instances"
-	TopicCacheGroupFileWriters    = "cache:group_file_writers"
-	TopicCacheSkillGrants         = "cache:skill_grants"
-	TopicChannelStreaming          = "channel-streaming"
+	TopicCacheChannelInstances = "cache:channel_instances"
+	TopicCacheGroupFileWriters = "cache:group_file_writers"
+	TopicCacheSkillGrants      = "cache:skill_grants"
+	TopicCacheMCP              = "cache:mcp"
+	TopicChannelStreaming      = "channel-streaming"
+	TopicConfigChanged         = "config:changed"
+	TopicPairingRevoked        = "pairing:revoked"
+	TopicAgentStatusChanged    = "agent:status_changed"
 )
+
+// EventPairingRevoked is the event name broadcast when a paired device is revoked.
+const EventPairingRevoked = "pairing.revoked"
+
+// PairingRevokedPayload identifies the revoked device.
+type PairingRevokedPayload struct {
+	SenderID string `json:"sender_id"`
+	Channel  string `json:"channel"`
+}
+
+// EventAgentStatusChanged is broadcast when an agent's status changes (e.g., active → inactive).
+const EventAgentStatusChanged = "agent.status_changed"
+
+// AgentStatusChangedPayload carries agent status transition info for cascade operations.
+type AgentStatusChangedPayload struct {
+	AgentID   string `json:"agent_id"`
+	OldStatus string `json:"old_status"`
+	NewStatus string `json:"new_status"`
+}
 
 // CacheInvalidatePayload signals cache layers to evict stale entries.
 // Used with protocol.EventCacheInvalidate events.

@@ -21,7 +21,7 @@ import (
 //   - mode="sync": block until done; mode="async" (default): return immediately
 type SpawnTool struct {
 	subagentMgr *SubagentManager
-	delegateMgr *DelegateManager // nil in standalone mode; injected via SetDelegateManager
+	delegateMgr *DelegateManager // nil if not configured; injected via SetDelegateManager
 	parentID    string
 	depth       int
 }
@@ -34,7 +34,7 @@ func NewSpawnTool(manager *SubagentManager, parentID string, depth int) *SpawnTo
 	}
 }
 
-// SetDelegateManager injects delegation capability (managed mode only).
+// SetDelegateManager injects delegation capability.
 func (t *SpawnTool) SetDelegateManager(dm *DelegateManager) { t.delegateMgr = dm }
 
 func (t *SpawnTool) Name() string { return "spawn" }
@@ -46,33 +46,33 @@ func (t *SpawnTool) Description() string {
 	return "Spawn a subagent to handle a task in the background. The subagent runs independently and reports back when done."
 }
 
-func (t *SpawnTool) Parameters() map[string]interface{} {
-	props := map[string]interface{}{
-		"action": map[string]interface{}{
+func (t *SpawnTool) Parameters() map[string]any {
+	props := map[string]any{
+		"action": map[string]any{
 			"type":        "string",
 			"description": "'spawn' (default), 'list', 'cancel', or 'steer'",
 		},
-		"task": map[string]interface{}{
+		"task": map[string]any{
 			"type":        "string",
 			"description": "The task to complete (required for action=spawn)",
 		},
-		"mode": map[string]interface{}{
+		"mode": map[string]any{
 			"type":        "string",
 			"description": "'async' (default, returns immediately) or 'sync' (blocks until done)",
 		},
-		"label": map[string]interface{}{
+		"label": map[string]any{
 			"type":        "string",
 			"description": "Short label for the task (for display)",
 		},
-		"model": map[string]interface{}{
+		"model": map[string]any{
 			"type":        "string",
 			"description": "Optional model override (e.g. 'anthropic/claude-sonnet-4-5-20250929')",
 		},
-		"id": map[string]interface{}{
+		"id": map[string]any{
 			"type":        "string",
 			"description": "Task ID for cancel/steer. For cancel: use 'all' to cancel all or 'last' for most recent",
 		},
-		"message": map[string]interface{}{
+		"message": map[string]any{
 			"type":        "string",
 			"description": "New instructions (required for action=steer)",
 		},
@@ -80,28 +80,32 @@ func (t *SpawnTool) Parameters() map[string]interface{} {
 
 	// Add delegation-specific params when delegate manager is available
 	if t.delegateMgr != nil {
-		props["agent"] = map[string]interface{}{
+		props["agent"] = map[string]any{
 			"type":        "string",
 			"description": "Target agent key. Omit to clone yourself, specify to delegate to another agent",
 		}
-		props["context"] = map[string]interface{}{
+		props["context"] = map[string]any{
 			"type":        "string",
 			"description": "Optional additional context for the target agent (used with agent param)",
 		}
-		props["team_task_id"] = map[string]interface{}{
+		props["team_task_id"] = map[string]any{
 			"type":        "string",
 			"description": "Team task ID to auto-complete when task finishes (for team workflows)",
 		}
+		props["estimated_duration"] = map[string]any{
+			"type":        "number",
+			"description": "Estimated task duration in seconds. A progress notification is sent to the user if the task takes longer than this. Default 90.",
+		}
 	}
 
-	return map[string]interface{}{
+	return map[string]any{
 		"type":       "object",
 		"properties": props,
 		"required":   []string{"task"},
 	}
 }
 
-func (t *SpawnTool) Execute(ctx context.Context, args map[string]interface{}) *Result {
+func (t *SpawnTool) Execute(ctx context.Context, args map[string]any) *Result {
 	action, _ := args["action"].(string)
 	if action == "" {
 		action = "spawn"
@@ -120,7 +124,7 @@ func (t *SpawnTool) Execute(ctx context.Context, args map[string]interface{}) *R
 }
 
 // executeSpawn routes to subagent (self-clone) or delegation (different agent).
-func (t *SpawnTool) executeSpawn(ctx context.Context, args map[string]interface{}) *Result {
+func (t *SpawnTool) executeSpawn(ctx context.Context, args map[string]any) *Result {
 	task, _ := args["task"].(string)
 	if task == "" {
 		return ErrorResult("task parameter is required")
@@ -146,7 +150,7 @@ func (t *SpawnTool) executeSpawn(ctx context.Context, args map[string]interface{
 }
 
 // executeSubagentAsync spawns an async self-clone (old SpawnTool behavior).
-func (t *SpawnTool) executeSubagentAsync(ctx context.Context, args map[string]interface{}, task string) *Result {
+func (t *SpawnTool) executeSubagentAsync(ctx context.Context, args map[string]any, task string) *Result {
 	label, _ := args["label"].(string)
 	modelOverride, _ := args["model"].(string)
 
@@ -174,7 +178,7 @@ After all spawn tool calls in this turn are complete, briefly tell the user what
 }
 
 // executeSubagentSync runs a sync self-clone (old SubagentTool action=run behavior).
-func (t *SpawnTool) executeSubagentSync(ctx context.Context, args map[string]interface{}, task string) *Result {
+func (t *SpawnTool) executeSubagentSync(ctx context.Context, args map[string]any, task string) *Result {
 	label, _ := args["label"].(string)
 	if label == "" {
 		label = truncate(task, 50)
@@ -208,7 +212,7 @@ func (t *SpawnTool) executeSubagentSync(ctx context.Context, args map[string]int
 }
 
 // executeDelegation delegates to a different agent (old DelegateTool behavior).
-func (t *SpawnTool) executeDelegation(ctx context.Context, args map[string]interface{}, agentKey, task string) *Result {
+func (t *SpawnTool) executeDelegation(ctx context.Context, args map[string]any, agentKey, task string) *Result {
 	extraContext, _ := args["context"].(string)
 	mode, _ := args["mode"].(string)
 	if mode == "" {
@@ -220,12 +224,21 @@ func (t *SpawnTool) executeDelegation(ctx context.Context, args map[string]inter
 		teamTaskID, _ = uuid.Parse(ttID)
 	}
 
+	var estimatedDuration time.Duration
+	if ed, ok := args["estimated_duration"].(float64); ok && ed > 0 {
+		estimatedDuration = time.Duration(ed) * time.Second
+	}
+
+	label, _ := args["label"].(string)
+
 	opts := DelegateOpts{
-		TargetAgentKey: agentKey,
-		Task:           task,
-		Context:        extraContext,
-		Mode:           mode,
-		TeamTaskID:     teamTaskID,
+		TargetAgentKey:    agentKey,
+		Task:              task,
+		Context:           extraContext,
+		Mode:              mode,
+		TeamTaskID:        teamTaskID,
+		EstimatedDuration: estimatedDuration,
+		Label:             label,
 	}
 
 	if mode == "async" {
@@ -233,10 +246,10 @@ func (t *SpawnTool) executeDelegation(ctx context.Context, args map[string]inter
 		if err != nil {
 			return ErrorResult(err.Error())
 		}
-		forLLM := fmt.Sprintf(`{"status":"accepted","delegation_id":%q,"target":%q,"mode":"async"}
+		forLLM := fmt.Sprintf(`{"status":"accepted","delegation_id":%q,"target":%q,"mode":"async","team_task_id":%q}
 Delegated to %q (async, id=%s). The result will be announced automatically when done — do NOT wait or poll.
 Briefly tell the user what you've delegated and to whom. Be friendly and natural.`,
-			result.DelegationID, agentKey, agentKey, result.DelegationID)
+			result.DelegationID, agentKey, result.TeamTaskID, agentKey, result.DelegationID)
 		return AsyncResult(forLLM)
 	}
 
@@ -247,9 +260,9 @@ Briefly tell the user what you've delegated and to whom. Be friendly and natural
 	}
 
 	mediaNote := ""
-	if len(result.MediaPaths) > 0 {
+	if len(result.Media) > 0 {
 		mediaNote = fmt.Sprintf("\n\n[%d media file(s) attached — will be delivered automatically. Do NOT recreate or call create_image.]",
-			len(result.MediaPaths))
+			len(result.Media))
 	}
 
 	forLLM := fmt.Sprintf(
@@ -260,8 +273,8 @@ Briefly tell the user what you've delegated and to whom. Be friendly and natural
 		agentKey, result.Iterations, result.Content, mediaNote)
 
 	toolResult := NewResult(forLLM)
-	if len(result.MediaPaths) > 0 {
-		toolResult.Media = result.MediaPaths
+	if len(result.Media) > 0 {
+		toolResult.Media = result.Media
 	}
 	return toolResult
 }
@@ -304,7 +317,7 @@ func (t *SpawnTool) executeList(ctx context.Context) *Result {
 		sourceAgentID := store.AgentIDFromContext(ctx)
 		delegations := t.delegateMgr.ListActive(sourceAgentID)
 		if len(delegations) > 0 {
-			out, _ := json.Marshal(map[string]interface{}{
+			out, _ := json.Marshal(map[string]any{
 				"delegations": delegations,
 				"count":       len(delegations),
 			})
@@ -319,7 +332,7 @@ func (t *SpawnTool) executeList(ctx context.Context) *Result {
 }
 
 // executeCancel cancels a subagent or delegation by ID.
-func (t *SpawnTool) executeCancel(ctx context.Context, args map[string]interface{}) *Result {
+func (t *SpawnTool) executeCancel(ctx context.Context, args map[string]any) *Result {
 	id, _ := args["id"].(string)
 	if id == "" {
 		return ErrorResult("id is required for action=cancel")
@@ -339,7 +352,7 @@ func (t *SpawnTool) executeCancel(ctx context.Context, args map[string]interface
 }
 
 // executeSteer redirects a running subagent with new instructions.
-func (t *SpawnTool) executeSteer(ctx context.Context, args map[string]interface{}) *Result {
+func (t *SpawnTool) executeSteer(ctx context.Context, args map[string]any) *Result {
 	id, _ := args["id"].(string)
 	if id == "" {
 		return ErrorResult("id is required for action=steer")

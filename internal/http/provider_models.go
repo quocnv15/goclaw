@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nextlevelbuilder/goclaw/internal/i18n"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // ModelInfo is a normalized model entry returned by the list-models endpoint.
@@ -24,20 +26,27 @@ type ModelInfo struct {
 //
 //	GET /v1/providers/{id}/models
 func (h *ProvidersHandler) handleListProviderModels(w http.ResponseWriter, r *http.Request) {
+	locale := extractLocale(r)
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid provider ID"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "provider")})
 		return
 	}
 
 	p, err := h.store.GetProvider(r.Context(), id)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "provider not found"})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": i18n.T(locale, i18n.MsgNotFound, "provider", id.String())})
+		return
+	}
+
+	// Claude CLI doesn't need an API key — return hardcoded models
+	if p.ProviderType == store.ProviderClaudeCLI {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"models": claudeCLIModels()})
 		return
 	}
 
 	if p.APIKey == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider has no API key configured"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgRequired, "API key")})
 		return
 	}
 
@@ -53,6 +62,12 @@ func (h *ProvidersHandler) handleListProviderModels(w http.ResponseWriter, r *ht
 		models, err = fetchGeminiModels(ctx, p.APIKey)
 	case "bailian":
 		models = bailianModels()
+	case "dashscope":
+		models = dashScopeModels()
+	case "minimax_native":
+		models = minimaxModels()
+	case "suno":
+		models = sunoModels()
 	default:
 		// All other types use OpenAI-compatible /models endpoint
 		apiBase := strings.TrimRight(p.APIBase, "/")
@@ -160,6 +175,63 @@ func bailianModels() []ModelInfo {
 		{ID: "qwen3-coder-next", Name: "Qwen 3 Coder Next"},
 		{ID: "qwen3-coder-plus", Name: "Qwen 3 Coder Plus"},
 		{ID: "glm-4.7", Name: "GLM 4.7"},
+	}
+}
+
+// minimaxModels returns a hardcoded list of MiniMax models.
+// MiniMax does not expose a /v1/models endpoint.
+func minimaxModels() []ModelInfo {
+	return []ModelInfo{
+		// Chat / text
+		{ID: "MiniMax-Text-01", Name: "MiniMax Text 01"},
+		{ID: "MiniMax-M1", Name: "MiniMax M1"},
+		{ID: "MiniMax-M2.5", Name: "MiniMax M2.5"},
+		// Image generation
+		{ID: "image-01", Name: "Image 01"},
+		// Video generation
+		{ID: "MiniMax-Hailuo-2.3", Name: "Hailuo Video 2.3"},
+		{ID: "MiniMax-Hailuo-2", Name: "Hailuo Video 2"},
+		{ID: "T2V-01-Director", Name: "T2V-01 Director"},
+		// Music generation
+		{ID: "music-2.5+", Name: "Music 2.5+"},
+		{ID: "music-2.5", Name: "Music 2.5"},
+		// TTS
+		{ID: "speech-02-hd", Name: "Speech 02 HD"},
+		{ID: "speech-02-turbo", Name: "Speech 02 Turbo"},
+	}
+}
+
+// dashScopeModels returns a hardcoded list of DashScope (Qwen) models.
+// DashScope does not expose a standard /v1/models endpoint.
+func dashScopeModels() []ModelInfo {
+	return []ModelInfo{
+		// Chat / text
+		{ID: "qwen3-max", Name: "Qwen 3 Max"},
+		{ID: "qwen3-plus", Name: "Qwen 3 Plus"},
+		{ID: "qwen3-turbo", Name: "Qwen 3 Turbo"},
+		// Image generation
+		{ID: "wan2.6-image", Name: "Wan 2.6 Image"},
+		{ID: "wan2.1-image", Name: "Wan 2.1 Image"},
+		// Video generation
+		{ID: "wan2.6-video", Name: "Wan 2.6 Video"},
+	}
+}
+
+// sunoModels returns a hardcoded list of Suno music generation models.
+func sunoModels() []ModelInfo {
+	return []ModelInfo{
+		{ID: "v4.5", Name: "Suno V4.5"},
+		{ID: "v4", Name: "Suno V4"},
+		{ID: "v3.5", Name: "Suno V3.5"},
+	}
+}
+
+// claudeCLIModels returns the model aliases accepted by the Claude CLI.
+func claudeCLIModels() []ModelInfo {
+	return []ModelInfo{
+		{ID: "sonnet", Name: "Sonnet"},
+		{ID: "opus", Name: "Opus"},
+		{ID: "haiku", Name: "Haiku"},
 	}
 }
 

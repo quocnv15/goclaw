@@ -5,11 +5,10 @@ import (
 	"encoding/json"
 	"log/slog"
 
-	"github.com/google/uuid"
-
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
+	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
@@ -52,20 +51,20 @@ func (m *TeamsMethods) Register(router *gateway.MethodRouter) {
 
 // --- List ---
 
-func (m *TeamsMethods) handleList(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *TeamsMethods) handleList(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	if m.teamStore == nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "teams not available (standalone mode)"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, i18n.T(locale, i18n.MsgTeamsNotConfigured)))
 		return
 	}
 
-	ctx := context.Background()
 	teams, err := m.teamStore.ListTeams(ctx)
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, err.Error()))
 		return
 	}
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"teams": teams,
 		"count": len(teams),
 	}))
@@ -81,24 +80,25 @@ type teamsCreateParams struct {
 	Settings    json.RawMessage `json:"settings"`
 }
 
-func (m *TeamsMethods) handleCreate(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *TeamsMethods) handleCreate(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	if m.teamStore == nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "teams not available (standalone mode)"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, i18n.T(locale, i18n.MsgTeamsNotConfigured)))
 		return
 	}
 
 	var params teamsCreateParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid params"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidJSON)))
 		return
 	}
 
 	if params.Name == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "name is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "name")))
 		return
 	}
 	if params.Lead == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "lead is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "lead")))
 		return
 	}
 
@@ -120,8 +120,6 @@ func (m *TeamsMethods) handleCreate(_ context.Context, client *gateway.Client, r
 		memberAgents = append(memberAgents, ag)
 	}
 
-	ctx := context.Background()
-
 	// Create team
 	team := &store.TeamData{
 		Name:        params.Name,
@@ -132,13 +130,13 @@ func (m *TeamsMethods) handleCreate(_ context.Context, client *gateway.Client, r
 		CreatedBy:   client.UserID(),
 	}
 	if err := m.teamStore.CreateTeam(ctx, team); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "failed to create team: "+err.Error()))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToCreate, "team", err.Error())))
 		return
 	}
 
 	// Add lead as member with lead role
 	if err := m.teamStore.AddMember(ctx, team.ID, leadAgent.ID, store.TeamRoleLead); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "failed to add lead as member: "+err.Error()))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToCreate, "team lead membership", err.Error())))
 		return
 	}
 
@@ -166,437 +164,21 @@ func (m *TeamsMethods) handleCreate(_ context.Context, client *gateway.Client, r
 		}
 	}
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"team": team,
 	}))
-}
 
-// --- Get ---
-
-type teamsGetParams struct {
-	TeamID string `json:"teamId"`
-}
-
-func (m *TeamsMethods) handleGet(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
-	if m.teamStore == nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "teams not available (standalone mode)"))
-		return
-	}
-
-	var params teamsGetParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid params"))
-		return
-	}
-
-	if params.TeamID == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "teamId is required"))
-		return
-	}
-
-	teamID, err := uuid.Parse(params.TeamID)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid teamId"))
-		return
-	}
-
-	ctx := context.Background()
-	team, err := m.teamStore.GetTeam(ctx, teamID)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, err.Error()))
-		return
-	}
-
-	members, err := m.teamStore.ListMembers(ctx, teamID)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, err.Error()))
-		return
-	}
-
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
-		"team":    team,
-		"members": members,
-	}))
-}
-
-// --- Delete ---
-
-type teamsDeleteParams struct {
-	TeamID string `json:"teamId"`
-}
-
-func (m *TeamsMethods) handleDelete(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
-	if m.teamStore == nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "teams not available (standalone mode)"))
-		return
-	}
-
-	var params teamsDeleteParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid params"))
-		return
-	}
-
-	if params.TeamID == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "teamId is required"))
-		return
-	}
-
-	teamID, err := uuid.Parse(params.TeamID)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid teamId"))
-		return
-	}
-
-	ctx := context.Background()
-
-	// Fetch members before deleting for cache invalidation
-	members, _ := m.teamStore.ListMembers(ctx, teamID)
-
-	if err := m.teamStore.DeleteTeam(ctx, teamID); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "failed to delete team: "+err.Error()))
-		return
-	}
-
-	// Invalidate agent caches
-	if m.agentRouter != nil {
-		for _, member := range members {
-			m.agentRouter.InvalidateAgent(member.AgentKey)
-		}
-	}
-
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{"ok": true}))
-}
-
-// --- Task List (admin view) ---
-
-type teamsTaskListParams struct {
-	TeamID string `json:"teamId"`
-}
-
-func (m *TeamsMethods) handleTaskList(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
-	if m.teamStore == nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "teams not available (standalone mode)"))
-		return
-	}
-
-	var params teamsTaskListParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid params"))
-		return
-	}
-
-	if params.TeamID == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "teamId is required"))
-		return
-	}
-
-	teamID, err := uuid.Parse(params.TeamID)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid teamId"))
-		return
-	}
-
-	ctx := context.Background()
-	tasks, err := m.teamStore.ListTasks(ctx, teamID, "newest", store.TeamTaskFilterAll)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, err.Error()))
-		return
-	}
-
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
-		"tasks": tasks,
-		"count": len(tasks),
-	}))
-}
-
-// --- Add Member ---
-
-type teamsAddMemberParams struct {
-	TeamID string `json:"teamId"`
-	Agent  string `json:"agent"` // agent key or UUID
-}
-
-func (m *TeamsMethods) handleAddMember(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
-	if m.teamStore == nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "teams not available (standalone mode)"))
-		return
-	}
-
-	var params teamsAddMemberParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid params"))
-		return
-	}
-	if params.TeamID == "" || params.Agent == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "teamId and agent are required"))
-		return
-	}
-
-	teamID, err := uuid.Parse(params.TeamID)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid teamId"))
-		return
-	}
-
-	ctx := context.Background()
-
-	// Validate team exists
-	team, err := m.teamStore.GetTeam(ctx, teamID)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "team not found: "+err.Error()))
-		return
-	}
-
-	// Resolve agent
-	ag, err := resolveAgentInfo(m.agentStore, params.Agent)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "agent: "+err.Error()))
-		return
-	}
-
-	// Prevent adding lead again
-	if ag.ID == team.LeadAgentID {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "agent is already the team lead"))
-		return
-	}
-
-	// Add member
-	if err := m.teamStore.AddMember(ctx, teamID, ag.ID, store.TeamRoleMember); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "failed to add member: "+err.Error()))
-		return
-	}
-
-	// Auto-create outbound link from lead to new member
-	if m.linkStore != nil {
-		leadAgent, err := m.agentStore.GetByID(ctx, team.LeadAgentID)
-		if err == nil {
-			m.autoCreateTeamLinks(ctx, teamID, leadAgent, []*store.AgentData{ag}, client.UserID())
-		}
-	}
-
-	// Invalidate caches for all team members
-	m.invalidateTeamCaches(ctx, teamID)
-
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{"ok": true}))
-}
-
-// --- Remove Member ---
-
-type teamsRemoveMemberParams struct {
-	TeamID  string `json:"teamId"`
-	AgentID string `json:"agentId"` // agent UUID
-}
-
-func (m *TeamsMethods) handleRemoveMember(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
-	if m.teamStore == nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "teams not available (standalone mode)"))
-		return
-	}
-
-	var params teamsRemoveMemberParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid params"))
-		return
-	}
-	if params.TeamID == "" || params.AgentID == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "teamId and agentId are required"))
-		return
-	}
-
-	teamID, err := uuid.Parse(params.TeamID)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid teamId"))
-		return
-	}
-	agentID, err := uuid.Parse(params.AgentID)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid agentId"))
-		return
-	}
-
-	ctx := context.Background()
-
-	// Validate team exists and prevent removing the lead
-	team, err := m.teamStore.GetTeam(ctx, teamID)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "team not found: "+err.Error()))
-		return
-	}
-	if agentID == team.LeadAgentID {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "cannot remove the team lead"))
-		return
-	}
-
-	// Remove member
-	if err := m.teamStore.RemoveMember(ctx, teamID, agentID); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "failed to remove member: "+err.Error()))
-		return
-	}
-
-	// Clean up team-specific links
-	if m.linkStore != nil {
-		if err := m.linkStore.DeleteTeamLinksForAgent(ctx, teamID, agentID); err != nil {
-			slog.Warn("teams.members.remove: failed to clean up links", "error", err)
-		}
-	}
-
-	// Invalidate caches for all remaining members + removed agent
-	m.invalidateTeamCaches(ctx, teamID)
-	if m.agentRouter != nil {
-		ag, err := m.agentStore.GetByID(ctx, agentID)
-		if err == nil {
-			m.agentRouter.InvalidateAgent(ag.AgentKey)
-		}
-	}
-
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{"ok": true}))
-}
-
-// invalidateTeamCaches invalidates agent caches for all members of a team
-// and emits a pub/sub event for TeamToolManager cache invalidation.
-func (m *TeamsMethods) invalidateTeamCaches(ctx context.Context, teamID uuid.UUID) {
-	if m.agentRouter != nil {
-		members, err := m.teamStore.ListMembers(ctx, teamID)
-		if err == nil {
-			for _, member := range members {
-				if member.AgentKey != "" {
-					m.agentRouter.InvalidateAgent(member.AgentKey)
-				}
-			}
-		}
-	}
-	m.emitTeamCacheInvalidate()
-}
-
-// --- Update (settings) ---
-
-type teamsUpdateParams struct {
-	TeamID   string                 `json:"teamId"`
-	Settings map[string]interface{} `json:"settings"`
-}
-
-func (m *TeamsMethods) handleUpdate(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
-	if m.teamStore == nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "teams not available (standalone mode)"))
-		return
-	}
-
-	var params teamsUpdateParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid params"))
-		return
-	}
-
-	if params.TeamID == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "teamId is required"))
-		return
-	}
-
-	teamID, err := uuid.Parse(params.TeamID)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid teamId"))
-		return
-	}
-
-	ctx := context.Background()
-
-	// Validate team exists
-	if _, err := m.teamStore.GetTeam(ctx, teamID); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "team not found: "+err.Error()))
-		return
-	}
-
-	// Validate settings against teamAccessSettings schema (strip unknown fields)
-	type teamAccessSettings struct {
-		AllowUserIDs  []string `json:"allow_user_ids"`
-		DenyUserIDs   []string `json:"deny_user_ids"`
-		AllowChannels []string `json:"allow_channels"`
-		DenyChannels  []string `json:"deny_channels"`
-	}
-	raw, _ := json.Marshal(params.Settings)
-	var access teamAccessSettings
-	if err := json.Unmarshal(raw, &access); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid settings: "+err.Error()))
-		return
-	}
-	cleaned, _ := json.Marshal(access)
-
-	updates := map[string]any{"settings": json.RawMessage(cleaned)}
-	if err := m.teamStore.UpdateTeam(ctx, teamID, updates); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "failed to update team: "+err.Error()))
-		return
-	}
-
-	m.invalidateTeamCaches(ctx, teamID)
-
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{"ok": true}))
-}
-
-// --- Known Users ---
-
-type teamsKnownUsersParams struct {
-	TeamID string `json:"teamId"`
-}
-
-func (m *TeamsMethods) handleKnownUsers(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
-	if m.teamStore == nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "teams not available (standalone mode)"))
-		return
-	}
-
-	var params teamsKnownUsersParams
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid params"))
-		return
-	}
-
-	if params.TeamID == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "teamId is required"))
-		return
-	}
-
-	teamID, err := uuid.Parse(params.TeamID)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid teamId"))
-		return
-	}
-
-	ctx := context.Background()
-	users, err := m.teamStore.KnownUserIDs(ctx, teamID, 100)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, err.Error()))
-		return
-	}
-
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
-		"users": users,
-	}))
-}
-
-// --- helpers ---
-
-// autoCreateTeamLinks creates outbound agent_links from lead to each member.
-// Only the lead can delegate to members — members cannot delegate back to lead
-// or to other members. Silently skips existing links (UNIQUE constraint).
-func (m *TeamsMethods) autoCreateTeamLinks(ctx context.Context, teamID uuid.UUID, leadAgent *store.AgentData, members []*store.AgentData, createdBy string) {
-	for _, member := range members {
-		if member.ID == leadAgent.ID {
-			continue
-		}
-		link := &store.AgentLinkData{
-			SourceAgentID: leadAgent.ID,
-			TargetAgentID: member.ID,
-			Direction:     store.LinkDirectionOutbound,
-			TeamID:        &teamID,
-			Description:   "auto-created by team",
-			MaxConcurrent: 3,
-			Status:        store.LinkStatusActive,
-			CreatedBy:     createdBy,
-		}
-		if err := m.linkStore.CreateLink(ctx, link); err != nil {
-			slog.Debug("teams: auto-link already exists or failed",
-				"source", leadAgent.AgentKey, "target", member.AgentKey, "error", err)
-		}
+	// Emit team.created event
+	if m.msgBus != nil {
+		m.msgBus.Broadcast(bus.Event{
+			Name: protocol.EventTeamCreated,
+			Payload: protocol.TeamCreatedPayload{
+				TeamID:          team.ID.String(),
+				TeamName:        params.Name,
+				LeadAgentKey:    leadAgent.AgentKey,
+				LeadDisplayName: leadAgent.DisplayName,
+				MemberCount:     len(memberAgents) + 1,
+			},
+		})
 	}
 }

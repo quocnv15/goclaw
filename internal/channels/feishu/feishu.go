@@ -6,6 +6,7 @@ package feishu
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -38,6 +39,8 @@ type Channel struct {
 	senderCache     sync.Map // open_id → *senderCacheEntry
 	dedup           sync.Map // message_id → struct{}
 	pairingDebounce sync.Map // senderID → time.Time
+	reactions       sync.Map // chatID → *reactionState
+	approvedGroups  sync.Map // chatID → true (in-memory cache for paired groups)
 	groupAllowList  []string
 	groupHistory    *channels.PendingHistory
 	historyLimit    int
@@ -46,13 +49,19 @@ type Channel struct {
 	wsClient        *WSClient
 }
 
+// reactionState tracks an active typing reaction on a user's message.
+type reactionState struct {
+	messageID  string // Lark message ID (om_xxx)
+	reactionID string // reaction ID returned by API for deletion
+}
+
 type senderCacheEntry struct {
 	name      string
 	expiresAt time.Time
 }
 
 // New creates a new Feishu/Lark channel.
-func New(cfg config.FeishuConfig, msgBus *bus.MessageBus, pairingSvc store.PairingStore) (*Channel, error) {
+func New(cfg config.FeishuConfig, msgBus *bus.MessageBus, pairingSvc store.PairingStore, pendingStore store.PendingMessageStore) (*Channel, error) {
 	if cfg.AppID == "" || cfg.AppSecret == "" {
 		return nil, fmt.Errorf("feishu app_id and app_secret are required")
 	}
@@ -62,7 +71,7 @@ func New(cfg config.FeishuConfig, msgBus *bus.MessageBus, pairingSvc store.Pairi
 
 	client := NewLarkClient(cfg.AppID, cfg.AppSecret, domain)
 
-	base := channels.NewBaseChannel("feishu", msgBus, cfg.AllowFrom)
+	base := channels.NewBaseChannel(channels.TypeFeishu, msgBus, cfg.AllowFrom)
 	base.ValidatePolicy(cfg.DMPolicy, cfg.GroupPolicy)
 
 	historyLimit := cfg.HistoryLimit
@@ -76,7 +85,7 @@ func New(cfg config.FeishuConfig, msgBus *bus.MessageBus, pairingSvc store.Pairi
 		client:         client,
 		pairingService: pairingSvc,
 		groupAllowList: cfg.GroupAllowFrom,
-		groupHistory:   channels.NewPendingHistory(),
+		groupHistory:   channels.MakeHistory(channels.TypeFeishu, pendingStore),
 		historyLimit:   historyLimit,
 		stopCh:         make(chan struct{}),
 	}, nil
@@ -84,6 +93,7 @@ func New(cfg config.FeishuConfig, msgBus *bus.MessageBus, pairingSvc store.Pairi
 
 // Start begins receiving Feishu events via WebSocket or Webhook.
 func (c *Channel) Start(ctx context.Context) error {
+	c.groupHistory.StartFlusher()
 	slog.Info("starting feishu/lark bot")
 
 	// Probe bot identity
@@ -108,8 +118,17 @@ func (c *Channel) Start(ctx context.Context) error {
 	}
 }
 
+// BlockReplyEnabled returns the per-channel block_reply override (nil = inherit gateway default).
+func (c *Channel) BlockReplyEnabled() *bool { return c.cfg.BlockReply }
+
+// SetPendingCompaction configures LLM-based auto-compaction for pending messages.
+func (c *Channel) SetPendingCompaction(cfg *channels.CompactionConfig) {
+	c.groupHistory.SetCompactionConfig(cfg)
+}
+
 // Stop shuts down the Feishu channel.
 func (c *Channel) Stop(_ context.Context) error {
+	c.groupHistory.StopFlusher()
 	slog.Info("stopping feishu/lark bot")
 	close(c.stopCh)
 
@@ -267,7 +286,7 @@ func (c *Channel) startWebhook(ctx context.Context) error {
 	}
 
 	go func() {
-		if err := c.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := c.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("feishu webhook server error", "error", err)
 		}
 	}()
@@ -377,9 +396,9 @@ func resolveReceiveIDType(id string) string {
 // --- Content builders ---
 
 func buildPostContent(text string) string {
-	content := map[string]interface{}{
-		"zh_cn": map[string]interface{}{
-			"content": [][]map[string]interface{}{
+	content := map[string]any{
+		"zh_cn": map[string]any{
+			"content": [][]map[string]any{
 				{
 					{
 						"tag":  "md",
@@ -393,14 +412,14 @@ func buildPostContent(text string) string {
 	return string(data)
 }
 
-func buildMarkdownCard(text string) map[string]interface{} {
-	return map[string]interface{}{
+func buildMarkdownCard(text string) map[string]any {
+	return map[string]any{
 		"schema": "2.0",
-		"config": map[string]interface{}{
+		"config": map[string]any{
 			"wide_screen_mode": true,
 		},
-		"body": map[string]interface{}{
-			"elements": []map[string]interface{}{
+		"body": map[string]any{
+			"elements": []map[string]any{
 				{
 					"tag":     "markdown",
 					"content": text,
@@ -429,6 +448,67 @@ func (c *Channel) isDuplicate(messageID string) bool {
 	return loaded
 }
 
-// Ensure Channel implements the channels.Channel and WebhookChannel interfaces at compile time.
+// --- ReactionChannel implementation ---
+
+const typingEmoji = "Typing" // Lark emoji type for typing indicator (matching TS)
+
+// OnReactionEvent handles agent status change events by adding/removing a typing reaction
+// on the user's original message. messageID is the Lark message ID (e.g. "om_xxx").
+func (c *Channel) OnReactionEvent(ctx context.Context, chatID string, messageID string, status string) error {
+	if c.cfg.ReactionLevel == "off" || messageID == "" {
+		return nil
+	}
+
+	// Minimal mode: only act on terminal states.
+	if c.cfg.ReactionLevel == "minimal" && status != "done" && status != "error" {
+		return nil
+	}
+
+	// Terminal states: remove typing reaction.
+	if status == "done" || status == "error" {
+		return c.removeTypingReaction(ctx, chatID)
+	}
+
+	// Active states (thinking, tool): add typing reaction if not already present.
+	if _, loaded := c.reactions.Load(chatID); loaded {
+		return nil // already has a reaction
+	}
+
+	reactionID, err := c.client.AddMessageReaction(ctx, messageID, typingEmoji)
+	if err != nil {
+		slog.Debug("feishu: add typing reaction failed", "message_id", messageID, "error", err)
+		return nil // non-critical, don't fail the run
+	}
+
+	c.reactions.Store(chatID, &reactionState{
+		messageID:  messageID,
+		reactionID: reactionID,
+	})
+	return nil
+}
+
+// ClearReaction removes the typing reaction from a message.
+func (c *Channel) ClearReaction(ctx context.Context, chatID string, _ string) error {
+	return c.removeTypingReaction(ctx, chatID)
+}
+
+// removeTypingReaction removes the stored typing reaction for a chatID.
+func (c *Channel) removeTypingReaction(ctx context.Context, chatID string) error {
+	val, ok := c.reactions.LoadAndDelete(chatID)
+	if !ok {
+		return nil
+	}
+	rs := val.(*reactionState)
+	if rs.reactionID == "" {
+		return nil
+	}
+	if err := c.client.DeleteMessageReaction(ctx, rs.messageID, rs.reactionID); err != nil {
+		slog.Debug("feishu: remove typing reaction failed", "message_id", rs.messageID, "error", err)
+	}
+	return nil
+}
+
+// Ensure Channel implements the channels.Channel, WebhookChannel, and ReactionChannel interfaces at compile time.
 var _ channels.Channel = (*Channel)(nil)
 var _ channels.WebhookChannel = (*Channel)(nil)
+var _ channels.ReactionChannel = (*Channel)(nil)

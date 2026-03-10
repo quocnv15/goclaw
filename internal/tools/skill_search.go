@@ -13,17 +13,17 @@ import (
 )
 
 // SkillSearchTool implements the skill_search tool with BM25 search
-// and optional hybrid search (BM25 + embedding) in managed mode.
+// and optional hybrid search (BM25 + embedding).
 type SkillSearchTool struct {
 	index       *skills.Index
 	loader      *skills.Loader
 	lastVersion int64 // tracks loader version for lazy rebuild
 
-	// Optional: embedding-based search (managed mode only)
+	// Optional: embedding-based search
 	embSearcher store.EmbeddingSkillSearcher
 	embProvider store.EmbeddingProvider
 
-	// Optional: per-agent skill access filtering (managed mode only).
+	// Optional: per-agent skill access filtering.
 	// When set, search results are filtered to only include skills
 	// accessible to the calling agent (public + agent-granted internal).
 	skillAccess store.SkillAccessStore
@@ -70,15 +70,15 @@ func (t *SkillSearchTool) Description() string {
 	return "Search for available skills by keyword. Returns matching skills with name, description, and SKILL.md location for reading with read_file."
 }
 
-func (t *SkillSearchTool) Parameters() map[string]interface{} {
-	return map[string]interface{}{
+func (t *SkillSearchTool) Parameters() map[string]any {
+	return map[string]any{
 		"type": "object",
-		"properties": map[string]interface{}{
-			"query": map[string]interface{}{
+		"properties": map[string]any{
+			"query": map[string]any{
 				"type":        "string",
 				"description": "Search keywords to find relevant skills (use English keywords)",
 			},
-			"max_results": map[string]interface{}{
+			"max_results": map[string]any{
 				"type":        "integer",
 				"description": "Maximum number of results to return (default: 5)",
 			},
@@ -87,7 +87,7 @@ func (t *SkillSearchTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *SkillSearchTool) Execute(ctx context.Context, args map[string]interface{}) *Result {
+func (t *SkillSearchTool) Execute(ctx context.Context, args map[string]any) *Result {
 	query, _ := args["query"].(string)
 	if query == "" {
 		return ErrorResult("query parameter is required")
@@ -127,15 +127,15 @@ func (t *SkillSearchTool) Execute(ctx context.Context, args map[string]interface
 		return NewResult(fmt.Sprintf("No skills found matching: %s", query))
 	}
 
-	data, _ := json.MarshalIndent(map[string]interface{}{
+	data, _ := json.MarshalIndent(map[string]any{
 		"results": results,
 		"count":   len(results),
 	}, "", "  ")
 
 	// Include explicit next-step instruction in the result so the model follows through.
 	instruction := fmt.Sprintf(
-		"\n\nACTION REQUIRED: Call read_file with path \"%s\" to read the skill instructions, then follow them.",
-		results[0].Location,
+		"\n\nACTION REQUIRED: Call use_skill with name \"%s\", then read_file with path \"%s\" to read the skill instructions, then follow them.",
+		results[0].Name, results[0].Location,
 	)
 
 	return NewResult(string(data) + instruction)
@@ -166,8 +166,10 @@ func (t *SkillSearchTool) filterByAccess(ctx context.Context, results []skills.S
 	for _, r := range results {
 		if r.Source != "managed" {
 			filtered = append(filtered, r)
-		} else if _, ok := allowed[r.Name]; ok {
+		} else if _, ok := allowed[r.Slug]; ok {
 			filtered = append(filtered, r)
+		} else {
+			slog.Debug("skill_search: filtered out inaccessible managed skill", "slug", r.Slug, "name", r.Name)
 		}
 	}
 	return filtered
@@ -238,6 +240,7 @@ func (t *SkillSearchTool) hybridSearch(ctx context.Context, query string, bm25Re
 			seen[r.Name] = &merged{
 				result: skills.SkillSearchResult{
 					Name:        r.Name,
+					Slug:        r.Slug,
 					Description: r.Description,
 					Location:    r.Path,
 					Source:      "managed",

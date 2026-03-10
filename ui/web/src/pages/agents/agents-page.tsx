@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { useParams, useNavigate } from "react-router";
 import { Plus, Bot } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { PageHeader } from "@/components/shared/page-header";
 import { EmptyState } from "@/components/shared/empty-state";
 import { SearchInput } from "@/components/shared/search-input";
@@ -8,8 +9,8 @@ import { Pagination } from "@/components/shared/pagination";
 import { CardSkeleton } from "@/components/shared/loading-skeleton";
 import { useDeferredLoading } from "@/hooks/use-deferred-loading";
 import { Button } from "@/components/ui/button";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
-import { useHttp } from "@/hooks/use-ws";
 import { useAgents } from "./hooks/use-agents";
 import { AgentCard } from "./agent-card";
 import { AgentCreateDialog } from "./agent-create-dialog";
@@ -18,10 +19,10 @@ import { SummoningModal } from "./summoning-modal";
 import { usePagination } from "@/hooks/use-pagination";
 
 export function AgentsPage() {
+  const { t } = useTranslation("agents");
   const { id: detailId } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const http = useHttp();
-  const { agents, loading, createAgent, deleteAgent, refresh } = useAgents();
+  const { agents, loading, createAgent, deleteAgent, refresh, resummonAgent } = useAgents();
   const showSkeleton = useDeferredLoading(loading && agents.length === 0);
 
   const [search, setSearch] = useState("");
@@ -31,10 +32,10 @@ export function AgentsPage() {
 
   const handleResummon = async (agent: { id: string; display_name?: string; agent_key: string }) => {
     try {
-      await http.post(`/v1/agents/${agent.id}/resummon`);
+      await resummonAgent(agent.id);
       setSummoningAgent({ id: agent.id, name: agent.display_name || agent.agent_key });
     } catch {
-      // error handled by http hook
+      // error handled by hook
     }
   };
 
@@ -61,13 +62,13 @@ export function AgentsPage() {
   useEffect(() => { resetPage(); }, [search, resetPage]);
 
   return (
-    <div className="p-6">
+    <div className="p-4 sm:p-6">
       <PageHeader
-        title="Agents"
-        description="Manage your AI agents"
+        title={t("title")}
+        description={t("description")}
         actions={
           <Button onClick={() => setCreateOpen(true)} className="gap-1">
-            <Plus className="h-4 w-4" /> Create Agent
+            <Plus className="h-4 w-4" /> {t("createAgent")}
           </Button>
         }
       />
@@ -76,7 +77,7 @@ export function AgentsPage() {
         <SearchInput
           value={search}
           onChange={setSearch}
-          placeholder="Search agents..."
+          placeholder={t("searchPlaceholder")}
           className="max-w-sm"
         />
       </div>
@@ -91,34 +92,37 @@ export function AgentsPage() {
         ) : filtered.length === 0 ? (
           <EmptyState
             icon={Bot}
-            title={search ? "No matching agents" : "No agents yet"}
+            title={search ? t("noMatchTitle") : t("emptyTitle")}
             description={
               search
-                ? "Try a different search term."
-                : "Create your first agent to get started."
+                ? t("noMatchDescription")
+                : t("emptyDescription")
             }
           />
         ) : (
           <>
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {pageItems.map((agent) => (
-                <AgentCard
-                  key={agent.id}
-                  agent={agent}
-                  onClick={() => {
-                    if (agent.status === "summoning") {
-                      setSummoningAgent({
-                        id: agent.id,
-                        name: agent.display_name || agent.agent_key,
-                      });
-                    } else {
-                      navigate(`/agents/${agent.id}`);
-                    }
-                  }}
-                  onResummon={() => handleResummon(agent)}
-                />
-              ))}
-            </div>
+            <TooltipProvider>
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                {pageItems.map((agent) => (
+                  <AgentCard
+                    key={agent.id}
+                    agent={agent}
+                    onClick={() => {
+                      if (agent.status === "summoning") {
+                        setSummoningAgent({
+                          id: agent.id,
+                          name: agent.display_name || agent.agent_key,
+                        });
+                      } else {
+                        navigate(`/agents/${agent.id}`);
+                      }
+                    }}
+                    onResummon={() => handleResummon(agent)}
+                    onDelete={() => setDeleteTarget(agent.id)}
+                  />
+                ))}
+              </div>
+            </TooltipProvider>
             <div className="mt-4">
               <Pagination
                 page={pagination.page}
@@ -150,9 +154,9 @@ export function AgentsPage() {
       <ConfirmDialog
         open={!!deleteTarget}
         onOpenChange={() => setDeleteTarget(null)}
-        title="Delete Agent"
-        description="Are you sure you want to delete this agent? This action cannot be undone."
-        confirmLabel="Delete"
+        title={t("delete.title")}
+        description={t("delete.description")}
+        confirmLabel={t("delete.confirmLabel")}
         variant="destructive"
         onConfirm={async () => {
           if (deleteTarget) {
@@ -169,6 +173,7 @@ export function AgentsPage() {
           agentId={summoningAgent.id}
           agentName={summoningAgent.name}
           onCompleted={refresh}
+          onResummon={resummonAgent}
         />
       )}
     </div>

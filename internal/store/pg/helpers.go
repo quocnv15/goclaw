@@ -71,7 +71,7 @@ func jsonOrEmpty(data []byte) []byte {
 	return data
 }
 
-func jsonOrNull(data json.RawMessage) interface{} {
+func jsonOrNull(data json.RawMessage) any {
 	if data == nil {
 		return nil
 	}
@@ -81,7 +81,7 @@ func jsonOrNull(data json.RawMessage) interface{} {
 // --- PostgreSQL array helpers ---
 
 // pqStringArray converts a Go string slice to a PostgreSQL text[] literal.
-func pqStringArray(arr []string) interface{} {
+func pqStringArray(arr []string) any {
 	if arr == nil {
 		return nil
 	}
@@ -110,11 +110,17 @@ func execMapUpdate(ctx context.Context, db *sql.DB, table string, id uuid.UUID, 
 		return nil
 	}
 	var setClauses []string
-	var args []interface{}
+	var args []any
 	i := 1
 	for col, val := range updates {
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", col, i))
 		args = append(args, val)
+		i++
+	}
+	// Auto-set updated_at for tables that have the column, unless caller already included it.
+	if _, ok := updates["updated_at"]; !ok && tableHasUpdatedAt(table) {
+		setClauses = append(setClauses, fmt.Sprintf("updated_at = $%d", i))
+		args = append(args, time.Now().UTC())
 		i++
 	}
 	args = append(args, id)
@@ -123,6 +129,17 @@ func execMapUpdate(ctx context.Context, db *sql.DB, table string, id uuid.UUID, 
 	return err
 }
 
-func nowUTC() time.Time {
-	return time.Now().UTC()
+// tablesWithUpdatedAt lists tables that have an updated_at column.
+var tablesWithUpdatedAt = map[string]bool{
+	"agents": true, "llm_providers": true, "sessions": true,
+	"channel_instances": true, "cron_jobs": true, "custom_tools": true,
+	"skills": true, "mcp_servers": true, "agent_links": true,
+	"agent_teams": true, "team_tasks": true, "builtin_tools": true,
+	"agent_context_files": true, "user_context_files": true,
+	"user_agent_overrides": true, "config_secrets": true,
+	"memory_documents": true, "memory_chunks": true, "embedding_cache": true,
+}
+
+func tableHasUpdatedAt(table string) bool {
+	return tablesWithUpdatedAt[table]
 }

@@ -1,8 +1,10 @@
 import { useState, useCallback, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useWs } from "@/hooks/use-ws";
+import { useAuthStore } from "@/stores/use-auth-store";
 import { Methods } from "@/api/protocol";
 import { queryKeys } from "@/lib/query-keys";
+import { toast } from "@/stores/use-toast-store";
 
 interface ConfigData {
   config: Record<string, unknown>;
@@ -12,19 +14,21 @@ interface ConfigData {
 
 export function useConfig() {
   const ws = useWs();
+  const connected = useAuthStore((s) => s.connected);
   const queryClient = useQueryClient();
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const hashRef = useRef("");
 
-  const { data, isLoading: loading } = useQuery({
+  const { data, isPending: loading } = useQuery({
     queryKey: queryKeys.config.all,
     queryFn: async (): Promise<ConfigData> => {
-      if (!ws.isConnected) return { config: {}, hash: "", path: "" };
       const res = await ws.call<ConfigData>(Methods.CONFIG_GET);
       hashRef.current = res.hash;
       return res;
     },
+    staleTime: 5 * 60_000,
+    enabled: connected,
   });
 
   const config = data?.config ?? null;
@@ -47,8 +51,11 @@ export function useConfig() {
         });
         hashRef.current = res.hash;
         await invalidate();
+        toast.success("Config saved");
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to apply config");
+        const msg = err instanceof Error ? err.message : "Failed to apply config";
+        setError(msg);
+        toast.error("Failed to save config", msg);
         throw err;
       } finally {
         setSaving(false);
@@ -62,10 +69,17 @@ export function useConfig() {
       setSaving(true);
       setError(null);
       try {
-        await ws.call(Methods.CONFIG_PATCH, updates);
+        const res = await ws.call<{ hash: string }>(Methods.CONFIG_PATCH, {
+          raw: JSON.stringify(updates),
+          baseHash: hashRef.current,
+        });
+        hashRef.current = res.hash;
         await invalidate();
+        toast.success("Config saved");
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to patch config");
+        const msg = err instanceof Error ? err.message : "Failed to patch config";
+        setError(msg);
+        toast.error("Failed to save config", msg);
         throw err;
       } finally {
         setSaving(false);

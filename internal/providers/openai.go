@@ -36,7 +36,7 @@ func NewOpenAIProvider(name, apiKey, apiBase, defaultModel string) *OpenAIProvid
 		apiBase:      apiBase,
 		chatPath:     "/chat/completions",
 		defaultModel: defaultModel,
-		client:       &http.Client{Timeout: 120 * time.Second},
+		client:       &http.Client{Timeout: 300 * time.Second},
 		retryConfig:  DefaultRetryConfig(),
 	}
 }
@@ -47,11 +47,11 @@ func (p *OpenAIProvider) WithChatPath(path string) *OpenAIProvider {
 	return p
 }
 
-func (p *OpenAIProvider) Name() string            { return p.name }
-func (p *OpenAIProvider) DefaultModel() string     { return p.defaultModel }
-func (p *OpenAIProvider) SupportsThinking() bool   { return true }
-func (p *OpenAIProvider) APIKey() string       { return p.apiKey }
-func (p *OpenAIProvider) APIBase() string      { return p.apiBase }
+func (p *OpenAIProvider) Name() string           { return p.name }
+func (p *OpenAIProvider) DefaultModel() string   { return p.defaultModel }
+func (p *OpenAIProvider) SupportsThinking() bool { return true }
+func (p *OpenAIProvider) APIKey() string         { return p.apiKey }
+func (p *OpenAIProvider) APIBase() string        { return p.apiBase }
 
 // resolveModel returns the model ID to use for a request.
 // For OpenRouter, model IDs require a provider prefix (e.g. "anthropic/claude-sonnet-4-5-20250929").
@@ -103,12 +103,16 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ChatRequest, onChun
 	accumulators := make(map[int]*toolCallAccumulator)
 
 	scanner := bufio.NewScanner(respBody)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 1MB max line for large tool call / thinking chunks
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
+		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		data := strings.TrimPrefix(line, "data: ")
+		// SSE spec allows both "data: value" and "data:value" (space is optional).
+		// Some providers (e.g. Kimi) omit the space after the colon.
+		data := strings.TrimPrefix(line, "data:")
+		data = strings.TrimPrefix(data, " ")
 		if data == "[DONE]" {
 			break
 		}
@@ -116,6 +120,23 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ChatRequest, onChun
 		var chunk openAIStreamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
+		}
+
+		// Usage chunk often has empty choices — extract usage before skipping.
+		// When stream_options.include_usage is true, the final chunk contains
+		// usage data but choices is typically an empty array.
+		if chunk.Usage != nil {
+			result.Usage = &Usage{
+				PromptTokens:     chunk.Usage.PromptTokens,
+				CompletionTokens: chunk.Usage.CompletionTokens,
+				TotalTokens:      chunk.Usage.TotalTokens,
+			}
+			if chunk.Usage.PromptTokensDetails != nil {
+				result.Usage.CacheReadTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+			}
+			if chunk.Usage.CompletionTokensDetails != nil && chunk.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
+				result.Usage.ThinkingTokens = chunk.Usage.CompletionTokensDetails.ReasoningTokens
+			}
 		}
 
 		if len(chunk.Choices) == 0 {
@@ -158,26 +179,17 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ChatRequest, onChun
 			result.FinishReason = chunk.Choices[0].FinishReason
 		}
 
-		if chunk.Usage != nil {
-			result.Usage = &Usage{
-				PromptTokens:     chunk.Usage.PromptTokens,
-				CompletionTokens: chunk.Usage.CompletionTokens,
-				TotalTokens:      chunk.Usage.TotalTokens,
-			}
-			if chunk.Usage.PromptTokensDetails != nil {
-				result.Usage.CacheReadTokens = chunk.Usage.PromptTokensDetails.CachedTokens
-			}
-			if chunk.Usage.CompletionTokensDetails != nil && chunk.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
-				result.Usage.ThinkingTokens = chunk.Usage.CompletionTokensDetails.ReasoningTokens
-			}
-		}
+	}
 
+	// Check for scanner errors (timeout, connection reset, etc.)
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("%s: stream read error: %w", p.name, err)
 	}
 
 	// Parse accumulated tool call arguments
 	for i := 0; i < len(accumulators); i++ {
 		acc := accumulators[i]
-		args := make(map[string]interface{})
+		args := make(map[string]any)
 		_ = json.Unmarshal([]byte(acc.rawArgs), &args)
 		acc.Arguments = args
 		if acc.thoughtSig != "" {
@@ -197,7 +209,7 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ChatRequest, onChun
 	return result, nil
 }
 
-func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream bool) map[string]interface{} {
+func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream bool) map[string]any {
 	// Gemini 2.5+: collapse tool_call cycles missing thought_signature.
 	// Gemini requires thought_signature echoed back on every tool_call; models that
 	// don't return it (e.g. gemini-3-flash) will cause HTTP 400 if sent as-is.
@@ -211,26 +223,31 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 	// This is necessary because our internal Message/ToolCall structs don't match
 	// the OpenAI API format (tool_calls need type+function wrapper, arguments as JSON string).
 	// Also omits empty content on assistant messages with tool_calls (Gemini compatibility).
-	msgs := make([]map[string]interface{}, 0, len(inputMessages))
+	msgs := make([]map[string]any, 0, len(inputMessages))
 	for _, m := range inputMessages {
-		msg := map[string]interface{}{
+		msg := map[string]any{
 			"role": m.Role,
+		}
+
+		// Echo reasoning_content for assistant messages (required by Kimi, DeepSeek when thinking is enabled)
+		if m.Thinking != "" && m.Role == "assistant" {
+			msg["reasoning_content"] = m.Thinking
 		}
 
 		// Include content; omit empty content for assistant messages with tool_calls
 		// (Gemini rejects empty content → "must include at least one parts field").
 		if m.Role == "user" && len(m.Images) > 0 {
-			var parts []map[string]interface{}
+			var parts []map[string]any
 			for _, img := range m.Images {
-				parts = append(parts, map[string]interface{}{
+				parts = append(parts, map[string]any{
 					"type": "image_url",
-					"image_url": map[string]interface{}{
+					"image_url": map[string]any{
 						"url": fmt.Sprintf("data:%s;base64,%s", img.MimeType, img.Data),
 					},
 				})
 			}
 			if m.Content != "" {
-				parts = append(parts, map[string]interface{}{
+				parts = append(parts, map[string]any{
 					"type": "text",
 					"text": m.Content,
 				})
@@ -243,17 +260,17 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 		// Convert tool_calls to OpenAI wire format:
 		// {id, type: "function", function: {name, arguments: "<json string>"}}
 		if len(m.ToolCalls) > 0 {
-			toolCalls := make([]map[string]interface{}, len(m.ToolCalls))
+			toolCalls := make([]map[string]any, len(m.ToolCalls))
 			for i, tc := range m.ToolCalls {
 				argsJSON, _ := json.Marshal(tc.Arguments)
-				fn := map[string]interface{}{
+				fn := map[string]any{
 					"name":      tc.Name,
 					"arguments": string(argsJSON),
 				}
 				if sig := tc.Metadata["thought_signature"]; sig != "" {
 					fn["thought_signature"] = sig
 				}
-				toolCalls[i] = map[string]interface{}{
+				toolCalls[i] = map[string]any{
 					"id":       tc.ID,
 					"type":     "function",
 					"function": fn,
@@ -269,7 +286,7 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 		msgs = append(msgs, msg)
 	}
 
-	body := map[string]interface{}{
+	body := map[string]any{
 		"model":    model,
 		"messages": msgs,
 		"stream":   stream,
@@ -281,7 +298,7 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 	}
 
 	if stream {
-		body["stream_options"] = map[string]interface{}{
+		body["stream_options"] = map[string]any{
 			"include_usage": true,
 		}
 	}
@@ -310,7 +327,7 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 	return body
 }
 
-func (p *OpenAIProvider) doRequest(ctx context.Context, body interface{}) (io.ReadCloser, error) {
+func (p *OpenAIProvider) doRequest(ctx context.Context, body any) (io.ReadCloser, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("%s: marshal request: %w", p.name, err)
@@ -353,7 +370,7 @@ func (p *OpenAIProvider) parseResponse(resp *openAIResponse) *ChatResponse {
 		result.FinishReason = resp.Choices[0].FinishReason
 
 		for _, tc := range msg.ToolCalls {
-			args := make(map[string]interface{})
+			args := make(map[string]any)
 			_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
 			call := ToolCall{
 				ID:        tc.ID,
@@ -387,4 +404,3 @@ func (p *OpenAIProvider) parseResponse(resp *openAIResponse) *ChatResponse {
 
 	return result
 }
-

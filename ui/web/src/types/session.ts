@@ -11,6 +11,9 @@ export interface SessionInfo {
   channel?: string;
   inputTokens?: number;
   outputTokens?: number;
+  userID?: string;
+  metadata?: Record<string, string>;
+  agentName?: string;
 }
 
 export interface SessionPreview {
@@ -23,8 +26,9 @@ export interface SessionPreview {
 export interface Message {
   role: "user" | "assistant" | "tool";
   content: string;
-  toolCalls?: ToolCall[];
-  toolCallId?: string;
+  thinking?: string;
+  tool_calls?: ToolCall[];
+  tool_call_id?: string;
 }
 
 export interface ToolCall {

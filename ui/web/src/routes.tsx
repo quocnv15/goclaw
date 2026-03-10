@@ -2,6 +2,7 @@ import { lazy, Suspense } from "react";
 import { Routes, Route, Navigate } from "react-router";
 import { AppLayout } from "@/components/layout/app-layout";
 import { RequireAuth } from "@/components/shared/require-auth";
+import { RequireSetup } from "@/components/shared/require-setup";
 import { ROUTES } from "@/lib/constants";
 
 // Lazy-loaded pages
@@ -65,8 +66,29 @@ const BuiltinToolsPage = lazy(() =>
 const TtsPage = lazy(() =>
   import("@/pages/tts/tts-page").then((m) => ({ default: m.TtsPage })),
 );
+const EventsPage = lazy(() =>
+  import("@/pages/events/events-page").then((m) => ({ default: m.EventsPage })),
+);
 const DelegationsPage = lazy(() =>
   import("@/pages/delegations/delegations-page").then((m) => ({ default: m.DelegationsPage })),
+);
+const StoragePage = lazy(() =>
+  import("@/pages/storage/storage-page").then((m) => ({ default: m.StoragePage })),
+);
+const SetupPage = lazy(() =>
+  import("@/pages/setup/setup-page").then((m) => ({ default: m.SetupPage })),
+);
+const PendingMessagesPage = lazy(() =>
+  import("@/pages/pending-messages/pending-messages-page").then((m) => ({ default: m.PendingMessagesPage })),
+);
+const MemoryPage = lazy(() =>
+  import("@/pages/memory/memory-page").then((m) => ({ default: m.MemoryPage })),
+);
+const KnowledgeGraphPage = lazy(() =>
+  import("@/pages/knowledge-graph/knowledge-graph-page").then((m) => ({ default: m.KnowledgeGraphPage })),
+);
+const ContactsPage = lazy(() =>
+  import("@/pages/contacts/contacts-page").then((m) => ({ default: m.ContactsPage })),
 );
 
 function PageLoader() {
@@ -83,10 +105,23 @@ export function AppRoutes() {
       <Routes>
         <Route path={ROUTES.LOGIN} element={<LoginPage />} />
 
+        {/* Setup wizard — standalone layout, requires auth but no sidebar */}
+        <Route
+          path={ROUTES.SETUP}
+          element={
+            <RequireAuth>
+              <SetupPage />
+            </RequireAuth>
+          }
+        />
+
+        {/* Main app — requires auth + setup complete */}
         <Route
           element={
             <RequireAuth>
-              <AppLayout />
+              <RequireSetup>
+                <AppLayout />
+              </RequireSetup>
             </RequireAuth>
           }
         >
@@ -103,12 +138,16 @@ export function AppRoutes() {
           <Route path={ROUTES.SKILLS} element={<SkillsPage key="list" />} />
           <Route path={ROUTES.SKILL_DETAIL} element={<SkillsPage key="detail" />} />
           <Route path={ROUTES.CRON} element={<CronPage />} />
+          <Route path={ROUTES.CRON_DETAIL} element={<CronPage />} />
           <Route path={ROUTES.CONFIG} element={<ConfigPage />} />
           <Route path={ROUTES.TRACES} element={<TracesPage key="list" />} />
           <Route path={ROUTES.TRACE_DETAIL} element={<TracesPage key="detail" />} />
+          <Route path={ROUTES.EVENTS} element={<EventsPage />} />
           <Route path={ROUTES.DELEGATIONS} element={<DelegationsPage />} />
           <Route path={ROUTES.USAGE} element={<UsagePage />} />
-          <Route path={ROUTES.CHANNELS} element={<ChannelsPage />} />
+          <Route path={ROUTES.CHANNELS} element={<ChannelsPage key="list" />} />
+          <Route path={ROUTES.CHANNEL_DETAIL} element={<ChannelsPage key="detail" />} />
+          <Route path={ROUTES.CONTACTS} element={<ContactsPage />} />
           <Route path={ROUTES.APPROVALS} element={<ApprovalsPage />} />
           <Route path={ROUTES.NODES} element={<NodesPage />} />
           <Route path={ROUTES.LOGS} element={<LogsPage />} />
@@ -117,6 +156,10 @@ export function AppRoutes() {
           <Route path={ROUTES.BUILTIN_TOOLS} element={<BuiltinToolsPage />} />
           <Route path={ROUTES.MCP} element={<MCPPage />} />
           <Route path={ROUTES.TTS} element={<TtsPage />} />
+          <Route path={ROUTES.STORAGE} element={<StoragePage />} />
+          <Route path={ROUTES.PENDING_MESSAGES} element={<PendingMessagesPage />} />
+          <Route path={ROUTES.MEMORY} element={<MemoryPage />} />
+          <Route path={ROUTES.KNOWLEDGE_GRAPH} element={<KnowledgeGraphPage />} />
         </Route>
 
         {/* Catch-all → overview */}

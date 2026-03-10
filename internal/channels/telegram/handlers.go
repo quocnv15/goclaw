@@ -191,69 +191,22 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 		content += message.Caption
 	}
 
-	// Process media (photos, audio, voice, documents)
-	mediaList := c.resolveMedia(ctx, message)
-	var mediaPaths []string
-
-	if len(mediaList) > 0 {
-		// First pass: process each media item.
-		// For audio/voice: attempt STT transcription so that buildMediaTags can embed the transcript.
-		// For documents: extract text content to append after the media tags.
-		// Note: buildMediaTags is called AFTER this loop so it picks up populated Transcript fields.
-		var extraContent string
-		for i := range mediaList {
-			m := &mediaList[i]
-
-			switch m.Type {
-			case "audio", "voice":
-				transcript, sttErr := c.transcribeAudio(ctx, m.FilePath)
-				if sttErr != nil {
-					slog.Warn("telegram: STT transcription failed, falling back to media placeholder",
-						"type", m.Type, "error", sttErr,
-					)
-				} else {
-					m.Transcript = transcript
-				}
-
-			case "document":
-				// Extract text content from documents
-				if m.FileName != "" && m.FilePath != "" {
-					docContent, err := extractDocumentContent(m.FilePath, m.FileName)
-					if err != nil {
-						slog.Warn("document extraction failed", "file", m.FileName, "error", err)
-					} else if docContent != "" {
-						extraContent += "\n\n" + docContent
-					}
-				}
-
-			case "video", "animation":
-				// Video: notify user that video is not fully supported yet.
-				// Only add the notice when there is no caption/text — media tags haven't been
-				// prepended yet at this stage of the pipeline.
-				if content == "" {
-					extraContent += "\n\n[Video received — video content analysis is not yet supported, only caption text is processed]"
-				}
-			}
-
-			if m.FilePath != "" {
-				mediaPaths = append(mediaPaths, m.FilePath)
-			}
+	// Build lightweight media tags from message metadata (no download).
+	// Used for pending history recording and bot command handling.
+	// Actual media download + processing is deferred until after mention gating.
+	if tags := lightweightMediaTags(message); tags != "" {
+		if content != "" {
+			content = tags + "\n\n" + content
+		} else {
+			content = tags
 		}
+	}
 
-		// Build media tags AFTER the processing loop so transcript fields are populated.
-		mediaTags := buildMediaTags(mediaList)
-		if mediaTags != "" {
-			if content != "" {
-				content = mediaTags + "\n\n" + content
-			} else {
-				content = mediaTags
-			}
-		}
-
-		// Append any extra content accumulated during processing (doc text, video note, etc.)
-		if extraContent != "" {
-			content += extraContent
-		}
+	// Handle bot commands BEFORE enriching with reply/forward context.
+	// Command parsing (SplitN on spaces) breaks when reply context is appended with newlines,
+	// e.g. "/addwriter@bot\n\n[Replying to ...]" — the bot-username check fails.
+	if handled := c.handleBotCommand(ctx, message, chatID, chatIDStr, localKey, content, senderID, isGroup, isForum, messageThreadID); handled {
+		return
 	}
 
 	// Enrich content with forward/reply/location context
@@ -262,11 +215,6 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 
 	if content == "" {
 		content = "[empty message]"
-	}
-
-	// Handle bot commands (/start, /help, /reset, /status, /addwriter, /removewriter, /writers).
-	if handled := c.handleBotCommand(ctx, message, chatID, chatIDStr, localKey, content, senderID, isGroup, isForum, messageThreadID); handled {
-		return
 	}
 
 	// Compute sender label for group context (used in history + current message annotation)
@@ -297,10 +245,16 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 		if !wasMentioned {
 			c.groupHistory.Record(localKey, channels.HistoryEntry{
 				Sender:    senderLabel,
+				SenderID:  senderID,
 				Body:      content,
 				Timestamp: time.Unix(int64(message.Date), 0),
 				MessageID: fmt.Sprintf("%d", message.MessageID),
 			}, c.historyLimit)
+
+			// Collect contact even when bot is not mentioned (cache prevents DB spam).
+			if cc := c.ContactCollector(); cc != nil {
+				cc.EnsureContact(ctx, c.Type(), c.Name(), userID, userID, user.FirstName, user.Username, "group")
+			}
 
 			slog.Debug("telegram group message recorded (no mention)",
 				"chat_id", chatID, "sender", senderLabel,
@@ -316,9 +270,75 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 			if c.pairingService.IsPaired(groupSenderID, c.Name()) {
 				c.approvedGroups.Store(chatIDStr, true)
 			} else {
-				c.sendGroupPairingReply(ctx, chatID, chatIDStr, groupSenderID, localKey, messageThreadID)
+				c.sendGroupPairingReply(ctx, chatID, chatIDStr, groupSenderID, localKey, messageThreadID, message.Chat.Title)
 				return
 			}
+		}
+	}
+
+	// --- Media download (only when bot will process the message) ---
+	// Deferred until after mention + pairing gates to avoid downloading
+	// media for messages that only get recorded in pending history.
+	mediaList := c.resolveMedia(ctx, message)
+	if message.ReplyToMessage != nil && len(mediaList) == 0 {
+		replyMedia := c.resolveMedia(ctx, message.ReplyToMessage)
+		if len(replyMedia) > 0 {
+			mediaList = append(mediaList, replyMedia...)
+			slog.Debug("telegram: resolved media from replied message",
+				"reply_msg_id", message.ReplyToMessage.MessageID,
+				"media_count", len(replyMedia),
+			)
+		}
+	}
+
+	var mediaFiles []bus.MediaFile
+	if len(mediaList) > 0 {
+		var extraContent string
+		for i := range mediaList {
+			m := &mediaList[i]
+			switch m.Type {
+			case "audio", "voice":
+				transcript, sttErr := c.transcribeAudio(ctx, m.FilePath)
+				if sttErr != nil {
+					slog.Warn("telegram: STT transcription failed",
+						"type", m.Type, "error", sttErr)
+				} else {
+					m.Transcript = transcript
+				}
+			case "document":
+				if m.FileName != "" && m.FilePath != "" {
+					docContent, err := extractDocumentContent(m.FilePath, m.FileName)
+					if err != nil {
+						slog.Warn("document extraction failed", "file", m.FileName, "error", err)
+					} else if docContent != "" {
+						extraContent += "\n\n" + docContent
+					}
+				}
+			case "video", "animation":
+				// Handled by read_video tool via MediaRef pipeline.
+			}
+			if m.FilePath != "" {
+				mediaFiles = append(mediaFiles, bus.MediaFile{
+					Path:     m.FilePath,
+					MimeType: m.ContentType,
+				})
+			}
+		}
+
+		// Replace lightweight media tags with full tags (includes transcripts).
+		fullTags := buildMediaTags(mediaList)
+		lightTags := lightweightMediaTags(message)
+		if lightTags != "" && fullTags != "" {
+			content = strings.Replace(content, lightTags, fullTags, 1)
+		} else if fullTags != "" {
+			if content != "" {
+				content = fullTags + "\n\n" + content
+			} else {
+				content = fullTags
+			}
+		}
+		if extraContent != "" {
+			content += extraContent
 		}
 	}
 
@@ -373,9 +393,10 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 	_, thinkCancel := context.WithCancel(ctx)
 	c.stopThinking.Store(localKey, &thinkingCancel{fn: thinkCancel})
 
-	// Send placeholder message only for DMs.
-	// In groups the placeholder drifts away as new messages arrive;
-	// instead the response will be sent as a reply to the sender's message.
+	// Send "Thinking..." placeholder for DMs.
+	// The streaming system will edit this message progressively (editMessageText),
+	// giving a smooth transition: "Thinking..." → streaming chunks → final formatted response.
+	// Groups: no placeholder; response replies to the sender's message.
 	if !isGroup {
 		thinkMsg := tu.Message(chatIDObj, "Thinking...")
 		if dmThreadID > 0 {
@@ -394,6 +415,9 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 		"first_name": user.FirstName,
 		"is_group":   fmt.Sprintf("%t", isGroup),
 		"local_key":  localKey,
+	}
+	if message.Chat.Title != "" {
+		metadata["chat_title"] = message.Chat.Title
 	}
 	if isForum {
 		metadata["is_forum"] = "true"
@@ -436,7 +460,7 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 		SenderID:     senderID,
 		ChatID:       chatIDStr,
 		Content:      finalContent,
-		Media:        mediaPaths,
+		Media:        mediaFiles,
 		PeerKind:     peerKind,
 		UserID:       userID,
 		AgentID:      targetAgentID,
@@ -451,77 +475,3 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 	}
 }
 
-// detectMention checks if a Telegram message mentions the bot.
-// Checks both msg.Text/Entities (text messages) and msg.Caption/CaptionEntities (photo/media messages).
-func (c *Channel) detectMention(msg *telego.Message, botUsername string) bool {
-	if botUsername == "" {
-		return false
-	}
-	lowerBot := strings.ToLower(botUsername)
-
-	// Check both text entities and caption entities (photos use Caption, not Text).
-	for _, pair := range []struct {
-		entities []telego.MessageEntity
-		text     string
-	}{
-		{msg.Entities, msg.Text},
-		{msg.CaptionEntities, msg.Caption},
-	} {
-		if pair.text == "" {
-			continue
-		}
-		for _, entity := range pair.entities {
-			if entity.Type == "mention" {
-				mentioned := pair.text[entity.Offset : entity.Offset+entity.Length]
-				if strings.EqualFold(mentioned, "@"+botUsername) {
-					return true
-				}
-			}
-			if entity.Type == "bot_command" {
-				cmdText := pair.text[entity.Offset : entity.Offset+entity.Length]
-				if strings.Contains(strings.ToLower(cmdText), "@"+lowerBot) {
-					return true
-				}
-			}
-		}
-	}
-
-	// Fallback: substring check in both text and caption
-	if msg.Text != "" && strings.Contains(strings.ToLower(msg.Text), "@"+lowerBot) {
-		return true
-	}
-	if msg.Caption != "" && strings.Contains(strings.ToLower(msg.Caption), "@"+lowerBot) {
-		return true
-	}
-
-	// Reply to bot's message = implicit mention
-	if msg.ReplyToMessage != nil && msg.ReplyToMessage.From != nil {
-		if msg.ReplyToMessage.From.Username == botUsername {
-			return true
-		}
-	}
-
-	return false
-}
-
-// isServiceMessage returns true if the Telegram message is a service/system message
-// (member added/removed, title changed, pinned, etc.) rather than a user-sent message.
-// Service messages have no text, caption, or media content.
-func isServiceMessage(msg *telego.Message) bool {
-	// Has text or caption → user message
-	if msg.Text != "" || msg.Caption != "" {
-		return false
-	}
-
-	// Has media → user message (photo, audio, video, document, sticker, etc.)
-	if msg.Photo != nil || msg.Audio != nil || msg.Video != nil ||
-		msg.Document != nil || msg.Voice != nil || msg.VideoNote != nil ||
-		msg.Sticker != nil || msg.Animation != nil || msg.Contact != nil ||
-		msg.Location != nil || msg.Venue != nil || msg.Poll != nil {
-		return false
-	}
-
-	// No user content — likely a service message (new_chat_members, left_chat_member,
-	// new_chat_title, new_chat_photo, pinned_message, etc.)
-	return true
-}

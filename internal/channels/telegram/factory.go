@@ -22,30 +22,31 @@ type telegramInstanceConfig struct {
 	GroupPolicy    string   `json:"group_policy,omitempty"`
 	RequireMention *bool    `json:"require_mention,omitempty"`
 	HistoryLimit   int      `json:"history_limit,omitempty"`
-	StreamMode     string   `json:"stream_mode,omitempty"`
+	DMStream       *bool    `json:"dm_stream,omitempty"`
+	GroupStream    *bool    `json:"group_stream,omitempty"`
 	ReactionLevel  string   `json:"reaction_level,omitempty"`
 	MediaMaxBytes  int64    `json:"media_max_bytes,omitempty"`
 	LinkPreview    *bool    `json:"link_preview,omitempty"`
+	BlockReply     *bool    `json:"block_reply,omitempty"`
 	AllowFrom      []string `json:"allow_from,omitempty"`
 }
 
-// Factory creates a Telegram channel from DB instance data (no agent/team store).
+// Factory creates a Telegram channel from DB instance data (no extra stores).
 func Factory(name string, creds json.RawMessage, cfg json.RawMessage,
 	msgBus *bus.MessageBus, pairingSvc store.PairingStore) (channels.Channel, error) {
-	return buildChannel(name, creds, cfg, msgBus, pairingSvc, nil, nil)
+	return buildChannel(name, creds, cfg, msgBus, pairingSvc, nil, nil, nil)
 }
 
-// FactoryWithStores returns a ChannelFactory that includes agent and team stores
-// for group file writer management and /tasks, /task_detail commands.
-func FactoryWithStores(agentStore store.AgentStore, teamStore store.TeamStore) channels.ChannelFactory {
+// FactoryWithStores returns a ChannelFactory that includes agent, team, and pending message stores.
+func FactoryWithStores(agentStore store.AgentStore, teamStore store.TeamStore, pendingStore store.PendingMessageStore) channels.ChannelFactory {
 	return func(name string, creds json.RawMessage, cfg json.RawMessage,
 		msgBus *bus.MessageBus, pairingSvc store.PairingStore) (channels.Channel, error) {
-		return buildChannel(name, creds, cfg, msgBus, pairingSvc, agentStore, teamStore)
+		return buildChannel(name, creds, cfg, msgBus, pairingSvc, agentStore, teamStore, pendingStore)
 	}
 }
 
 func buildChannel(name string, creds json.RawMessage, cfg json.RawMessage,
-	msgBus *bus.MessageBus, pairingSvc store.PairingStore, agentStore store.AgentStore, teamStore store.TeamStore) (channels.Channel, error) {
+	msgBus *bus.MessageBus, pairingSvc store.PairingStore, agentStore store.AgentStore, teamStore store.TeamStore, pendingStore store.PendingMessageStore) (channels.Channel, error) {
 
 	var c telegramCreds
 	if len(creds) > 0 {
@@ -73,10 +74,12 @@ func buildChannel(name string, creds json.RawMessage, cfg json.RawMessage,
 		GroupPolicy:    ic.GroupPolicy,
 		RequireMention: ic.RequireMention,
 		HistoryLimit:   ic.HistoryLimit,
-		StreamMode:     ic.StreamMode,
+		DMStream:       ic.DMStream,
+		GroupStream:    ic.GroupStream,
 		ReactionLevel:  ic.ReactionLevel,
 		MediaMaxBytes:  ic.MediaMaxBytes,
 		LinkPreview:    ic.LinkPreview,
+		BlockReply:     ic.BlockReply,
 	}
 
 	// DB instances default to "pairing" for groups (secure by default).
@@ -85,7 +88,7 @@ func buildChannel(name string, creds json.RawMessage, cfg json.RawMessage,
 		tgCfg.GroupPolicy = "pairing"
 	}
 
-	ch, err := New(tgCfg, msgBus, pairingSvc, agentStore, teamStore)
+	ch, err := New(tgCfg, msgBus, pairingSvc, agentStore, teamStore, pendingStore)
 	if err != nil {
 		return nil, err
 	}

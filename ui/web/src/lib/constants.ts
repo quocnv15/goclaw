@@ -10,12 +10,16 @@ export const ROUTES = {
   SKILLS: "/skills",
   SKILL_DETAIL: "/skills/:id",
   CRON: "/cron",
+  CRON_DETAIL: "/cron/:id",
   CONFIG: "/config",
   TRACES: "/traces",
   TRACE_DETAIL: "/traces/:id",
+  EVENTS: "/events",
   DELEGATIONS: "/delegations",
   USAGE: "/usage",
   CHANNELS: "/channels",
+  CHANNEL_DETAIL: "/channels/:id",
+  CONTACTS: "/contacts",
   APPROVALS: "/approvals",
   NODES: "/nodes",
   LOGS: "/logs",
@@ -26,6 +30,11 @@ export const ROUTES = {
   BUILTIN_TOOLS: "/builtin-tools",
   MCP: "/mcp",
   TTS: "/tts",
+  STORAGE: "/storage",
+  PENDING_MESSAGES: "/pending-messages",
+  MEMORY: "/memory",
+  KNOWLEDGE_GRAPH: "/knowledge-graph",
+  SETUP: "/setup",
 } as const;
 
 export const LOCAL_STORAGE_KEYS = {
@@ -34,4 +43,14 @@ export const LOCAL_STORAGE_KEYS = {
   SENDER_ID: "goclaw:senderID",
   THEME: "goclaw:theme",
   SIDEBAR_COLLAPSED: "goclaw:sidebarCollapsed",
+  LANGUAGE: "goclaw:language",
 } as const;
+
+export const SUPPORTED_LANGUAGES = ["en", "vi", "zh"] as const;
+export type Language = (typeof SUPPORTED_LANGUAGES)[number];
+
+export const LANGUAGE_LABELS: Record<Language, string> = {
+  en: "English",
+  vi: "Tiếng Việt",
+  zh: "中文",
+};

@@ -3,11 +3,13 @@ package tools
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/nextlevelbuilder/goclaw/internal/sandbox"
@@ -32,11 +34,11 @@ var defaultDenyPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`:\(\)\s*\{.*\};\s*:`), // fork bomb
 
 	// ── Data exfiltration ──
-	regexp.MustCompile(`\bcurl\b.*\|\s*(ba)?sh\b`),                                            // curl | sh
+	regexp.MustCompile(`\bcurl\b.*\|\s*(ba)?sh\b`),                                              // curl | sh
 	regexp.MustCompile(`\bcurl\b.*(-d\b|-F\b|--data|--upload|--form|-T\b|-X\s*P(UT|OST|ATCH))`), // curl POST/PUT
-	regexp.MustCompile(`\bwget\b.*-O\s*-\s*\|\s*(ba)?sh\b`),                                   // wget | sh
-	regexp.MustCompile(`\bwget\b.*--post-(data|file)`),                                         // wget POST
-	regexp.MustCompile(`\b(nslookup|dig|host)\b`),                                              // DNS exfiltration
+	regexp.MustCompile(`\bwget\b.*-O\s*-\s*\|\s*(ba)?sh\b`),                                     // wget | sh
+	regexp.MustCompile(`\bwget\b.*--post-(data|file)`),                                          // wget POST
+	regexp.MustCompile(`\b(nslookup|dig|host)\b`),                                               // DNS exfiltration
 	regexp.MustCompile(`/dev/tcp/`),                                                             // bash tcp redirect
 
 	// ── Reverse shells ──
@@ -48,8 +50,8 @@ var defaultDenyPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\bperl\b.*-e\s*.*\b[Ss]ocket\b`),
 	regexp.MustCompile(`\bruby\b.*-e\s*.*\b(TCPSocket|Socket)\b`),
 	regexp.MustCompile(`\bnode\b.*-e\s*.*\b(net\.connect|child_process)\b`),
-	regexp.MustCompile(`\bawk\b.*/inet/`),  // awk built-in networking
-	regexp.MustCompile(`\bmkfifo\b`),        // named pipes for shell redirection
+	regexp.MustCompile(`\bawk\b.*/inet/`), // awk built-in networking
+	regexp.MustCompile(`\bmkfifo\b`),      // named pipes for shell redirection
 
 	// ── Dangerous eval / code injection ──
 	regexp.MustCompile(`\beval\s*\$`),
@@ -66,7 +68,7 @@ var defaultDenyPatterns = []*regexp.Regexp{
 	// ── Dangerous path operations ──
 	regexp.MustCompile(`\bchmod\s+[0-7]{3,4}\s+/`),
 	regexp.MustCompile(`\bchown\b.*\s+/`),
-	regexp.MustCompile(`\bchmod\b.*\+x.*/tmp/`),       // make tmpfs executable
+	regexp.MustCompile(`\bchmod\b.*\+x.*/tmp/`), // make tmpfs executable
 	regexp.MustCompile(`\bchmod\b.*\+x.*/var/tmp/`),
 	regexp.MustCompile(`\bchmod\b.*\+x.*/dev/shm/`),
 
@@ -75,14 +77,14 @@ var defaultDenyPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\bDYLD_INSERT_LIBRARIES\s*=`),
 	regexp.MustCompile(`\bLD_LIBRARY_PATH\s*=`),
 	regexp.MustCompile(`/etc/ld\.so\.preload`),
-	regexp.MustCompile(`\bGIT_EXTERNAL_DIFF\s*=`),          // git diff arbitrary code exec
-	regexp.MustCompile(`\bGIT_DIFF_OPTS\s*=`),              // git diff behavior injection
-	regexp.MustCompile(`\bBASH_ENV\s*=`),                   // shell init injection
-	regexp.MustCompile(`\bENV\s*=.*\bsh\b`),                // sh init injection
+	regexp.MustCompile(`\bGIT_EXTERNAL_DIFF\s*=`), // git diff arbitrary code exec
+	regexp.MustCompile(`\bGIT_DIFF_OPTS\s*=`),     // git diff behavior injection
+	regexp.MustCompile(`\bBASH_ENV\s*=`),          // shell init injection
+	regexp.MustCompile(`\bENV\s*=.*\bsh\b`),       // sh init injection
 
 	// ── Container escape ──
 	regexp.MustCompile(`/var/run/docker\.sock|docker\.(sock|socket)`),
-	regexp.MustCompile(`/proc/sys/(kernel|fs|net)/`),    // proc writes
+	regexp.MustCompile(`/proc/sys/(kernel|fs|net)/`),      // proc writes
 	regexp.MustCompile(`/sys/(kernel|fs|class|devices)/`), // sysfs manipulation
 
 	// ── Crypto mining ──
@@ -90,17 +92,17 @@ var defaultDenyPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`stratum\+tcp://|stratum\+ssl://`),
 
 	// ── Filter bypass (Claude Code CVE-2025-66032) ──
-	regexp.MustCompile(`\bsed\b.*['"]/e\b`),             // sed /e command execution
-	regexp.MustCompile(`\bsort\b.*--compress-program`),   // sort arbitrary exec
+	regexp.MustCompile(`\bsed\b.*['"]/e\b`),                               // sed /e command execution
+	regexp.MustCompile(`\bsort\b.*--compress-program`),                    // sort arbitrary exec
 	regexp.MustCompile(`\bgit\b.*(--upload-pack|--receive-pack|--exec)=`), // git exec flags
-	regexp.MustCompile(`\b(rg|grep)\b.*--pre=`),          // preprocessor execution
-	regexp.MustCompile(`\bman\b.*--html=`),                // man command injection
-	regexp.MustCompile(`\bhistory\b.*-[saw]\b`),           // history file injection
-	regexp.MustCompile(`\$\{[^}]*@[PpEeAaKk]\}`),         // ${var@P} parameter expansion
+	regexp.MustCompile(`\b(rg|grep)\b.*--pre=`),                           // preprocessor execution
+	regexp.MustCompile(`\bman\b.*--html=`),                                // man command injection
+	regexp.MustCompile(`\bhistory\b.*-[saw]\b`),                           // history file injection
+	regexp.MustCompile(`\$\{[^}]*@[PpEeAaKk]\}`),                          // ${var@P} parameter expansion
 
 	// ── Network abuse / reconnaissance ──
 	regexp.MustCompile(`\b(nmap|masscan|zmap|rustscan)\b`),
-	regexp.MustCompile(`\b(ssh|scp|sftp)\b.*@`),           // outbound SSH
+	regexp.MustCompile(`\b(ssh|scp|sftp)\b.*@`),                               // outbound SSH
 	regexp.MustCompile(`\b(chisel|frp|ngrok|cloudflared|bore|localtunnel)\b`), // tunneling tools
 
 	// ── Persistence ──
@@ -115,26 +117,27 @@ var defaultDenyPatterns = []*regexp.Regexp{
 	// ── Environment variable dumping ──
 	// Bare env/printenv/set/export dumps all vars including secrets (API keys, DSN, encryption keys).
 	// 'env VAR=val cmd' (env with assignment before command) is still allowed.
-	regexp.MustCompile(`^\s*env\s*$`),                                     // bare 'env'
-	regexp.MustCompile(`^\s*env\s*\|`),                                    // 'env | ...' (piped)
-	regexp.MustCompile(`^\s*env\s*>\s`),                                   // 'env > file'
-	regexp.MustCompile(`\bprintenv\b`),                                    // any printenv usage
-	regexp.MustCompile(`^\s*(set|export\s+-p|declare\s+-x)\s*($|\|)`),     // shell var dumps
-	regexp.MustCompile(`\bcompgen\s+-e\b`),                                // bash env completion dump
-	regexp.MustCompile(`/proc/[^/]+/environ`),                             // /proc/PID/environ (leaks all env vars)
-	regexp.MustCompile(`/proc/self/environ`),                              // /proc/self/environ
-	regexp.MustCompile(`(?i)\bstrings\b.*/proc/`),                        // strings on /proc files (binary env dump)
+	regexp.MustCompile(`^\s*env\s*$`),                                 // bare 'env'
+	regexp.MustCompile(`^\s*env\s*\|`),                                // 'env | ...' (piped)
+	regexp.MustCompile(`^\s*env\s*>\s`),                               // 'env > file'
+	regexp.MustCompile(`\bprintenv\b`),                                // any printenv usage
+	regexp.MustCompile(`^\s*(set|export\s+-p|declare\s+-x)\s*($|\|)`), // shell var dumps
+	regexp.MustCompile(`\bcompgen\s+-e\b`),                            // bash env completion dump
+	regexp.MustCompile(`/proc/[^/]+/environ`),                         // /proc/PID/environ (leaks all env vars)
+	regexp.MustCompile(`/proc/self/environ`),                          // /proc/self/environ
+	regexp.MustCompile(`(?i)\bstrings\b.*/proc/`),                     // strings on /proc files (binary env dump)
 }
 
 // ExecTool executes shell commands, optionally inside a sandbox container.
 type ExecTool struct {
-	workingDir   string
-	timeout      time.Duration
-	denyPatterns []*regexp.Regexp
-	restrict     bool
-	sandboxMgr   sandbox.Manager        // nil = no sandbox, execute on host
-	approvalMgr  *ExecApprovalManager   // nil = no approval needed
-	agentID      string                  // for approval request context
+	workingDir     string
+	timeout        time.Duration
+	denyPatterns   []*regexp.Regexp
+	denyExemptions []string // substrings that exempt a command from deny (e.g. ".goclaw/skills-store/")
+	restrict       bool
+	sandboxMgr     sandbox.Manager      // nil = no sandbox, execute on host
+	approvalMgr    *ExecApprovalManager // nil = no approval needed
+	agentID        string               // for approval request context
 }
 
 // NewExecTool creates an exec tool that runs commands directly on the host.
@@ -170,6 +173,13 @@ func (t *ExecTool) DenyPaths(paths ...string) {
 	}
 }
 
+// AllowPathExemptions adds substrings that exempt a command from deny pattern matches.
+// E.g. AllowPathExemptions(".goclaw/skills-store/") lets commands referencing
+// skills-store pass even though ".goclaw/" is denied.
+func (t *ExecTool) AllowPathExemptions(substrings ...string) {
+	t.denyExemptions = append(t.denyExemptions, substrings...)
+}
+
 // SetApprovalManager sets the exec approval manager for this tool.
 func (t *ExecTool) SetApprovalManager(mgr *ExecApprovalManager, agentID string) {
 	t.approvalMgr = mgr
@@ -178,15 +188,15 @@ func (t *ExecTool) SetApprovalManager(mgr *ExecApprovalManager, agentID string) 
 
 func (t *ExecTool) Name() string        { return "exec" }
 func (t *ExecTool) Description() string { return "Execute a shell command and return its output" }
-func (t *ExecTool) Parameters() map[string]interface{} {
-	return map[string]interface{}{
+func (t *ExecTool) Parameters() map[string]any {
+	return map[string]any{
 		"type": "object",
-		"properties": map[string]interface{}{
-			"command": map[string]interface{}{
+		"properties": map[string]any{
+			"command": map[string]any{
 				"type":        "string",
 				"description": "The shell command to execute",
 			},
-			"working_dir": map[string]interface{}{
+			"working_dir": map[string]any{
 				"type":        "string",
 				"description": "Optional working directory for the command",
 			},
@@ -195,7 +205,7 @@ func (t *ExecTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *ExecTool) Execute(ctx context.Context, args map[string]interface{}) *Result {
+func (t *ExecTool) Execute(ctx context.Context, args map[string]any) *Result {
 	command, _ := args["command"].(string)
 	if command == "" {
 		return ErrorResult("command is required")
@@ -204,7 +214,17 @@ func (t *ExecTool) Execute(ctx context.Context, args map[string]interface{}) *Re
 	// Check for dangerous commands (applies to both host and sandbox)
 	for _, pattern := range t.denyPatterns {
 		if pattern.MatchString(command) {
-			return ErrorResult(fmt.Sprintf("command denied by safety policy: matches pattern %s", pattern.String()))
+			// Check if any exemption applies (e.g. skills-store within .goclaw)
+			exempt := false
+			for _, ex := range t.denyExemptions {
+				if strings.Contains(command, ex) {
+					exempt = true
+					break
+				}
+			}
+			if !exempt {
+				return ErrorResult(fmt.Sprintf("command denied by safety policy: matches pattern %s", pattern.String()))
+			}
 		}
 	}
 
@@ -224,7 +244,7 @@ func (t *ExecTool) Execute(ctx context.Context, args map[string]interface{}) *Re
 		}
 	}
 
-	// Use per-user workspace from context if available (managed mode), fallback to struct field
+	// Use per-user workspace from context if available, fallback to struct field
 	cwd := ToolWorkspaceFromCtx(ctx)
 	if cwd == "" {
 		cwd = t.workingDir
@@ -297,7 +317,7 @@ func (t *ExecTool) executeOnHost(ctx context.Context, command, cwd string) *Resu
 func (t *ExecTool) executeInSandbox(ctx context.Context, command, cwd, sandboxKey string) *Result {
 	sb, err := t.sandboxMgr.Get(ctx, sandboxKey, t.workingDir)
 	if err != nil {
-		if err == sandbox.ErrSandboxDisabled {
+		if errors.Is(err, sandbox.ErrSandboxDisabled) {
 			return t.executeOnHost(ctx, command, cwd)
 		}
 		// Docker unavailable (binary missing, daemon down) → fallback to host

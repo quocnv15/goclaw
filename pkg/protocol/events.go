@@ -17,7 +17,6 @@ const (
 	EventDevicePairRes      = "device.pair.resolved"
 	EventVoicewakeChanged   = "voicewake.changed"
 	EventConnectChallenge   = "connect.challenge"
-	EventHeartbeat          = "heartbeat"
 	EventTalkMode           = "talk.mode"
 
 	// Agent summoning events (predefined agent setup via LLM).
@@ -33,8 +32,39 @@ const (
 	EventDelegationStarted   = "delegation.started"
 	EventDelegationCompleted = "delegation.completed"
 
+	// Delegation lifecycle events.
+	EventDelegationFailed      = "delegation.failed"
+	EventDelegationCancelled   = "delegation.cancelled"
+	EventDelegationProgress    = "delegation.progress"
+	EventDelegationAccumulated = "delegation.accumulated"
+	EventDelegationAnnounce    = "delegation.announce"
+	EventQualityGateRetry      = "delegation.quality_gate.retry"
+
+	// Team task lifecycle events.
+	EventTeamTaskClaimed   = "team.task.claimed"
+	EventTeamTaskCancelled = "team.task.cancelled"
+
+	// Team CRUD events (admin operations).
+	EventTeamCreated       = "team.created"
+	EventTeamUpdated       = "team.updated"
+	EventTeamDeleted       = "team.deleted"
+	EventTeamMemberAdded   = "team.member.added"
+	EventTeamMemberRemoved = "team.member.removed"
+
+	// Agent link events (admin operations).
+	EventAgentLinkCreated = "agent_link.created"
+	EventAgentLinkUpdated = "agent_link.updated"
+	EventAgentLinkDeleted = "agent_link.deleted"
+
+	// Trace lifecycle events (realtime trace/span updates).
+	EventTraceUpdated = "trace.updated"
+
 	// Cache invalidation events (internal, not forwarded to WS clients).
 	EventCacheInvalidate = "cache.invalidate"
+
+	// Zalo Personal QR login events (client-scoped, not broadcast).
+	EventZaloPersonalQRCode = "zalo.personal.qr.code"
+	EventZaloPersonalQRDone = "zalo.personal.qr.done"
 )
 
 // Agent event subtypes (in payload.type)
@@ -45,6 +75,8 @@ const (
 	AgentEventRunRetrying  = "run.retrying"
 	AgentEventToolCall     = "tool.call"
 	AgentEventToolResult   = "tool.result"
+	AgentEventBlockReply   = "block.reply"
+	AgentEventActivity     = "activity" // agent phase transitions: thinking, tool_exec, compacting
 )
 
 // Chat event subtypes (in payload.type)

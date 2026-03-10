@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -24,6 +25,7 @@ func Default() *Config {
 				MaxTokens:           8192,
 				Temperature:         0.7,
 				MaxToolIterations:   20,
+				MaxToolCalls:        25,
 				ContextWindow:       200000,
 				Subagents: &SubagentsConfig{
 					MaxConcurrent: 20,
@@ -33,7 +35,6 @@ func Default() *Config {
 		},
 		Channels: ChannelsConfig{
 			Telegram: TelegramConfig{
-				StreamMode:    "none",
 				ReactionLevel: "full",
 			},
 		},
@@ -55,6 +56,7 @@ func Default() *Config {
 				Security: "full",
 				Ask:      "off",
 			},
+			RateLimitPerHour: 150,
 		},
 		Sessions: SessionsConfig{
 			Storage: "~/.goclaw/sessions",
@@ -96,6 +98,7 @@ func (c *Config) applyEnvOverrides() {
 	envStr("GOCLAW_ANTHROPIC_API_KEY", &c.Providers.Anthropic.APIKey)
 	envStr("GOCLAW_ANTHROPIC_BASE_URL", &c.Providers.Anthropic.APIBase)
 	envStr("GOCLAW_OPENAI_API_KEY", &c.Providers.OpenAI.APIKey)
+	envStr("GOCLAW_OPENAI_BASE_URL", &c.Providers.OpenAI.APIBase)
 	envStr("GOCLAW_OPENROUTER_API_KEY", &c.Providers.OpenRouter.APIKey)
 	envStr("GOCLAW_GROQ_API_KEY", &c.Providers.Groq.APIKey)
 	envStr("GOCLAW_DEEPSEEK_API_KEY", &c.Providers.DeepSeek.APIKey)
@@ -107,6 +110,11 @@ func (c *Config) applyEnvOverrides() {
 	envStr("GOCLAW_PERPLEXITY_API_KEY", &c.Providers.Perplexity.APIKey)
 	envStr("GOCLAW_DASHSCOPE_API_KEY", &c.Providers.DashScope.APIKey)
 	envStr("GOCLAW_BAILIAN_API_KEY", &c.Providers.Bailian.APIKey)
+	envStr("GOCLAW_ZAI_API_KEY", &c.Providers.Zai.APIKey)
+	envStr("GOCLAW_ZAI_CODING_API_KEY", &c.Providers.ZaiCoding.APIKey)
+	envStr("GOCLAW_OLLAMA_HOST", &c.Providers.Ollama.Host)
+	envStr("GOCLAW_OLLAMA_CLOUD_API_KEY", &c.Providers.OllamaCloud.APIKey)
+	envStr("GOCLAW_OLLAMA_CLOUD_API_BASE", &c.Providers.OllamaCloud.APIBase)
 	envStr("GOCLAW_GATEWAY_TOKEN", &c.Gateway.Token)
 	envStr("GOCLAW_TELEGRAM_TOKEN", &c.Channels.Telegram.Token)
 	envStr("GOCLAW_DISCORD_TOKEN", &c.Channels.Discord.Token)
@@ -116,6 +124,9 @@ func (c *Config) applyEnvOverrides() {
 	envStr("GOCLAW_LARK_ENCRYPT_KEY", &c.Channels.Feishu.EncryptKey)
 	envStr("GOCLAW_LARK_VERIFICATION_TOKEN", &c.Channels.Feishu.VerificationToken)
 	envStr("GOCLAW_WHATSAPP_BRIDGE_URL", &c.Channels.WhatsApp.BridgeURL)
+	envStr("GOCLAW_SLACK_BOT_TOKEN", &c.Channels.Slack.BotToken)
+	envStr("GOCLAW_SLACK_APP_TOKEN", &c.Channels.Slack.AppToken)
+	envStr("GOCLAW_SLACK_USER_TOKEN", &c.Channels.Slack.UserToken)
 
 	// TTS secrets
 	envStr("GOCLAW_TTS_OPENAI_API_KEY", &c.Tts.OpenAI.APIKey)
@@ -139,10 +150,27 @@ func (c *Config) applyEnvOverrides() {
 	if c.Channels.WhatsApp.BridgeURL != "" {
 		c.Channels.WhatsApp.Enabled = true
 	}
+	if c.Channels.Slack.BotToken != "" && c.Channels.Slack.AppToken != "" {
+		c.Channels.Slack.Enabled = true
+	}
 
-	// Allow overriding default provider/model
-	envStr("GOCLAW_PROVIDER", &c.Agents.Defaults.Provider)
-	envStr("GOCLAW_MODEL", &c.Agents.Defaults.Model)
+	// Claude CLI provider
+	envStr("GOCLAW_CLAUDE_CLI_PATH", &c.Providers.ClaudeCLI.CLIPath)
+	envStr("GOCLAW_CLAUDE_CLI_MODEL", &c.Providers.ClaudeCLI.Model)
+	envStr("GOCLAW_CLAUDE_CLI_WORK_DIR", &c.Providers.ClaudeCLI.BaseWorkDir)
+
+	// Default provider/model: env is fallback only (applied when config has no value).
+	// The onboard wizard sets these in .env for initial bootstrap; once the user
+	// saves a provider/model via the Dashboard, the config-file value wins.
+	envFallback := func(key string, dst *string) {
+		if *dst == "" {
+			if v := os.Getenv(key); v != "" {
+				*dst = v
+			}
+		}
+	}
+	envFallback("GOCLAW_PROVIDER", &c.Agents.Defaults.Provider)
+	envFallback("GOCLAW_MODEL", &c.Agents.Defaults.Model)
 
 	// Workspace & sessions
 	envStr("GOCLAW_WORKSPACE", &c.Agents.Defaults.Workspace)
@@ -158,7 +186,12 @@ func (c *Config) applyEnvOverrides() {
 
 	// Database
 	envStr("GOCLAW_POSTGRES_DSN", &c.Database.PostgresDSN)
-	envStr("GOCLAW_MODE", &c.Database.Mode)
+	envStr("GOCLAW_REDIS_DSN", &c.Database.RedisDSN)
+
+	// Deprecation warning for GOCLAW_MODE (removed — PostgreSQL is always active)
+	if v := os.Getenv("GOCLAW_MODE"); v != "" {
+		slog.Warn("GOCLAW_MODE is deprecated; managed mode is now the only mode", "value", v)
+	}
 
 	// Telemetry
 	envStr("GOCLAW_TELEMETRY_ENDPOINT", &c.Telemetry.Endpoint)
@@ -225,6 +258,12 @@ func (c *Config) applyEnvOverrides() {
 		ensureSandbox()
 		c.Agents.Defaults.Sandbox.NetworkEnabled = v == "true" || v == "1"
 	}
+
+	// Browser (for Docker-compose browser sidecar overlay)
+	envStr("GOCLAW_BROWSER_REMOTE_URL", &c.Tools.Browser.RemoteURL)
+	if c.Tools.Browser.RemoteURL != "" {
+		c.Tools.Browser.Enabled = true
+	}
 }
 
 // applyContextPruningDefaults auto-enables context pruning when the Anthropic
@@ -232,7 +271,7 @@ func (c *Config) applyEnvOverrides() {
 // src/config/defaults.ts.
 //
 // Go port does not have OAuth vs API-key distinction — we always treat it as
-// API-key mode (heartbeat 30m).
+// API-key mode.
 func (c *Config) applyContextPruningDefaults() {
 	// Only apply when Anthropic is configured.
 	if c.Providers.Anthropic.APIKey == "" {
@@ -310,6 +349,9 @@ func (c *Config) ResolveAgent(agentID string) AgentDefaults {
 		}
 		if spec.ContextWindow > 0 {
 			d.ContextWindow = spec.ContextWindow
+		}
+		if spec.MaxToolCalls > 0 {
+			d.MaxToolCalls = spec.MaxToolCalls
 		}
 		if spec.Workspace != "" {
 			d.Workspace = spec.Workspace

@@ -14,14 +14,16 @@ import (
 type toolContextKey string
 
 const (
-	ctxChannel    toolContextKey = "tool_channel"
-	ctxChatID     toolContextKey = "tool_chat_id"
-	ctxPeerKind   toolContextKey = "tool_peer_kind"
-	ctxLocalKey   toolContextKey = "tool_local_key" // composite key with topic/thread suffix for routing
-	ctxSandboxKey toolContextKey = "tool_sandbox_key"
-	ctxAsyncCB    toolContextKey = "tool_async_cb"
-	ctxWorkspace  toolContextKey = "tool_workspace"
-	ctxAgentKey   toolContextKey = "tool_agent_key"
+	ctxChannel     toolContextKey = "tool_channel"
+	ctxChannelType toolContextKey = "tool_channel_type"
+	ctxChatID      toolContextKey = "tool_chat_id"
+	ctxPeerKind    toolContextKey = "tool_peer_kind"
+	ctxLocalKey    toolContextKey = "tool_local_key" // composite key with topic/thread suffix for routing
+	ctxSandboxKey  toolContextKey = "tool_sandbox_key"
+	ctxAsyncCB     toolContextKey = "tool_async_cb"
+	ctxWorkspace   toolContextKey = "tool_workspace"
+	ctxAgentKey    toolContextKey = "tool_agent_key"
+	ctxSessionKey  toolContextKey = "tool_session_key" // origin session key for announce routing
 )
 
 func WithToolChannel(ctx context.Context, channel string) context.Context {
@@ -30,6 +32,15 @@ func WithToolChannel(ctx context.Context, channel string) context.Context {
 
 func ToolChannelFromCtx(ctx context.Context) string {
 	v, _ := ctx.Value(ctxChannel).(string)
+	return v
+}
+
+func WithToolChannelType(ctx context.Context, channelType string) context.Context {
+	return context.WithValue(ctx, ctxChannelType, channelType)
+}
+
+func ToolChannelTypeFromCtx(ctx context.Context) string {
+	v, _ := ctx.Value(ctxChannelType).(string)
 	return v
 }
 
@@ -90,7 +101,7 @@ func ToolWorkspaceFromCtx(ctx context.Context) string {
 }
 
 // WithToolAgentKey injects the calling agent's key into context.
-// In managed mode multiple agents share a single tool registry; the agent key
+// Multiple agents share a single tool registry; the agent key
 // lets tools like spawn/subagent identify which agent is the parent.
 func WithToolAgentKey(ctx context.Context, key string) context.Context {
 	return context.WithValue(ctx, ctxAgentKey, key)
@@ -98,6 +109,18 @@ func WithToolAgentKey(ctx context.Context, key string) context.Context {
 
 func ToolAgentKeyFromCtx(ctx context.Context) string {
 	v, _ := ctx.Value(ctxAgentKey).(string)
+	return v
+}
+
+// WithToolSessionKey injects the parent's session key so subagent announce
+// can route results back to the exact same session (required for WS where
+// session keys don't follow BuildScopedSessionKey format).
+func WithToolSessionKey(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, ctxSessionKey, key)
+}
+
+func ToolSessionKeyFromCtx(ctx context.Context) string {
+	v, _ := ctx.Value(ctxSessionKey).(string)
 	return v
 }
 

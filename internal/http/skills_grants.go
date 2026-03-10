@@ -4,21 +4,44 @@ import (
 	"archive/zip"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
+func (h *SkillsHandler) handleListAgentSkills(w http.ResponseWriter, r *http.Request) {
+	locale := store.LocaleFromContext(r.Context())
+	agentIDStr := r.PathValue("agentID")
+	agentID, err := uuid.Parse(agentIDStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "agent")})
+		return
+	}
+
+	skills, err := h.skills.ListWithGrantStatus(r.Context(), agentID)
+	if err != nil {
+		slog.Error("failed to list skills with grant status", "agent_id", agentID, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": i18n.T(locale, i18n.MsgFailedToList, "skills")})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{"skills": skills})
+}
+
 func (h *SkillsHandler) handleGrantAgent(w http.ResponseWriter, r *http.Request) {
+	locale := store.LocaleFromContext(r.Context())
 	userID := store.UserIDFromContext(r.Context())
 	idStr := r.PathValue("id")
 	skillID, err := uuid.Parse(idStr)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid skill ID"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "skill")})
 		return
 	}
 
@@ -27,13 +50,13 @@ func (h *SkillsHandler) handleGrantAgent(w http.ResponseWriter, r *http.Request)
 		Version int    `json:"version"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
 		return
 	}
 
 	agentID, err := uuid.Parse(req.AgentID)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid agent_id"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "agent")})
 		return
 	}
 
@@ -52,17 +75,18 @@ func (h *SkillsHandler) handleGrantAgent(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *SkillsHandler) handleRevokeAgent(w http.ResponseWriter, r *http.Request) {
+	locale := store.LocaleFromContext(r.Context())
 	idStr := r.PathValue("id")
 	skillID, err := uuid.Parse(idStr)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid skill ID"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "skill")})
 		return
 	}
 
 	agentIDStr := r.PathValue("agentID")
 	agentID, err := uuid.Parse(agentIDStr)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid agent ID"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "agent")})
 		return
 	}
 
@@ -77,11 +101,12 @@ func (h *SkillsHandler) handleRevokeAgent(w http.ResponseWriter, r *http.Request
 }
 
 func (h *SkillsHandler) handleGrantUser(w http.ResponseWriter, r *http.Request) {
+	locale := store.LocaleFromContext(r.Context())
 	userID := store.UserIDFromContext(r.Context())
 	idStr := r.PathValue("id")
 	skillID, err := uuid.Parse(idStr)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid skill ID"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "skill")})
 		return
 	}
 
@@ -89,11 +114,11 @@ func (h *SkillsHandler) handleGrantUser(w http.ResponseWriter, r *http.Request) 
 		UserID string `json:"user_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
 		return
 	}
 	if req.UserID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "user_id is required"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgRequired, "user_id")})
 		return
 	}
 	if err := store.ValidateUserID(req.UserID); err != nil {
@@ -112,10 +137,11 @@ func (h *SkillsHandler) handleGrantUser(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *SkillsHandler) handleRevokeUser(w http.ResponseWriter, r *http.Request) {
+	locale := store.LocaleFromContext(r.Context())
 	idStr := r.PathValue("id")
 	skillID, err := uuid.Parse(idStr)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid skill ID"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "skill")})
 		return
 	}
 
@@ -150,32 +176,64 @@ func readZipFile(f *zip.File) (string, error) {
 }
 
 // parseSkillFrontmatter extracts name, description, and slug from SKILL.md YAML frontmatter.
-func parseSkillFrontmatter(content string) (name, description, slug string) {
+// Also returns the full parsed frontmatter as a map for DB storage.
+func parseSkillFrontmatter(content string) (name, description, slug string, allFields map[string]string) {
+	allFields = make(map[string]string)
 	if !strings.HasPrefix(content, "---") {
-		return "", "", ""
+		return "", "", "", allFields
 	}
 	end := strings.Index(content[3:], "---")
 	if end < 0 {
-		return "", "", ""
+		return "", "", "", allFields
 	}
 	fm := content[3 : 3+end]
 
 	for _, line := range strings.Split(fm, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "name:") {
-			name = strings.TrimSpace(strings.TrimPrefix(line, "name:"))
-			name = strings.Trim(name, `"'`)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
 		}
-		if strings.HasPrefix(line, "description:") {
-			description = strings.TrimSpace(strings.TrimPrefix(line, "description:"))
-			description = strings.Trim(description, `"'`)
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
 		}
-		if strings.HasPrefix(line, "slug:") {
-			slug = strings.TrimSpace(strings.TrimPrefix(line, "slug:"))
-			slug = strings.Trim(slug, `"'`)
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		val = strings.Trim(val, `"'`)
+		allFields[key] = val
+
+		switch key {
+		case "name":
+			name = val
+		case "description":
+			description = val
+		case "slug":
+			slug = val
 		}
 	}
 	return
+}
+
+// isSystemArtifact returns true for OS-generated junk that should be skipped
+// during ZIP extraction and file listing (e.g. __MACOSX, .DS_Store, Thumbs.db).
+func isSystemArtifact(name string) bool {
+	base := filepath.Base(name)
+	// macOS resource fork / metadata folders and files
+	if base == "__MACOSX" || strings.HasPrefix(base, "._") {
+		return true
+	}
+	// Check if any path component is __MACOSX
+	for _, part := range strings.Split(filepath.ToSlash(name), "/") {
+		if part == "__MACOSX" {
+			return true
+		}
+	}
+	// Common OS junk files
+	switch base {
+	case ".DS_Store", "Thumbs.db", "desktop.ini", ".Spotlight-V100", ".Trashes", ".fseventsd":
+		return true
+	}
+	return false
 }
 
 func slugify(name string) string {

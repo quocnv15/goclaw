@@ -35,13 +35,14 @@ const (
 // Channel connects to the Zalo OA Bot API.
 type Channel struct {
 	*channels.BaseChannel
-	token          string
-	dmPolicy       string
-	mediaMaxMB     int
-	pairingService store.PairingStore
+	token           string
+	dmPolicy        string
+	mediaMaxMB      int
+	blockReply      *bool
+	pairingService  store.PairingStore
 	pairingDebounce sync.Map // senderID → time.Time
-	stopCh         chan struct{}
-	client         *http.Client
+	stopCh          chan struct{}
+	client          *http.Client
 }
 
 // New creates a new Zalo channel.
@@ -68,11 +69,15 @@ func New(cfg config.ZaloConfig, msgBus *bus.MessageBus, pairingSvc store.Pairing
 		token:          cfg.Token,
 		dmPolicy:       dmPolicy,
 		mediaMaxMB:     mediaMax,
+		blockReply:     cfg.BlockReply,
 		pairingService: pairingSvc,
 		stopCh:         make(chan struct{}),
 		client:         &http.Client{Timeout: 60 * time.Second},
 	}, nil
 }
+
+// BlockReplyEnabled returns the per-channel block_reply override (nil = inherit gateway default).
+func (c *Channel) BlockReplyEnabled() *bool { return c.blockReply }
 
 // Start begins polling for Zalo updates.
 func (c *Channel) Start(ctx context.Context) error {
@@ -105,6 +110,9 @@ func (c *Channel) Send(_ context.Context, msg bus.OutboundMessage) error {
 	if !c.IsRunning() {
 		return fmt.Errorf("zalo bot not running")
 	}
+
+	// Strip markdown — Zalo does not support any markup rendering.
+	msg.Content = StripMarkdown(msg.Content)
 
 	// Check for media in content (URL-based photo sending)
 	if strings.Contains(msg.Content, "[photo:") {
@@ -289,7 +297,7 @@ func (c *Channel) sendPairingReply(senderID, chatID string) {
 		}
 	}
 
-	code, err := c.pairingService.RequestPairing(senderID, c.Name(), chatID, "default")
+	code, err := c.pairingService.RequestPairing(senderID, c.Name(), chatID, "default", nil)
 	if err != nil {
 		slog.Debug("zalo pairing request failed", "sender_id", senderID, "error", err)
 		return
@@ -371,7 +379,7 @@ type zaloUpdate struct {
 	Message   *zaloMessage `json:"message,omitempty"`
 }
 
-func (c *Channel) callAPI(method string, body interface{}) (json.RawMessage, error) {
+func (c *Channel) callAPI(method string, body any) (json.RawMessage, error) {
 	url := fmt.Sprintf("%s/bot%s/%s", apiBase, c.token, method)
 
 	var reqBody io.Reader
@@ -428,7 +436,7 @@ func (c *Channel) getMe() (*zaloBotInfo, error) {
 }
 
 func (c *Channel) getUpdates(timeout int) ([]zaloUpdate, error) {
-	params := map[string]interface{}{
+	params := map[string]any{
 		"timeout": timeout,
 	}
 
@@ -445,7 +453,7 @@ func (c *Channel) getUpdates(timeout int) ([]zaloUpdate, error) {
 }
 
 func (c *Channel) sendMessage(chatID, text string) error {
-	params := map[string]interface{}{
+	params := map[string]any{
 		"chat_id": chatID,
 		"text":    text,
 	}
@@ -455,7 +463,7 @@ func (c *Channel) sendMessage(chatID, text string) error {
 }
 
 func (c *Channel) sendPhoto(chatID, photoURL, caption string) error {
-	params := map[string]interface{}{
+	params := map[string]any{
 		"chat_id": chatID,
 		"photo":   photoURL,
 	}

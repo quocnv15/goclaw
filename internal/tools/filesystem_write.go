@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/sandbox"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
@@ -16,9 +17,9 @@ type WriteFileTool struct {
 	restrict         bool
 	deniedPrefixes   []string // path prefixes to deny access to (e.g. .goclaw)
 	sandboxMgr       sandbox.Manager
-	contextFileIntc  *ContextFileInterceptor // nil = no virtual FS routing (standalone mode)
-	memIntc          *MemoryInterceptor      // nil = no memory routing (standalone mode)
-	groupWriterCache *store.GroupWriterCache  // nil = no group write restriction (standalone mode)
+	contextFileIntc  *ContextFileInterceptor // nil = no virtual FS routing
+	memIntc          *MemoryInterceptor      // nil = no memory routing
+	groupWriterCache *store.GroupWriterCache // nil = no group write restriction
 }
 
 // DenyPaths adds path prefixes that write_file must reject.
@@ -26,17 +27,17 @@ func (t *WriteFileTool) DenyPaths(prefixes ...string) {
 	t.deniedPrefixes = append(t.deniedPrefixes, prefixes...)
 }
 
-// SetContextFileInterceptor enables virtual FS routing for context files (managed mode).
+// SetContextFileInterceptor enables virtual FS routing for context files.
 func (t *WriteFileTool) SetContextFileInterceptor(intc *ContextFileInterceptor) {
 	t.contextFileIntc = intc
 }
 
-// SetMemoryInterceptor enables virtual FS routing for memory files (managed mode).
+// SetMemoryInterceptor enables virtual FS routing for memory files.
 func (t *WriteFileTool) SetMemoryInterceptor(intc *MemoryInterceptor) {
 	t.memIntc = intc
 }
 
-// SetGroupWriterCache enables group write permission checks (managed mode).
+// SetGroupWriterCache enables group write permission checks.
 func (t *WriteFileTool) SetGroupWriterCache(c *store.GroupWriterCache) {
 	t.groupWriterCache = c
 }
@@ -52,21 +53,23 @@ func NewSandboxedWriteFileTool(workspace string, restrict bool, mgr sandbox.Mana
 // SetSandboxKey is a no-op; sandbox key is now read from ctx (thread-safe).
 func (t *WriteFileTool) SetSandboxKey(key string) {}
 
-func (t *WriteFileTool) Name() string        { return "write_file" }
-func (t *WriteFileTool) Description() string { return "Write content to a file, creating directories as needed" }
-func (t *WriteFileTool) Parameters() map[string]interface{} {
-	return map[string]interface{}{
+func (t *WriteFileTool) Name() string { return "write_file" }
+func (t *WriteFileTool) Description() string {
+	return "Write content to a file, creating directories as needed"
+}
+func (t *WriteFileTool) Parameters() map[string]any {
+	return map[string]any{
 		"type": "object",
-		"properties": map[string]interface{}{
-			"path": map[string]interface{}{
+		"properties": map[string]any{
+			"path": map[string]any{
 				"type":        "string",
 				"description": "Path to the file to write",
 			},
-			"content": map[string]interface{}{
+			"content": map[string]any{
 				"type":        "string",
 				"description": "Content to write",
 			},
-			"deliver": map[string]interface{}{
+			"deliver": map[string]any{
 				"type":        "boolean",
 				"description": "If true, deliver this file to the user as an attachment (image, document, etc.)",
 			},
@@ -75,7 +78,7 @@ func (t *WriteFileTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *WriteFileTool) Execute(ctx context.Context, args map[string]interface{}) *Result {
+func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Result {
 	path, _ := args["path"].(string)
 	content, _ := args["content"].(string)
 	deliver, _ := args["deliver"].(bool)
@@ -83,14 +86,14 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]interface{}
 		return ErrorResult("path is required")
 	}
 
-	// Group write permission check (managed mode)
+	// Group write permission check
 	if t.groupWriterCache != nil {
 		if err := store.CheckGroupWritePermission(ctx, t.groupWriterCache); err != nil {
 			return ErrorResult(err.Error())
 		}
 	}
 
-	// Virtual FS: route context files to DB (managed mode)
+	// Virtual FS: route context files to DB
 	if t.contextFileIntc != nil {
 		if handled, err := t.contextFileIntc.WriteFile(ctx, path, content); handled {
 			if err != nil {
@@ -100,13 +103,17 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]interface{}
 		}
 	}
 
-	// Virtual FS: route memory files to DB (managed mode)
+	// Virtual FS: route memory files to DB
 	if t.memIntc != nil {
-		if handled, err := t.memIntc.WriteFile(ctx, path, content); handled {
+		if mwr, err := t.memIntc.WriteFile(ctx, path, content); mwr.Handled {
 			if err != nil {
 				return ErrorResult(fmt.Sprintf("failed to write memory file: %v", err))
 			}
-			return SilentResult(fmt.Sprintf("Memory file written: %s (%d bytes)", path, len(content)))
+			msg := fmt.Sprintf("Memory file written: %s (%d bytes)", path, len(content))
+			if mwr.KGTriggered {
+				msg += "\n\n[Knowledge graph extraction triggered in background. The knowledge system may take a moment to fully update with new entities and relationships.]"
+			}
+			return SilentResult(msg)
 		}
 	}
 
@@ -116,7 +123,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]interface{}
 		return t.executeInSandbox(ctx, path, content, sandboxKey, deliver)
 	}
 
-	// Host execution — use per-user workspace from context if available (managed mode)
+	// Host execution — use per-user workspace from context if available
 	workspace := ToolWorkspaceFromCtx(ctx)
 	if workspace == "" {
 		workspace = t.workspace
@@ -140,7 +147,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]interface{}
 	result := SilentResult(fmt.Sprintf("File written: %s (%d bytes)", path, len(content)))
 	result.Deliverable = content
 	if deliver {
-		result.Media = []string{resolved}
+		result.Media = []bus.MediaFile{{Path: resolved}}
 	}
 	return result
 }
@@ -164,7 +171,7 @@ func (t *WriteFileTool) executeInSandbox(ctx context.Context, path, content, san
 			workspace = t.workspace
 		}
 		hostPath := filepath.Join(workspace, path)
-		result.Media = []string{hostPath}
+		result.Media = []bus.MediaFile{{Path: hostPath}}
 	}
 	return result
 }

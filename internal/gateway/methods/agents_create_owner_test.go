@@ -92,6 +92,15 @@ func (s *createCaptureStore) RemoveGroupFileWriter(_ context.Context, _ uuid.UUI
 func (s *createCaptureStore) ListGroupFileWriters(_ context.Context, _ uuid.UUID, _ string) ([]store.GroupFileWriterData, error) {
 	return nil, nil
 }
+func (s *createCaptureStore) ListGroupFileWriterGroups(_ context.Context, _ uuid.UUID) ([]store.GroupWriterGroupInfo, error) {
+	return nil, nil
+}
+func (s *createCaptureStore) ListUserInstances(_ context.Context, _ uuid.UUID) ([]store.UserInstanceData, error) {
+	return nil, nil
+}
+func (s *createCaptureStore) UpdateUserProfileMetadata(_ context.Context, _ uuid.UUID, _ string, _ map[string]string) error {
+	return nil
+}
 
 // ---- helpers ----
 
@@ -123,7 +132,7 @@ func nullClient() *gateway.Client {
 	return &gateway.Client{}
 }
 
-// newManagedMethods returns AgentsMethods wired for managed mode with the given stub store.
+// newManagedMethods returns AgentsMethods wired with the given stub store.
 func newManagedMethods(t *testing.T, stub store.AgentStore) *AgentsMethods {
 	t.Helper()
 	return &AgentsMethods{
@@ -131,7 +140,6 @@ func newManagedMethods(t *testing.T, stub store.AgentStore) *AgentsMethods {
 		cfg:        minimalConfig(),
 		workspace:  t.TempDir(),
 		agentStore: stub,
-		isManaged:  true,
 	}
 }
 

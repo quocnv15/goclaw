@@ -65,6 +65,7 @@ const (
 
 	MethodPairingRequest = "device.pair.request"
 	MethodPairingApprove = "device.pair.approve"
+	MethodPairingDeny    = "device.pair.deny"
 	MethodPairingList    = "device.pair.list"
 	MethodPairingRevoke  = "device.pair.revoke"
 
@@ -77,10 +78,12 @@ const (
 	MethodUsageGet     = "usage.get"
 	MethodUsageSummary = "usage.summary"
 
+	MethodQuotaUsage = "quota.usage"
+
 	MethodSend = "send"
 )
 
-// Channel instances management (managed mode)
+// Channel instances management
 const (
 	MethodChannelInstancesList   = "channels.instances.list"
 	MethodChannelInstancesGet    = "channels.instances.get"
@@ -89,7 +92,7 @@ const (
 	MethodChannelInstancesDelete = "channels.instances.delete"
 )
 
-// Agent links (inter-agent delegation, managed mode)
+// Agent links (inter-agent delegation)
 const (
 	MethodAgentsLinksList   = "agents.links.list"
 	MethodAgentsLinksCreate = "agents.links.create"
@@ -97,7 +100,7 @@ const (
 	MethodAgentsLinksDelete = "agents.links.delete"
 )
 
-// Agent teams (managed mode)
+// Agent teams
 const (
 	MethodTeamsList     = "teams.list"
 	MethodTeamsCreate   = "teams.create"
@@ -110,7 +113,7 @@ const (
 	MethodTeamsKnownUsers    = "teams.known_users"
 )
 
-// Delegation history (managed mode)
+// Delegation history
 const (
 	MethodDelegationsList = "delegations.list"
 	MethodDelegationsGet  = "delegations.get"
@@ -131,5 +134,7 @@ const (
 	MethodBrowserSnapshot   = "browser.snapshot"
 	MethodBrowserScreenshot = "browser.screenshot"
 
-	MethodHeartbeat = "heartbeat"
+	// Zalo Personal
+	MethodZaloPersonalQRStart   = "zalo.personal.qr.start"
+	MethodZaloPersonalContacts  = "zalo.personal.contacts"
 )

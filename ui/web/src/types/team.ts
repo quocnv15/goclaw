@@ -5,6 +5,7 @@ export interface TeamAccessSettings {
   deny_user_ids?: string[];
   allow_channels?: string[];
   deny_channels?: string[];
+  progress_notifications?: boolean;
 }
 
 export interface TeamData {
@@ -26,7 +27,7 @@ export interface TeamMemberData {
   agent_key?: string;
   display_name?: string;
   frontmatter?: string;
-  role: "lead" | "member";
+  role: "lead" | "member" | "reviewer";
   joined_at?: string;
 }
 

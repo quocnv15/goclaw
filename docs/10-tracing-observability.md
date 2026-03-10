@@ -2,7 +2,7 @@
 
 Records agent run activities asynchronously. Spans are buffered in memory and flushed to the TracingStore in batches, with optional export to external OpenTelemetry backends.
 
-> **Managed mode only**: Tracing requires PostgreSQL. In standalone mode, `TracingStore` is nil and no traces are recorded. The `traces` and `spans` tables store all tracing data. Optional OTel export sends spans to external backends (Jaeger, Grafana Tempo, Datadog) in addition to PostgreSQL.
+> Tracing uses PostgreSQL. The `traces` and `spans` tables store all tracing data. Optional OTel export sends spans to external backends (Jaeger, Grafana Tempo, Datadog) in addition to PostgreSQL.
 
 ---
 
@@ -43,6 +43,8 @@ Context values (traceID, collector) survive cancellation -- only `ctx.Done()` an
 | `llm_call` | LLM provider call | Client |
 | `tool_call` | Tool execution | Internal |
 | `agent` | Root agent span (parents all child spans) | Internal |
+| `embedding` | Embedding generation (vector store operations) | Internal |
+| `event` | Discrete event marker (no duration) | Internal |
 
 ```mermaid
 flowchart TD
@@ -50,6 +52,7 @@ flowchart TD
     AGENT --> TOOL1["Tool Span: exec<br/>(tool_name, duration)"]
     AGENT --> LLM2["LLM Call Span 2"]
     AGENT --> TOOL2["Tool Span: read_file"]
+    AGENT --> EMB["Embedding Span<br/>(vector store operation)"]
     AGENT --> LLM3["LLM Call Span 3"]
 ```
 
@@ -160,5 +163,5 @@ Delegation history is automatically recorded by `DelegateManager.saveDelegationH
 | [01-agent-loop.md](./01-agent-loop.md) | Span emission during agent execution, cancel handling |
 | [03-tools-system.md](./03-tools-system.md) | Delegation system, delegation history via agent tool |
 | [06-store-data-model.md](./06-store-data-model.md) | traces/spans tables schema, delegation_history table |
-| [08-scheduling-cron-heartbeat.md](./08-scheduling-cron-heartbeat.md) | /stop and /stopall commands |
+| [08-scheduling-cron.md](./08-scheduling-cron.md) | Scheduler lanes, /stop and /stopall commands |
 | [09-security.md](./09-security.md) | Rate limiting, RBAC access control |

@@ -8,6 +8,7 @@ export const queryKeys = {
     detail: (id: string) => ["agents", id] as const,
     files: (agentKey: string) => ["agents", agentKey, "files"] as const,
     links: (agentId: string) => ["agents", agentId, "links"] as const,
+    instances: (agentId: string) => ["agents", agentId, "instances"] as const,
   },
   sessions: {
     all: ["sessions"] as const,
@@ -27,6 +28,12 @@ export const queryKeys = {
   channels: {
     all: ["channels"] as const,
     list: (params: Record<string, unknown>) => ["channels", params] as const,
+    detail: (id: string) => ["channels", "detail", id] as const,
+  },
+  contacts: {
+    all: ["contacts"] as const,
+    list: (params: Record<string, unknown>) => ["contacts", params] as const,
+    resolve: (ids: string) => ["contacts", "resolve", ids] as const,
   },
   skills: {
     all: ["skills"] as const,
@@ -55,5 +62,15 @@ export const queryKeys = {
   teams: {
     all: ["teams"] as const,
     detail: (id: string) => ["teams", id] as const,
+  },
+  memory: {
+    all: ["memory"] as const,
+    list: (params: Record<string, unknown>) => ["memory", params] as const,
+  },
+  kg: {
+    all: ["kg"] as const,
+    list: (params: Record<string, unknown>) => ["kg", params] as const,
+    stats: (agentId: string, userId?: string) => ["kg", "stats", agentId, userId] as const,
+    graph: (agentId: string, userId?: string) => ["kg", "graph", agentId, userId] as const,
   },
 };

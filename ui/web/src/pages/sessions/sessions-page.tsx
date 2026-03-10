@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useParams, useNavigate } from "react-router";
+import { useTranslation } from "react-i18next";
 import { History } from "lucide-react";
 import { PageHeader } from "@/components/shared/page-header";
 import { EmptyState } from "@/components/shared/empty-state";
@@ -15,13 +16,14 @@ import { formatRelativeTime } from "@/lib/format";
 import type { SessionInfo } from "@/types/session";
 
 export function SessionsPage() {
+  const { t } = useTranslation("sessions");
   const { key: detailKey } = useParams<{ key: string }>();
   const navigate = useNavigate();
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
 
-  const { sessions, total, loading, preview, deleteSession, resetSession } = useSessions({
+  const { sessions, total, loading, preview, deleteSession, resetSession, patchSession } = useSessions({
     limit: pageSize,
     offset: (page - 1) * pageSize,
   });
@@ -44,24 +46,32 @@ export function SessionsPage() {
           navigate("/sessions");
         }}
         onReset={resetSession}
+        onPatch={patchSession}
       />
     );
   }
 
   const filtered = sessions.filter((s) => {
     const q = search.toLowerCase();
-    return s.key.toLowerCase().includes(q) || (s.label ?? "").toLowerCase().includes(q);
+    const meta = s.metadata;
+    return (
+      s.key.toLowerCase().includes(q) ||
+      (s.label ?? "").toLowerCase().includes(q) ||
+      (meta?.display_name ?? "").toLowerCase().includes(q) ||
+      (meta?.username ?? "").toLowerCase().includes(q) ||
+      (meta?.chat_title ?? "").toLowerCase().includes(q)
+    );
   });
 
   return (
-    <div className="p-6">
-      <PageHeader title="Sessions" description="Browse conversation sessions" />
+    <div className="p-4 sm:p-6">
+      <PageHeader title={t("title")} description={t("description")} />
 
       <div className="mt-4">
         <SearchInput
           value={search}
           onChange={setSearch}
-          placeholder="Search sessions..."
+          placeholder={t("searchPlaceholder")}
           className="max-w-sm"
         />
       </div>
@@ -72,23 +82,19 @@ export function SessionsPage() {
         ) : filtered.length === 0 ? (
           <EmptyState
             icon={History}
-            title={search ? "No matching sessions" : "No sessions yet"}
-            description={
-              search
-                ? "Try a different search term."
-                : "Sessions will appear here once you start chatting."
-            }
+            title={search ? t("noMatchTitle") : t("emptyTitle")}
+            description={search ? t("noMatchDescription") : t("emptyDescription")}
           />
         ) : (
-          <div className="rounded-md border">
-            <table className="w-full">
+          <div className="rounded-md border overflow-x-auto">
+            <table className="w-full min-w-[600px]">
               <thead>
                 <tr className="border-b bg-muted/50">
-                  <th className="px-4 py-3 text-left text-sm font-medium">Session</th>
-                  <th className="px-4 py-3 text-left text-sm font-medium">Agent</th>
-                  <th className="px-4 py-3 text-left text-sm font-medium">Channel</th>
-                  <th className="px-4 py-3 text-right text-sm font-medium">Messages</th>
-                  <th className="px-4 py-3 text-right text-sm font-medium">Updated</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium">{t("columns.session")}</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium">{t("columns.agent")}</th>
+                  <th className="px-4 py-3 text-left text-sm font-medium">{t("columns.channel")}</th>
+                  <th className="px-4 py-3 text-right text-sm font-medium">{t("columns.messages")}</th>
+                  <th className="px-4 py-3 text-right text-sm font-medium">{t("columns.updated")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -131,11 +137,15 @@ function SessionRow({
       onClick={onClick}
     >
       <td className="px-4 py-3">
-        <div className="text-sm font-medium">{session.label || parsed.scope}</div>
-        <div className="text-xs text-muted-foreground">{session.key}</div>
+        <div className="text-sm font-medium">
+          {session.metadata?.chat_title || session.metadata?.display_name || session.label || parsed.scope}
+        </div>
+        <div className="text-xs text-muted-foreground">
+          {session.metadata?.username ? `@${session.metadata.username}` : session.key}
+        </div>
       </td>
       <td className="px-4 py-3">
-        <Badge variant="outline">{parsed.agentId}</Badge>
+        <Badge variant="outline">{session.agentName || parsed.agentId}</Badge>
       </td>
       <td className="px-4 py-3 text-sm text-muted-foreground">
         {session.channel || "ws"}

@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // InternalChannels are system channels excluded from outbound dispatch.
@@ -48,10 +49,25 @@ const (
 	GroupPolicyDisabled  GroupPolicy = "disabled"   // No group messages
 )
 
+// Channel type constants used across channel packages and gateway wiring.
+const (
+	TypeTelegram     = "telegram"
+	TypeDiscord      = "discord"
+	TypeSlack        = "slack"
+	TypeFeishu       = "feishu"
+	TypeWhatsApp     = "whatsapp"
+	TypeZaloOA       = "zalo_oa"
+	TypeZaloPersonal = "zalo_personal"
+)
+
 // Channel defines the interface that all channel implementations must satisfy.
 type Channel interface {
-	// Name returns the channel identifier (e.g., "telegram", "discord", "slack").
+	// Name returns the channel instance name (e.g., "telegram", "discord", "slack").
 	Name() string
+
+	// Type returns the platform type (e.g., "telegram", "zalo_personal").
+	// For config-based channels this equals Name(); for DB instances it may differ.
+	Type() string
 
 	// Start begins listening for messages. Should be non-blocking after setup.
 	Start(ctx context.Context) error
@@ -79,10 +95,20 @@ type StreamingChannel interface {
 	// which gives more accurate token usage from providers that don't support
 	// stream_options (e.g. MiniMax). The channel still implements the interface
 	// so it can be toggled at runtime via config.
-	StreamEnabled() bool
+	//
+	// isGroup indicates whether this is a group chat (true) or DM (false).
+	// Channels may choose to always stream for DMs while gating group streaming
+	// behind config (e.g. Telegram uses sendMessageDraft for DMs).
+	StreamEnabled(isGroup bool) bool
 	OnStreamStart(ctx context.Context, chatID string) error
 	OnChunkEvent(ctx context.Context, chatID string, fullText string) error
 	OnStreamEnd(ctx context.Context, chatID string, finalText string) error
+}
+
+// BlockReplyChannel is optionally implemented by channels that override
+// the gateway-level block_reply setting. Returns nil to inherit the gateway default.
+type BlockReplyChannel interface {
+	BlockReplyEnabled() *bool
 }
 
 // WebhookChannel extends Channel with an HTTP handler that can be mounted
@@ -99,20 +125,23 @@ type WebhookChannel interface {
 // ReactionChannel extends Channel with status reaction support.
 // Channels that implement this interface can show emoji reactions on user messages
 // to indicate agent status (thinking, tool call, done, error, stall).
+// messageID is a string to support platforms with non-integer IDs (e.g., Feishu "om_xxx").
 type ReactionChannel interface {
 	Channel
-	OnReactionEvent(ctx context.Context, chatID string, messageID int, status string) error
-	ClearReaction(ctx context.Context, chatID string, messageID int) error
+	OnReactionEvent(ctx context.Context, chatID string, messageID string, status string) error
+	ClearReaction(ctx context.Context, chatID string, messageID string) error
 }
 
 // BaseChannel provides shared functionality for all channel implementations.
 // Channel implementations should embed this struct.
 type BaseChannel struct {
-	name      string
-	bus       *bus.MessageBus
-	running   bool
-	allowList []string
-	agentID   string // for DB instances: routes to specific agent (empty = use resolveAgentRoute)
+	name             string
+	channelType      string // platform type; defaults to name if unset
+	bus              *bus.MessageBus
+	running          bool
+	allowList        []string
+	agentID          string                 // for DB instances: routes to specific agent (empty = use resolveAgentRoute)
+	contactCollector *store.ContactCollector // optional: auto-collect contacts from channel messages
 }
 
 // NewBaseChannel creates a new BaseChannel with the given parameters.
@@ -124,17 +153,34 @@ func NewBaseChannel(name string, msgBus *bus.MessageBus, allowList []string) *Ba
 	}
 }
 
-// Name returns the channel name.
+// Name returns the channel instance name.
 func (c *BaseChannel) Name() string { return c.name }
+
+// Type returns the platform type. Falls back to name if unset (config-based channels).
+func (c *BaseChannel) Type() string {
+	if c.channelType != "" {
+		return c.channelType
+	}
+	return c.name
+}
 
 // SetName overrides the channel name (used by InstanceLoader for DB instances).
 func (c *BaseChannel) SetName(name string) { c.name = name }
+
+// SetType sets the platform type (used by InstanceLoader for DB instances).
+func (c *BaseChannel) SetType(t string) { c.channelType = t }
 
 // AgentID returns the explicit agent ID for this channel (empty = use resolveAgentRoute).
 func (c *BaseChannel) AgentID() string { return c.agentID }
 
 // SetAgentID sets the explicit agent ID for routing (used by InstanceLoader for DB instances).
 func (c *BaseChannel) SetAgentID(id string) { c.agentID = id }
+
+// SetContactCollector sets the contact collector for auto-collecting contacts from messages.
+func (c *BaseChannel) SetContactCollector(cc *store.ContactCollector) { c.contactCollector = cc }
+
+// ContactCollector returns the contact collector (may be nil).
+func (c *BaseChannel) ContactCollector() *store.ContactCollector { return c.contactCollector }
 
 // IsRunning returns whether the channel is running.
 func (c *BaseChannel) IsRunning() bool { return c.running }
@@ -233,7 +279,12 @@ func (c *BaseChannel) ValidatePolicy(dmPolicy, groupPolicy string) {
 // This is the standard way for channels to forward received messages.
 // peerKind should be "direct" or "group" (see sessions.PeerDirect, sessions.PeerGroup).
 func (c *BaseChannel) HandleMessage(senderID, chatID, content string, media []string, metadata map[string]string, peerKind string) {
-	if !c.IsAllowed(senderID) {
+	// For DMs, enforce the allowlist as a safety net.
+	// For group messages, skip this check — group access is already enforced
+	// by the channel-specific group policy (checkGroupPolicy / CheckPolicy).
+	// Re-checking the sender here would incorrectly block users who are not
+	// individually listed but are in an allowed (or open-policy) group.
+	if peerKind != "group" && !c.IsAllowed(senderID) {
 		return
 	}
 
@@ -244,12 +295,18 @@ func (c *BaseChannel) HandleMessage(senderID, chatID, content string, media []st
 		userID = senderID[:idx]
 	}
 
+	// Convert string paths to MediaFile (for channels that haven't been updated yet).
+	var mediaFiles []bus.MediaFile
+	for _, p := range media {
+		mediaFiles = append(mediaFiles, bus.MediaFile{Path: p})
+	}
+
 	msg := bus.InboundMessage{
 		Channel:  c.name,
 		SenderID: senderID,
 		ChatID:   chatID,
 		Content:  content,
-		Media:    media,
+		Media:    mediaFiles,
 		PeerKind: peerKind,
 		UserID:   userID,
 		Metadata: metadata,
@@ -257,6 +314,13 @@ func (c *BaseChannel) HandleMessage(senderID, chatID, content string, media []st
 	}
 
 	c.bus.PublishInbound(msg)
+}
+
+// PendingCompactable is optionally implemented by channels that have a PendingHistory
+// supporting LLM-based compaction. InstanceLoader uses this to wire compaction config
+// after channel creation.
+type PendingCompactable interface {
+	SetPendingCompaction(cfg *CompactionConfig)
 }
 
 // Truncate shortens a string to maxLen, appending "..." if truncated.

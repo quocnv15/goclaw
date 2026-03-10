@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/nextlevelbuilder/goclaw/internal/bus"
 )
 
 // AnnounceQueueItem represents a single subagent result waiting to be announced.
@@ -13,6 +15,7 @@ type AnnounceQueueItem struct {
 	Label      string
 	Status     string // "completed", "failed", "cancelled"
 	Result     string
+	Media      []bus.MediaFile // media files from tool results
 	Runtime    time.Duration
 	Iterations int
 }
@@ -24,6 +27,7 @@ type AnnounceMetadata struct {
 	OriginPeerKind   string
 	OriginLocalKey   string // composite key with topic/thread suffix for routing
 	OriginUserID     string
+	OriginSessionKey string // exact parent session key (WS uses non-standard format)
 	ParentAgent      string
 	OriginTraceID    string // parent trace UUID for announce linking
 	OriginRootSpanID string // parent agent's root span UUID

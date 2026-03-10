@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ── Stage 1: Build ──
-FROM golang:1.25-bookworm AS builder
+FROM golang:1.26-bookworm AS builder
 
 WORKDIR /src
 
@@ -15,6 +15,7 @@ COPY . .
 # Build args
 ARG ENABLE_OTEL=false
 ARG ENABLE_TSNET=false
+ARG ENABLE_REDIS=false
 ARG VERSION=dev
 
 # Build static binary (CGO disabled for scratch/alpine compatibility)
@@ -23,6 +24,9 @@ RUN set -eux; \
     if [ "$ENABLE_OTEL" = "true" ]; then TAGS="otel"; fi; \
     if [ "$ENABLE_TSNET" = "true" ]; then \
         if [ -n "$TAGS" ]; then TAGS="$TAGS,tsnet"; else TAGS="tsnet"; fi; \
+    fi; \
+    if [ "$ENABLE_REDIS" = "true" ]; then \
+        if [ -n "$TAGS" ]; then TAGS="$TAGS,redis"; else TAGS="redis"; fi; \
     fi; \
     if [ -n "$TAGS" ]; then TAGS="-tags $TAGS"; fi; \
     CGO_ENABLED=0 GOOS=linux \
@@ -33,12 +37,16 @@ RUN set -eux; \
 FROM alpine:3.22
 
 ARG ENABLE_SANDBOX=false
+ARG ENABLE_PYTHON=false
 
-# Install ca-certificates + wget (healthcheck) + optionally docker-cli (sandbox)
+# Install ca-certificates + wget (healthcheck) + optionally docker-cli (sandbox) + python3
 RUN set -eux; \
     apk add --no-cache ca-certificates wget; \
     if [ "$ENABLE_SANDBOX" = "true" ]; then \
         apk add --no-cache docker-cli; \
+    fi; \
+    if [ "$ENABLE_PYTHON" = "true" ]; then \
+        apk add --no-cache python3 py3-pip; \
     fi
 
 # Non-root user

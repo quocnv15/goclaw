@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
+	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
@@ -42,12 +43,12 @@ func (m *SessionsMethods) handleList(_ context.Context, client *gateway.Client, 
 		params.Limit = 20
 	}
 
-	result := m.sessions.ListPaged(store.SessionListOpts{
+	result := m.sessions.ListPagedRich(store.SessionListOpts{
 		AgentID: params.AgentID,
 		Limit:   params.Limit,
 		Offset:  params.Offset,
 	})
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"sessions": result.Sessions,
 		"total":    result.Total,
 		"limit":    params.Limit,
@@ -59,17 +60,18 @@ type sessionKeyParams struct {
 	Key string `json:"key"`
 }
 
-func (m *SessionsMethods) handlePreview(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *SessionsMethods) handlePreview(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	var params sessionKeyParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid params"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidJSON)))
 		return
 	}
 
 	history := m.sessions.GetHistory(params.Key)
 	summary := m.sessions.GetSummary(params.Key)
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"key":      params.Key,
 		"messages": history,
 		"summary":  summary,
@@ -78,19 +80,21 @@ func (m *SessionsMethods) handlePreview(_ context.Context, client *gateway.Clien
 
 // handlePatch updates session metadata fields.
 // Matching TS sessions.patch (src/gateway/server-methods/sessions.ts:237-287).
-func (m *SessionsMethods) handlePatch(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *SessionsMethods) handlePatch(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	var params struct {
-		Key   string `json:"key"`
-		Label *string `json:"label,omitempty"`
-		Model *string `json:"model,omitempty"`
+		Key      string            `json:"key"`
+		Label    *string           `json:"label,omitempty"`
+		Model    *string           `json:"model,omitempty"`
+		Metadata map[string]string `json:"metadata,omitempty"`
 	}
 	if err := json.Unmarshal(req.Params, &params); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid params"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidJSON)))
 		return
 	}
 
 	if params.Key == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "key is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "key")))
 		return
 	}
 
@@ -104,16 +108,25 @@ func (m *SessionsMethods) handlePatch(_ context.Context, client *gateway.Client,
 		m.sessions.UpdateMetadata(params.Key, *params.Model, "", "")
 	}
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	// Apply metadata patch
+	if len(params.Metadata) > 0 {
+		m.sessions.SetSessionMetadata(params.Key, params.Metadata)
+	}
+
+	// Save changes to DB
+	m.sessions.Save(params.Key)
+
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"ok":  true,
 		"key": params.Key,
 	}))
 }
 
-func (m *SessionsMethods) handleDelete(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *SessionsMethods) handleDelete(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	var params sessionKeyParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid params"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidJSON)))
 		return
 	}
 
@@ -122,21 +135,22 @@ func (m *SessionsMethods) handleDelete(_ context.Context, client *gateway.Client
 		return
 	}
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"ok": true,
 	}))
 }
 
-func (m *SessionsMethods) handleReset(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *SessionsMethods) handleReset(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	var params sessionKeyParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid params"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidJSON)))
 		return
 	}
 
 	m.sessions.Reset(params.Key)
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"ok": true,
 	}))
 }
