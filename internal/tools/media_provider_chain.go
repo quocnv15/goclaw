@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
@@ -19,18 +20,16 @@ type MediaProviderEntry struct {
 	Provider   string         `json:"provider"`              // name for registry.Get()
 	Model      string         `json:"model"`
 	Enabled    bool           `json:"enabled"`
-	Timeout    int            `json:"timeout"`               // seconds, default 120
-	MaxRetries int            `json:"max_retries"`           // default 2
-	Params     map[string]any `json:"params,omitempty"`      // provider-specific config
+	Timeout    int            `json:"timeout"`          // seconds, default 120
+	MaxRetries int            `json:"max_retries"`      // default 2
+	Params     map[string]any `json:"params,omitempty"` // provider-specific config
 }
 
 // mediaProviderChain is the settings JSON structure for media tools.
-// Supports both new (providers array) and legacy (flat provider/model) formats.
+// Only supports chain format: {"providers":[...]}.
+// Legacy flat format is auto-migrated at startup (see cmd/gateway_builtin_tools.go).
 type mediaProviderChain struct {
 	Providers []MediaProviderEntry `json:"providers,omitempty"`
-	// Legacy fields (backward compat)
-	Provider string `json:"provider,omitempty"`
-	Model    string `json:"model,omitempty"`
 }
 
 // applyDefaults fills in zero-value fields with sensible defaults.
@@ -85,7 +84,7 @@ func ResolveMediaProviderChain(
 	}
 
 	// 3. Hardcoded default chain — use first available provider
-	return buildDefaultChain(defaultPriority, defaultModels, registry)
+	return buildDefaultChain(ctx, defaultPriority, defaultModels, registry)
 }
 
 // parseChainSettings parses the settings JSON into a chain, handling both new
@@ -97,53 +96,34 @@ func parseChainSettings(raw []byte, defaultModels map[string]string) []MediaProv
 		return nil
 	}
 
-	// New format: providers array
-	if len(chain.Providers) > 0 {
-		var result []MediaProviderEntry
-		for _, e := range chain.Providers {
-			if !e.Enabled {
-				continue
-			}
-			if e.Provider == "" {
-				continue
-			}
-			if e.Model == "" {
-				e.Model = defaultModels[e.Provider]
-			}
-			e.applyDefaults()
-			result = append(result, e)
+	var result []MediaProviderEntry
+	for _, e := range chain.Providers {
+		if !e.Enabled {
+			continue
 		}
-		return result
+		if e.Provider == "" {
+			continue
+		}
+		if e.Model == "" {
+			e.Model = defaultModels[e.Provider]
+		}
+		e.applyDefaults()
+		result = append(result, e)
 	}
-
-	// Legacy format: flat provider/model
-	if chain.Provider != "" {
-		model := chain.Model
-		if model == "" {
-			model = defaultModels[chain.Provider]
-		}
-		entry := MediaProviderEntry{
-			Provider: chain.Provider,
-			Model:    model,
-			Enabled:  true,
-		}
-		entry.applyDefaults()
-		return []MediaProviderEntry{entry}
-	}
-
-	return nil
+	return result
 }
 
 // buildDefaultChain creates a chain from the hardcoded priority list,
 // including only providers that are currently registered.
 func buildDefaultChain(
+	ctx context.Context,
 	priority []string,
 	defaultModels map[string]string,
 	registry *providers.Registry,
 ) []MediaProviderEntry {
 	var chain []MediaProviderEntry
 	for _, name := range priority {
-		if _, err := registry.Get(name); err == nil {
+		if _, err := registry.Get(ctx, name); err == nil {
 			entry := MediaProviderEntry{
 				Provider: name,
 				Model:    defaultModels[name],
@@ -183,7 +163,7 @@ func ExecuteWithChain(
 
 	var lastErr error
 	for _, entry := range chain {
-		p, err := registry.Get(entry.Provider)
+		p, err := registry.Get(ctx, entry.Provider)
 		if err != nil {
 			slog.Warn("media_chain: provider not found, skipping",
 				"provider", entry.Provider, "error", err)
@@ -191,19 +171,23 @@ func ExecuteWithChain(
 			continue
 		}
 
-		cp, ok := p.(credentialProvider)
-		if !ok {
-			slog.Warn("media_chain: provider does not expose credentials, skipping",
-				"provider", entry.Provider)
-			lastErr = fmt.Errorf("provider %q does not expose API credentials", entry.Provider)
-			continue
-		}
+		// credentialProvider is optional — providers that don't expose static
+		// credentials (e.g. OAuth-based CodexProvider) pass nil and each
+		// callProvider falls back to using the provider's Chat() API.
+		cp, _ := p.(credentialProvider)
+
+		// Inject resolved provider type into params so callProvider can route correctly.
+		// Clone params to avoid mutating the original entry config.
+		resolvedType := ResolveProviderType(p)
+		callParams := make(map[string]any, len(entry.Params)+1)
+		maps.Copy(callParams, entry.Params)
+		callParams["_provider_type"] = resolvedType
 
 		// Retry loop for this provider
 		for attempt := 1; attempt <= entry.MaxRetries; attempt++ {
 			timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(entry.Timeout)*time.Second)
 
-			data, usage, callErr := fn(timeoutCtx, cp, entry.Provider, entry.Model, entry.Params)
+			data, usage, callErr := fn(timeoutCtx, cp, entry.Provider, entry.Model, callParams)
 			cancel()
 
 			if callErr == nil {
@@ -306,9 +290,46 @@ func GetParamInt(params map[string]any, key string, fallback int) int {
 	return fallback
 }
 
-// ProviderTypeFromName returns the provider_type based on known provider naming patterns.
-// Used to determine which API endpoint to call.
-func ProviderTypeFromName(name string) string {
+// typedProvider is optionally implemented by providers that carry their DB provider_type.
+type typedProvider interface {
+	ProviderType() string
+}
+
+// dbTypeToMediaType maps DB provider_type values to the media routing type
+// used by callProvider switch statements.
+var dbTypeToMediaType = map[string]string{
+	"gemini_native":    "gemini",
+	"openrouter":       "openrouter",
+	"minimax_native":   "minimax",
+	"dashscope":        "dashscope",
+	"bailian":          "dashscope",
+	"anthropic_native": "anthropic",
+	"suno":             "suno",
+}
+
+// ResolveProviderType returns the media routing type for a provider.
+// It first checks the provider's DB type (via typedProvider interface),
+// then falls back to name-based heuristics for config-registered providers.
+// Generic DB types like "openai_compat" are skipped in favor of name-based
+// inference, since different openai_compat providers (OpenRouter, etc.)
+// need different media API endpoints.
+func ResolveProviderType(p providers.Provider) string {
+	// Prefer the actual DB provider_type when available,
+	// but skip generic types that don't distinguish media routing.
+	if tp, ok := p.(typedProvider); ok {
+		if pt := tp.ProviderType(); pt != "" && pt != "openai_compat" {
+			if mt, found := dbTypeToMediaType[pt]; found {
+				return mt
+			}
+		}
+	}
+	// Fallback: infer from provider name (for config-registered and openai_compat providers)
+	return providerTypeFromName(p.Name())
+}
+
+// providerTypeFromName infers provider type from naming patterns.
+// Used as fallback when the provider doesn't carry its DB type.
+func providerTypeFromName(name string) string {
 	switch {
 	case name == "gemini" || strings.HasPrefix(name, "gemini"):
 		return "gemini"

@@ -81,7 +81,7 @@ func (c *Channel) handleTasksList(ctx context.Context, chatID int64, isGroup boo
 		return
 	}
 
-	tasks, err := c.teamStore.ListTasks(ctx, team.ID, "newest", store.TeamTaskFilterAll, taskUserID(c.Name(), chatID, isGroup))
+	tasks, err := c.teamStore.ListTasks(ctx, team.ID, "newest", store.TeamTaskFilterAll, taskUserID(c.Name(), chatID, isGroup), "", "", 0, 0)
 	if err != nil {
 		slog.Warn("tasks command: ListTasks failed", "error", err)
 		send("Failed to list tasks. Please try again.")
@@ -173,7 +173,7 @@ func (c *Channel) handleTaskDetail(ctx context.Context, chatID int64, text strin
 		return
 	}
 
-	tasks, err := c.teamStore.ListTasks(ctx, team.ID, "newest", store.TeamTaskFilterAll, taskUserID(c.Name(), chatID, isGroup))
+	tasks, err := c.teamStore.ListTasks(ctx, team.ID, "newest", store.TeamTaskFilterAll, taskUserID(c.Name(), chatID, isGroup), "", "", 0, 0)
 	if err != nil {
 		slog.Warn("task_detail command: ListTasks failed", "error", err)
 		send("Failed to list tasks. Please try again.")
@@ -196,6 +196,9 @@ func (c *Channel) handleTaskDetail(ctx context.Context, chatID int64, text strin
 // handleCallbackQuery handles inline keyboard button presses.
 func (c *Channel) handleCallbackQuery(ctx context.Context, query *telego.CallbackQuery) {
 	// Always answer to dismiss the loading indicator.
+	// Inject tenant scope (callback queries bypass handleBotCommand).
+	ctx = store.WithTenantID(ctx, c.TenantID())
+
 	c.bot.AnswerCallbackQuery(ctx, &telego.AnswerCallbackQueryParams{
 		CallbackQueryID: query.ID,
 	})
@@ -236,7 +239,7 @@ func (c *Channel) handleCallbackQuery(ctx context.Context, query *telego.Callbac
 		return
 	}
 
-	tasks, err := c.teamStore.ListTasks(ctx, team.ID, "newest", store.TeamTaskFilterAll, taskUserID(c.Name(), chatID, isGroup))
+	tasks, err := c.teamStore.ListTasks(ctx, team.ID, "newest", store.TeamTaskFilterAll, taskUserID(c.Name(), chatID, isGroup), "", "", 0, 0)
 	if err != nil {
 		send("Failed to list tasks.")
 		return

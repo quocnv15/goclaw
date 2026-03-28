@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { Inbox, RefreshCw, Trash2, Archive, Loader2, Info, ChevronDown, ChevronUp } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -33,10 +33,29 @@ export function PendingMessagesPage() {
   const [confirmClear, setConfirmClear] = useState<PendingMessageGroup | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [compactingKey, setCompactingKey] = useState<string | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     loadGroups();
   }, [loadGroups]);
+
+  // Clear spinner as soon as the compacting group's has_summary becomes true
+  useEffect(() => {
+    if (!compactingKey) return;
+    const [channel, historyKey] = compactingKey.split("/");
+    const group = groups.find(
+      (g) => g.channel_name === channel && g.history_key === historyKey,
+    );
+    if (group?.has_summary) {
+      if (pollRef.current) clearInterval(pollRef.current);
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      pollRef.current = null;
+      timeoutRef.current = null;
+      setCompactingKey(null);
+      setActionLoading(null);
+    }
+  }, [groups, compactingKey]);
 
   const handleRefresh = () => loadGroups();
 
@@ -45,10 +64,23 @@ export function PendingMessagesPage() {
     const key = `${group.channel_name}/${group.history_key}`;
     setActionLoading(key);
     setCompactingKey(key);
-    await compactGroup(group.channel_name, group.history_key);
-    setCompactingKey(null);
-    setActionLoading(null);
-    loadGroups();
+    const ok = await compactGroup(group.channel_name, group.history_key);
+    if (!ok) {
+      setCompactingKey(null);
+      setActionLoading(null);
+      return;
+    }
+    // Backend runs LLM in background — poll until done (has_summary changes).
+    // useEffect above clears spinner when has_summary becomes true.
+    pollRef.current = setInterval(() => loadGroups(), 5000);
+    setTimeout(() => loadGroups(), 2000); // quick first check
+    timeoutRef.current = setTimeout(() => {
+      if (pollRef.current) clearInterval(pollRef.current);
+      pollRef.current = null;
+      timeoutRef.current = null;
+      setCompactingKey(null);
+      setActionLoading(null);
+    }, 120_000);
   };
 
   const handleClear = async (group: PendingMessageGroup) => {
@@ -61,7 +93,7 @@ export function PendingMessagesPage() {
   };
 
   return (
-    <div className="p-4 sm:p-6">
+    <div className="p-4 sm:p-6 pb-10">
       <PageHeader
         title={t("title")}
         description={t("description")}
@@ -84,8 +116,8 @@ export function PendingMessagesPage() {
             description={t("emptyDescription")}
           />
         ) : (
-          <div className="rounded-md border">
-            <table className="w-full text-sm">
+          <div className="overflow-x-auto rounded-md border">
+            <table className="w-full min-w-[600px] text-sm">
               <thead>
                 <tr className="border-b bg-muted/50">
                   <th className="px-4 py-3 text-left font-medium">{t("columns.channel")}</th>

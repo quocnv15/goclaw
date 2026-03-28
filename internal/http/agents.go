@@ -1,6 +1,7 @@
 package http
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -11,24 +12,40 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/bootstrap"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
+	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
 // AgentsHandler handles agent CRUD and sharing endpoints.
 type AgentsHandler struct {
-	agents   store.AgentStore
-	token    string
-	msgBus   *bus.MessageBus  // for cache invalidation events (nil = no events)
-	summoner *AgentSummoner   // LLM-based agent setup (nil = disabled)
-	isOwner  func(string) bool // checks if user ID is a system owner (nil = no owners configured)
+	agents           store.AgentStore
+	providers        store.ProviderStore
+	providerReg      *providers.Registry
+	db               *sql.DB
+	tracingStore     store.TracingStore
+	defaultWorkspace string            // default workspace path template (e.g. "~/.goclaw/workspace")
+	msgBus           *bus.MessageBus   // for cache invalidation events (nil = no events)
+	summoner         *AgentSummoner    // LLM-based agent setup (nil = disabled)
+	isOwner          func(string) bool // checks if user ID is a system owner (nil = no owners configured)
 }
 
 // NewAgentsHandler creates a handler for agent management endpoints.
 // isOwner is a function that checks if a user ID is in GOCLAW_OWNER_IDS (nil = disabled).
-func NewAgentsHandler(agents store.AgentStore, token string, msgBus *bus.MessageBus, summoner *AgentSummoner, isOwner func(string) bool) *AgentsHandler {
-	return &AgentsHandler{agents: agents, token: token, msgBus: msgBus, summoner: summoner, isOwner: isOwner}
+func NewAgentsHandler(agents store.AgentStore, providers store.ProviderStore, providerReg *providers.Registry, db *sql.DB, tracing store.TracingStore, defaultWorkspace string, msgBus *bus.MessageBus, summoner *AgentSummoner, isOwner func(string) bool) *AgentsHandler {
+	return &AgentsHandler{
+		agents:           agents,
+		providers:        providers,
+		providerReg:      providerReg,
+		db:               db,
+		tracingStore:     tracing,
+		defaultWorkspace: defaultWorkspace,
+		msgBus:           msgBus,
+		summoner:         summoner,
+		isOwner:          isOwner,
+	}
 }
 
 // isOwnerUser checks if the given user ID is a system owner.
@@ -59,6 +76,7 @@ func (h *AgentsHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /v1/agents/{id}/shares/{userID}", h.authMiddleware(h.handleRevokeShare))
 	mux.HandleFunc("POST /v1/agents/{id}/regenerate", h.authMiddleware(h.handleRegenerate))
 	mux.HandleFunc("POST /v1/agents/{id}/resummon", h.authMiddleware(h.handleResummon))
+	mux.HandleFunc("GET /v1/agents/{id}/codex-pool-activity", h.authMiddleware(h.handleCodexPoolActivity))
 	mux.HandleFunc("GET /v1/agents/{id}/instances", h.authMiddleware(h.handleListInstances))
 	mux.HandleFunc("GET /v1/agents/{id}/instances/{userID}/files", h.authMiddleware(h.handleGetInstanceFiles))
 	mux.HandleFunc("PUT /v1/agents/{id}/instances/{userID}/files/{fileName}", h.authMiddleware(h.handleSetInstanceFile))
@@ -66,30 +84,14 @@ func (h *AgentsHandler) RegisterRoutes(mux *http.ServeMux) {
 }
 
 func (h *AgentsHandler) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if h.token != "" {
-			if extractBearerToken(r) != h.token {
-				locale := extractLocale(r)
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": i18n.T(locale, i18n.MsgUnauthorized)})
-				return
-			}
-		}
-		// Inject user_id and locale into context
-		userID := extractUserID(r)
-		ctx := store.WithLocale(r.Context(), extractLocale(r))
-		if userID != "" {
-			ctx = store.WithUserID(ctx, userID)
-		}
-		r = r.WithContext(ctx)
-		next(w, r)
-	}
+	return requireAuth("", next)
 }
 
 func (h *AgentsHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	userID := store.UserIDFromContext(r.Context())
 	if userID == "" {
 		locale := store.LocaleFromContext(r.Context())
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgUserIDHeader)})
+		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgUserIDHeader))
 		return
 	}
 
@@ -101,50 +103,62 @@ func (h *AgentsHandler) handleList(w http.ResponseWriter, r *http.Request) {
 		agents, err = h.agents.ListAccessible(r.Context(), userID)
 	}
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("agents.list", "error", err)
+		locale := store.LocaleFromContext(r.Context())
+		writeError(w, http.StatusInternalServerError, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToList, "agents"))
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{"agents": agents})
+	writeJSON(w, http.StatusOK, map[string]any{"agents": agents})
 }
 
 func (h *AgentsHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 	userID := store.UserIDFromContext(r.Context())
 	locale := store.LocaleFromContext(r.Context())
 	if userID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgUserIDHeader)})
+		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgUserIDHeader))
 		return
 	}
 
 	var req store.AgentData
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, err.Error())})
+		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidRequest, err.Error()))
 		return
 	}
 
 	if !isValidSlug(req.AgentKey) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidSlug, "agent_key")})
+		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidSlug, "agent_key"))
 		return
 	}
 
 	// Check for duplicate agent_key before creating
 	if existing, _ := h.agents.GetByKey(r.Context(), req.AgentKey); existing != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": i18n.T(locale, i18n.MsgAlreadyExists, "agent", req.AgentKey)})
+		writeError(w, http.StatusConflict, protocol.ErrAlreadyExists, i18n.T(locale, i18n.MsgAlreadyExists, "agent", req.AgentKey))
 		return
 	}
 
 	req.OwnerID = userID
+
+	// Resolve tenant_id: explicit body field for cross-tenant; otherwise inherit from auth context.
+	if store.IsOwnerRole(r.Context()) {
+		if req.TenantID == uuid.Nil {
+			req.TenantID = store.TenantIDFromContext(r.Context())
+		}
+	} else {
+		req.TenantID = store.TenantIDFromContext(r.Context())
+	}
+
 	if req.AgentType == "" {
 		req.AgentType = store.AgentTypeOpen
 	}
 	if req.ContextWindow <= 0 {
-		req.ContextWindow = 200000
+		req.ContextWindow = config.DefaultContextWindow
 	}
 	if req.MaxToolIterations <= 0 {
-		req.MaxToolIterations = 20
+		req.MaxToolIterations = config.DefaultMaxIterations
 	}
 	if req.Workspace == "" {
-		req.Workspace = fmt.Sprintf("~/.goclaw/%s-workspace", req.AgentKey)
+		req.Workspace = fmt.Sprintf("%s/%s", h.defaultWorkspace, req.AgentKey)
 	}
 	req.RestrictToWorkspace = true
 
@@ -164,11 +178,23 @@ func (h *AgentsHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 		req.Status = store.AgentStatusActive
 	}
 
+	if err := validateChatGPTOAuthAgentRouting(
+		r.Context(),
+		h.providers,
+		req.Provider,
+		req.ParseChatGPTOAuthRouting(),
+	); err != nil {
+		slog.Error("agents.create.validate_routing", "error", err)
+		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidRequest, err.Error()))
+		return
+	}
+
 	if err := h.agents.Create(r.Context(), &req); err != nil {
 		if strings.Contains(err.Error(), "duplicate key") || strings.Contains(err.Error(), "23505") {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": i18n.T(locale, i18n.MsgAlreadyExists, "agent", req.AgentKey)})
+			writeError(w, http.StatusConflict, protocol.ErrAlreadyExists, i18n.T(locale, i18n.MsgAlreadyExists, "agent", req.AgentKey))
 		} else {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			slog.Error("agents.create", "agent_key", req.AgentKey, "error", err)
+			writeError(w, http.StatusInternalServerError, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToCreate, "agent", "internal error"))
 		}
 		return
 	}
@@ -181,9 +207,10 @@ func (h *AgentsHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	// Start LLM summoning in background if applicable
 	if req.Status == store.AgentStatusSummoning {
-		go h.summoner.SummonAgent(req.ID, req.Provider, req.Model, description)
+		go h.summoner.SummonAgent(req.ID, req.TenantID, req.Provider, req.Model, description)
 	}
 
+	emitAudit(h.msgBus, r, "agent.created", "agent", req.ID.String())
 	writeJSON(w, http.StatusCreated, req)
 }
 
@@ -197,12 +224,12 @@ func (h *AgentsHandler) handleGet(w http.ResponseWriter, r *http.Request) {
 		// Try by agent_key
 		ag, err2 := h.agents.GetByKey(r.Context(), r.PathValue("id"))
 		if err2 != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": i18n.T(locale, i18n.MsgNotFound, "agent", r.PathValue("id"))})
+			writeError(w, http.StatusNotFound, protocol.ErrNotFound, i18n.T(locale, i18n.MsgNotFound, "agent", r.PathValue("id")))
 			return
 		}
 		if userID != "" && !isOwner {
 			if ok, _, _ := h.agents.CanAccess(r.Context(), ag.ID, userID); !ok {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": i18n.T(locale, i18n.MsgNoAccess, "agent")})
+				writeError(w, http.StatusForbidden, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgNoAccess, "agent"))
 				return
 			}
 		}
@@ -212,13 +239,13 @@ func (h *AgentsHandler) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	ag, err := h.agents.GetByID(r.Context(), id)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": i18n.T(locale, i18n.MsgNotFound, "agent", id.String())})
+		writeError(w, http.StatusNotFound, protocol.ErrNotFound, i18n.T(locale, i18n.MsgNotFound, "agent", id.String()))
 		return
 	}
 
 	if userID != "" && !isOwner {
 		if ok, _, _ := h.agents.CanAccess(r.Context(), id, userID); !ok {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": i18n.T(locale, i18n.MsgNoAccess, "agent")})
+			writeError(w, http.StatusForbidden, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgNoAccess, "agent"))
 			return
 		}
 	}
@@ -231,33 +258,61 @@ func (h *AgentsHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	locale := store.LocaleFromContext(r.Context())
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "agent")})
+		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidID, "agent"))
 		return
 	}
 
 	// Only owner can update
 	ag, err := h.agents.GetByID(r.Context(), id)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": i18n.T(locale, i18n.MsgNotFound, "agent", id.String())})
+		writeError(w, http.StatusNotFound, protocol.ErrNotFound, i18n.T(locale, i18n.MsgNotFound, "agent", id.String()))
 		return
 	}
 	if userID != "" && ag.OwnerID != userID && !h.isOwnerUser(userID) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": i18n.T(locale, i18n.MsgOwnerOnly, "update agent")})
+		writeError(w, http.StatusForbidden, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgOwnerOnly, "update agent"))
 		return
 	}
 
 	var updates map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, err.Error())})
+		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidRequest, err.Error()))
 		return
 	}
 
-	// Prevent changing owner_id
-	delete(updates, "owner_id")
-	delete(updates, "id")
+	// Allowlist: only permit known agent columns to be updated.
+	// Defense-in-depth against column injection via arbitrary JSON keys.
+	allowed := filterAllowedKeys(updates, agentAllowedFields)
+	allowed["restrict_to_workspace"] = true
 
-	if err := h.agents.Update(r.Context(), id, updates); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	validationProvider := ag.Provider
+	if providerName, ok := allowed["provider"].(string); ok && providerName != "" {
+		validationProvider = providerName
+	}
+	validationAgent := *ag
+	validationAgent.Provider = validationProvider
+	if otherConfig, ok := allowed["other_config"]; ok {
+		rawOtherConfig, err := marshalJSONRaw(otherConfig)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidJSON))
+			return
+		}
+		validationAgent.OtherConfig = rawOtherConfig
+	}
+
+	if err := validateChatGPTOAuthAgentRouting(
+		r.Context(),
+		h.providers,
+		validationAgent.Provider,
+		validationAgent.ParseChatGPTOAuthRouting(),
+	); err != nil {
+		slog.Error("agents.update.validate_routing", "id", id, "error", err)
+		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidRequest, err.Error()))
+		return
+	}
+
+	if err := h.agents.Update(r.Context(), id, allowed); err != nil {
+		slog.Error("agents.update", "id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToUpdate, "agent", "internal error"))
 		return
 	}
 
@@ -266,19 +321,19 @@ func (h *AgentsHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	h.emitCacheInvalidate(bus.CacheKindBootstrap, id.String())
 
 	// Cascade: if status changed, broadcast so channel instances and cron jobs react.
-	if newStatus, ok := updates["status"].(string); ok && newStatus != ag.Status {
+	if newStatus, ok := allowed["status"].(string); ok && newStatus != ag.Status {
 		if h.msgBus != nil {
-			h.msgBus.Broadcast(bus.Event{
-				Name: bus.EventAgentStatusChanged,
-				Payload: bus.AgentStatusChangedPayload{
+			bus.BroadcastForTenant(h.msgBus, bus.EventAgentStatusChanged,
+				store.TenantIDFromContext(r.Context()),
+				bus.AgentStatusChangedPayload{
 					AgentID:   id.String(),
 					OldStatus: ag.Status,
 					NewStatus: newStatus,
-				},
-			})
+				})
 		}
 	}
 
+	emitAudit(h.msgBus, r, "agent.updated", "agent", id.String())
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 }
 
@@ -287,23 +342,24 @@ func (h *AgentsHandler) handleDelete(w http.ResponseWriter, r *http.Request) {
 	locale := store.LocaleFromContext(r.Context())
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "agent")})
+		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidID, "agent"))
 		return
 	}
 
 	// Only owner can delete
 	ag, err := h.agents.GetByID(r.Context(), id)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": i18n.T(locale, i18n.MsgNotFound, "agent", id.String())})
+		writeError(w, http.StatusNotFound, protocol.ErrNotFound, i18n.T(locale, i18n.MsgNotFound, "agent", id.String()))
 		return
 	}
 	if userID != "" && ag.OwnerID != userID && !h.isOwnerUser(userID) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": i18n.T(locale, i18n.MsgOwnerOnly, "delete agent")})
+		writeError(w, http.StatusForbidden, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgOwnerOnly, "delete agent"))
 		return
 	}
 
 	if err := h.agents.Delete(r.Context(), id); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("agents.delete", "id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToDelete, "agent", "internal error"))
 		return
 	}
 
@@ -311,5 +367,6 @@ func (h *AgentsHandler) handleDelete(w http.ResponseWriter, r *http.Request) {
 	h.emitCacheInvalidate(bus.CacheKindAgent, ag.AgentKey)
 	h.emitCacheInvalidate(bus.CacheKindBootstrap, id.String())
 
+	emitAudit(h.msgBus, r, "agent.deleted", "agent", id.String())
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 }

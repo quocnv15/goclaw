@@ -14,13 +14,23 @@ import (
 // It extracts the agentID from the session key and routes to the correct agent loop.
 func makeSchedulerRunFunc(agents *agent.Router, cfg *config.Config) scheduler.RunFunc {
 	return func(ctx context.Context, req agent.RunRequest) (*agent.RunResult, error) {
-		// Extract agentID from session key (format: agent:{agentId}:{rest})
+		// Extract agentID from session key.
+		// Supported formats:
+		//   agent:{agentId}:{rest}
+		//   delegate:{sourceUUID8}:{targetAgentKey}:{delegationId}  (legacy, kept for existing sessions)
 		agentID := cfg.ResolveDefaultAgentID()
-		if parts := strings.SplitN(req.SessionKey, ":", 3); len(parts) >= 2 && parts[0] == "agent" {
-			agentID = parts[1]
+		if parts := strings.SplitN(req.SessionKey, ":", 4); len(parts) >= 2 {
+			switch parts[0] {
+			case "agent":
+				agentID = parts[1]
+			case "delegate":
+				if len(parts) >= 3 {
+					agentID = parts[2]
+				}
+			}
 		}
 
-		loop, err := agents.Get(agentID)
+		loop, err := agents.Get(ctx, agentID)
 		if err != nil {
 			return nil, fmt.Errorf("agent %s not found: %w", agentID, err)
 		}
@@ -30,10 +40,11 @@ func makeSchedulerRunFunc(agents *agent.Router, cfg *config.Config) scheduler.Ru
 		// The ctx from the scheduler is already cancellable; we create a child so the router's
 		// cancel func is independent from the scheduler's cancel func. Calling cancel twice is safe.
 		runCtx, cancel := context.WithCancel(ctx)
-		agents.RegisterRun(req.RunID, req.SessionKey, agentID, cancel)
+		injectCh := agents.RegisterRun(req.RunID, req.SessionKey, agentID, cancel)
 		defer agents.UnregisterRun(req.RunID)
 		defer cancel()
 
+		req.InjectCh = injectCh
 		return loop.Run(runCtx, req)
 	}
 }

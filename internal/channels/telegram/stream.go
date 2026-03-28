@@ -12,6 +12,8 @@ import (
 
 	"github.com/mymmrac/telego"
 	tu "github.com/mymmrac/telego/telegoutil"
+
+	"github.com/nextlevelbuilder/goclaw/internal/channels"
 )
 
 const (
@@ -87,12 +89,13 @@ type DraftStream struct {
 	draftID         int    // sendMessageDraft draft_id (0 = message transport)
 	useDraft        bool   // true = draft transport, false = message transport
 	draftFailed     bool   // true = draft API rejected permanently, using message transport
+	sendMayHaveLanded bool   // true = initial sendMessage was attempted and may have landed (even if timed out)
 }
 
-// newDraftStream creates a new streaming preview manager.
+// NewDraftStream creates a new streaming preview manager.
 // When useDraft is true, the stream will attempt to use sendMessageDraft (Bot API 9.3+)
 // and automatically fall back to sendMessage+editMessageText if the API rejects it.
-func newDraftStream(bot *telego.Bot, chatID int64, throttleMs int, messageThreadID int, useDraft bool) *DraftStream {
+func NewDraftStream(bot *telego.Bot, chatID int64, throttleMs int, messageThreadID int, useDraft bool) *DraftStream {
 	throttle := defaultStreamThrottle
 	if throttleMs > 0 {
 		throttle = time.Duration(throttleMs) * time.Millisecond
@@ -197,6 +200,7 @@ func (ds *DraftStream) flush(ctx context.Context) error {
 		if sendThreadID := resolveThreadIDForSend(ds.messageThreadID); sendThreadID > 0 {
 			params.MessageThreadID = sendThreadID
 		}
+		ds.sendMayHaveLanded = true
 		msg, err := ds.bot.SendMessage(ctx, params)
 		// TS ref: withTelegramThreadFallback — retry without thread ID when topic is deleted.
 		if err != nil && params.MessageThreadID != 0 && threadNotFoundRe.MatchString(err.Error()) {
@@ -205,6 +209,10 @@ func (ds *DraftStream) flush(ctx context.Context) error {
 			msg, err = ds.bot.SendMessage(ctx, params)
 		}
 		if err != nil {
+			if isPostConnectNetworkErr(err) {
+				slog.Warn("stream: initial sendMessage timed out or lost. Treating as landed to avoid duplicate.", "error", err)
+				return nil // treat as successful but with unknown messageID
+			}
 			slog.Debug("stream: failed to send initial message", "error", err)
 			return err
 		}
@@ -269,8 +277,8 @@ func (ds *DraftStream) UsedDraftTransport() bool {
 
 // --- StreamingChannel implementation ---
 
-// OnStreamStart prepares for streaming.
-// chatID here is the localKey (composite key with :topic:N suffix for forum topics).
+// CreateStream prepares a per-run streaming handle for the given chatID (localKey).
+// Implements channels.StreamingChannel.
 //
 // For DMs: seeds the stream with the "Thinking..." placeholder messageID so that
 // flush() uses editMessageText to update it progressively. This gives a smooth
@@ -278,10 +286,10 @@ func (ds *DraftStream) UsedDraftTransport() bool {
 //
 // For groups: deletes the placeholder and lets the stream create its own message,
 // since group placeholders drift away as other messages arrive.
-func (c *Channel) OnStreamStart(ctx context.Context, chatID string) error {
+func (c *Channel) CreateStream(ctx context.Context, chatID string, firstStream bool) (channels.ChannelStream, error) {
 	id, err := parseRawChatID(chatID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Look up thread ID stored during handleMessage
@@ -292,71 +300,40 @@ func (c *Channel) OnStreamStart(ctx context.Context, chatID string) error {
 
 	isDM := id > 0
 
-	// Both DMs and groups use message transport (editMessageText).
-	// sendMessageDraft (draft transport) is available in the codebase but disabled
-	// because it causes "reply to deleted message" artifacts in Telegram clients.
-	ds := newDraftStream(c.bot, id, 0, threadID, false)
+	// Draft transport only for non-first streams (answer lane) in DMs.
+	// First stream must use message transport because it may become the
+	// reasoning lane — draft messages are ephemeral and would disappear
+	// when the answer stream starts.
+	useDraft := isDM && !firstStream && c.draftTransportEnabled()
+	ds := NewDraftStream(c.bot, id, 0, threadID, useDraft)
 
-	if isDM {
-		// DMs: seed the stream with the "Thinking..." placeholder messageID.
-		// flush() will use editMessageText to update it progressively.
-		if pID, ok := c.placeholders.Load(chatID); ok {
-			c.placeholders.Delete(chatID)
-			ds.messageID = pID.(int)
-			slog.Info("stream: DM using placeholder for progressive edit", "chat_id", id, "message_id", pID.(int))
-		} else {
-			slog.Info("stream: DM starting stream (no placeholder found)", "chat_id", id)
-		}
-	} else {
-		// Groups: delete placeholder — the stream creates its own message.
-		if pID, ok := c.placeholders.Load(chatID); ok {
-			c.placeholders.Delete(chatID)
-			_ = c.deleteMessage(ctx, id, pID.(int))
-		}
-		slog.Info("stream: group using message transport", "chat_id", id)
-	}
+	// No placeholder seeding — DraftStream creates its own message on first flush().
+	// This avoids "reply to deleted/non-existent message" artifacts.
 
-	c.streams.Store(chatID, ds)
-
-	return nil
+	return ds, nil
 }
 
-// OnChunkEvent updates the streaming message with accumulated content.
-func (c *Channel) OnChunkEvent(ctx context.Context, chatID string, fullText string) error {
-
-	val, ok := c.streams.Load(chatID)
-	if !ok {
-		return nil
-	}
-
-	ds := val.(*DraftStream)
-	ds.Update(ctx, fullText)
-	return nil
-}
-
-// OnStreamEnd finalizes the streaming preview.
-// Hands the stream's messageID back to the placeholders map so that Send()
+// FinalizeStream hands the stream's messageID back to the placeholders map so that Send()
 // can edit it with the properly formatted final response.
-func (c *Channel) OnStreamEnd(ctx context.Context, chatID string, _ string) error {
-	val, ok := c.streams.Load(chatID)
-	if !ok {
-		return nil
-	}
-
-	ds := val.(*DraftStream)
-
-	// Mark stream as stopped (no more edits)
-	ds.mu.Lock()
-	ds.stopped = true
-	msgID := ds.messageID
-	ds.mu.Unlock()
-
-	c.streams.Delete(chatID)
-
+// Also stops any thinking animation for the chat.
+// Implements channels.StreamingChannel.
+func (c *Channel) FinalizeStream(ctx context.Context, chatID string, stream channels.ChannelStream) {
+	msgID := stream.MessageID()
 	if msgID != 0 {
 		// Hand off the stream message to Send() for final formatted edit.
 		c.placeholders.Store(chatID, msgID)
 		slog.Info("stream: ended, handing off to Send()", "chat_id", chatID, "message_id", msgID)
+	} else if ds, ok := stream.(*DraftStream); ok && ds.sendMayHaveLanded && !ds.UsedDraftTransport() {
+		// The message transport was used but no ID was retrieved (timeout).
+		// We MUST store a -1 placeholder to signal to Send() that a message
+		// likely landed and it should NOT send a duplicate, even if it cannot edit.
+		c.placeholders.Store(chatID, -1)
+		slog.Warn("stream: initial send landed but ID unknown. Suppressing fallback message to avoid duplicate.", "chat_id", chatID)
+	}
+
+	// Capture draft ID for clearing after the final Send()
+	if ds, ok := stream.(*DraftStream); ok && ds.UsedDraftTransport() {
+		c.pendingDraftID.Store(chatID, ds.draftID)
 	}
 
 	// Stop thinking animation
@@ -366,6 +343,4 @@ func (c *Channel) OnStreamEnd(ctx context.Context, chatID string, _ string) erro
 		}
 		c.stopThinking.Delete(chatID)
 	}
-
-	return nil
 }

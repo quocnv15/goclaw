@@ -1,27 +1,19 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
+	"slices"
 	"strings"
 
+	"github.com/nextlevelbuilder/goclaw/internal/bootstrap"
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
-// sanitizePathSegment makes a userID safe for use as a directory name.
-// Replaces colons, spaces, and other unsafe chars with underscores.
-func sanitizePathSegment(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('_')
-		}
-	}
-	return b.String()
-}
 
 // scanWebToolResult checks web_fetch/web_search tool results for prompt injection patterns.
 // If detected, prepends a warning (doesn't block — may be false positive).
@@ -39,10 +31,113 @@ func (l *Loop) scanWebToolResult(toolName string, result *tools.Result) {
 	}
 }
 
-// InvalidateUserWorkspace clears the cached workspace for a user,
-// forcing the next request to re-read from user_agent_profiles.
+// shouldShareWorkspace checks if the given user should share the base workspace
+// directory (skip per-user subfolder isolation) based on workspace_sharing config.
+func (l *Loop) shouldShareWorkspace(userID, peerKind string) bool {
+	ws := l.workspaceSharing
+	if ws == nil {
+		return false
+	}
+	if slices.Contains(ws.SharedUsers, userID) {
+		return true
+	}
+	switch peerKind {
+	case "direct":
+		return ws.SharedDM
+	case "group":
+		return ws.SharedGroup
+	}
+	return false
+}
+
+// shouldShareMemory returns true if memory/KG should be shared across all users.
+// Independent of workspace folder sharing.
+func (l *Loop) shouldShareMemory() bool {
+	return l.workspaceSharing != nil && l.workspaceSharing.ShareMemory
+}
+
+// shouldShareKnowledgeGraph returns true if knowledge graph should be shared
+// across all users of the agent (agent-level, no per-user scoping).
+func (l *Loop) shouldShareKnowledgeGraph() bool {
+	return l.workspaceSharing != nil && l.workspaceSharing.ShareKnowledgeGraph
+}
+
+// getOrCreateUserSetup returns the cached userSetup for a user, creating it on first call.
+// On first call: seeds context files (non-team) and resolves workspace from user profile.
+// On subsequent calls: returns cached setup immediately (no DB calls).
+func (l *Loop) getOrCreateUserSetup(ctx context.Context, userID, channel string, isTeamSession bool) *userSetup {
+	if userID == "" {
+		return &userSetup{workspace: l.workspace}
+	}
+
+	// Fast path: already initialized
+	if val, ok := l.userSetups.Load(userID); ok {
+		return val.(*userSetup)
+	}
+
+	// Slow path: first request for this user in this Loop instance.
+	setup := &userSetup{}
+
+	if !isTeamSession {
+		if l.ensureUserProfile != nil && l.seedUserFiles != nil {
+			// Preferred path: separate callbacks for profile + seed.
+			// Step 1: Create/resolve profile → get isNew + workspace
+			ws, isNew, err := l.ensureUserProfile(ctx, l.agentUUID, userID, l.workspace, channel)
+			if err != nil {
+				slog.Warn("failed to ensure user profile", "error", err)
+			} else if ws != "" {
+				setup.workspace = expandWorkspace(ws)
+			}
+			// Step 2: Seed context files (must run before buildMessages reads them).
+			// Passes isNew so SeedUserFiles knows whether to skip existing files.
+			if err := l.seedUserFiles(ctx, l.agentUUID, userID, l.agentType, isNew); err != nil {
+				slog.Warn("failed to seed user context files", "error", err)
+				// Seeding failed (e.g. SQLITE_BUSY after retries). Inject
+				// embedded bootstrap templates in-memory so the first turn
+				// still gets onboarding. DB seed will retry next session.
+				setup.fallbackBootstrap = bootstrap.EmbeddedUserFiles(l.agentType)
+			} else if l.cacheInvalidate != nil {
+				// SeedUserFiles writes via raw agentStore, bypassing the
+				// ContextFileInterceptor cache. Invalidate so LoadContextFiles
+				// sees newly seeded BOOTSTRAP.md/USER.md on the first turn.
+				l.cacheInvalidate(l.agentUUID, userID)
+			}
+			setup.seeded = true
+		} else if l.ensureUserFiles != nil {
+			// Legacy fallback: combined callback handles both profile + seed
+			ws, err := l.ensureUserFiles(ctx, l.agentUUID, userID, l.agentType, l.workspace, channel)
+			if err != nil {
+				slog.Warn("failed to ensure user context files", "error", err)
+			} else if ws != "" {
+				setup.workspace = expandWorkspace(ws)
+			}
+			setup.seeded = true
+		}
+	}
+
+	// Fallback: use agent's default workspace if profile didn't provide one
+	if setup.workspace == "" && l.workspace != "" {
+		setup.workspace = expandWorkspace(l.workspace)
+	}
+
+	// Store atomically — if another goroutine raced, use their result
+	actual, _ := l.userSetups.LoadOrStore(userID, setup)
+	return actual.(*userSetup)
+}
+
+// expandWorkspace expands ~ and converts to absolute path.
+func expandWorkspace(ws string) string {
+	ws = config.ExpandHome(ws)
+	if !filepath.IsAbs(ws) {
+		ws, _ = filepath.Abs(ws)
+	}
+	return ws
+}
+
+// InvalidateUserWorkspace clears the cached setup for a user,
+// forcing the next request to re-resolve workspace and re-seed if needed.
 func (l *Loop) InvalidateUserWorkspace(userID string) {
-	l.userWorkspaces.Delete(userID)
+	l.userSetups.Delete(userID)
 }
 
 // Provider returns the LLM provider for this agent loop.
@@ -55,4 +150,31 @@ func (l *Loop) ProviderName() string {
 		return ""
 	}
 	return l.provider.Name()
+}
+
+// uniquifyToolCallIDs ensures all tool call IDs are globally unique across the
+// transcript by appending a short run-ID prefix and iteration index.
+// Returns a new slice (does not mutate the input).
+//
+// Some OpenAI-compatible APIs (OpenRouter, vLLM, DeepSeek) return duplicate IDs
+// within a single response or reuse IDs from earlier turns, causing HTTP 400.
+// Using the run UUID guarantees cross-turn uniqueness without history rewriting.
+func uniquifyToolCallIDs(calls []providers.ToolCall, runID string, iteration int) []providers.ToolCall {
+	if len(calls) == 0 {
+		return calls
+	}
+	short := runID
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	out := make([]providers.ToolCall, len(calls))
+	copy(out, calls)
+	for i := range out {
+		if out[i].ID == "" {
+			out[i].ID = fmt.Sprintf("call_%s_%d_%d", short, iteration, i)
+		} else {
+			out[i].ID = fmt.Sprintf("%s_%s_%d_%d", out[i].ID, short, iteration, i)
+		}
+	}
+	return out
 }

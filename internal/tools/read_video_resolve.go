@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
@@ -38,9 +37,17 @@ func (t *ReadVideoTool) resolveVideoFile(ctx context.Context, mediaID string) (p
 		ref = &refs[len(refs)-1]
 	}
 
-	p, err := t.mediaLoader.LoadPath(ref.ID)
-	if err != nil {
-		return "", "", fmt.Errorf("video file not found: %v", err)
+	// Prefer persisted workspace path; fall back to legacy .media/ lookup.
+	p := ref.Path
+	if p == "" {
+		var err error
+		if t.mediaLoader == nil {
+			return "", "", fmt.Errorf("no media storage configured")
+		}
+		p, err = t.mediaLoader.LoadPath(ref.ID)
+		if err != nil {
+			return "", "", fmt.Errorf("video file not found: %v", err)
+		}
 	}
 
 	mime = ref.MimeType
@@ -59,8 +66,9 @@ func (t *ReadVideoTool) callProvider(ctx context.Context, cp credentialProvider,
 	data, _ := params["data"].([]byte)
 	mime := GetParamString(params, "mime", "video/mp4")
 
-	// Gemini: use File API.
-	if strings.HasPrefix(providerName, "gemini") {
+	// Gemini: use File API (requires credentials).
+	ptype := GetParamString(params, "_provider_type", providerTypeFromName(providerName))
+	if cp != nil && ptype == "gemini" {
 		slog.Info("read_video: using gemini file API", "provider", providerName, "model", model, "size", len(data), "mime", mime)
 		resp, err := geminiFileAPICall(ctx, cp.APIKey(), model, prompt, data, mime, 180*time.Second)
 		if err != nil {
@@ -70,7 +78,7 @@ func (t *ReadVideoTool) callProvider(ctx context.Context, cp credentialProvider,
 	}
 
 	// Other providers: try standard Chat API with base64 as image_url (best effort).
-	p, err := t.registry.Get(providerName)
+	p, err := t.registry.Get(ctx, providerName)
 	if err != nil {
 		return nil, nil, fmt.Errorf("provider %q not available: %w", providerName, err)
 	}

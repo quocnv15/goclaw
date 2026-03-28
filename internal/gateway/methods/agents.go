@@ -4,12 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"slices"
 
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
+	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
+	"github.com/nextlevelbuilder/goclaw/internal/permissions"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
@@ -24,18 +25,16 @@ type AgentsMethods struct {
 	workspace   string
 	agentStore  store.AgentStore
 	interceptor *tools.ContextFileInterceptor // invalidated on file writes
+	eventBus    bus.EventPublisher
 }
 
-func NewAgentsMethods(agents *agent.Router, cfg *config.Config, cfgPath, workspace string, agentStore store.AgentStore, interceptor *tools.ContextFileInterceptor) *AgentsMethods {
-	return &AgentsMethods{agents: agents, cfg: cfg, cfgPath: cfgPath, workspace: workspace, agentStore: agentStore, interceptor: interceptor}
+func NewAgentsMethods(agents *agent.Router, cfg *config.Config, cfgPath, workspace string, agentStore store.AgentStore, interceptor *tools.ContextFileInterceptor, eventBus bus.EventPublisher) *AgentsMethods {
+	return &AgentsMethods{agents: agents, cfg: cfg, cfgPath: cfgPath, workspace: workspace, agentStore: agentStore, interceptor: interceptor, eventBus: eventBus}
 }
 
 // isOwnerUser checks if the given user ID is in the configured owner IDs.
 func (m *AgentsMethods) isOwnerUser(userID string) bool {
-	if userID == "" {
-		return false
-	}
-	return slices.Contains(m.cfg.Gateway.OwnerIDs, userID)
+	return canSeeAll(permissions.RoleViewer, m.cfg.Gateway.OwnerIDs, userID)
 }
 
 func (m *AgentsMethods) Register(router *gateway.MethodRouter) {
@@ -55,7 +54,7 @@ type agentParams struct {
 	AgentID string `json:"agentId"`
 }
 
-func (m *AgentsMethods) handleAgent(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *AgentsMethods) handleAgent(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
 	var params agentParams
 	if req.Params != nil {
 		json.Unmarshal(req.Params, &params)
@@ -64,7 +63,7 @@ func (m *AgentsMethods) handleAgent(_ context.Context, client *gateway.Client, r
 		params.AgentID = "default"
 	}
 
-	loop, err := m.agents.Get(params.AgentID)
+	loop, err := m.agents.Get(ctx, params.AgentID)
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, err.Error()))
 		return
@@ -76,7 +75,7 @@ func (m *AgentsMethods) handleAgent(_ context.Context, client *gateway.Client, r
 	}))
 }
 
-func (m *AgentsMethods) handleAgentWait(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *AgentsMethods) handleAgentWait(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
 	var params agentParams
 	if req.Params != nil {
 		json.Unmarshal(req.Params, &params)
@@ -85,7 +84,7 @@ func (m *AgentsMethods) handleAgentWait(_ context.Context, client *gateway.Clien
 		params.AgentID = "default"
 	}
 
-	loop, err := m.agents.Get(params.AgentID)
+	loop, err := m.agents.Get(ctx, params.AgentID)
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, err.Error()))
 		return

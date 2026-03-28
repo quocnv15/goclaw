@@ -15,6 +15,9 @@ export interface HealthPayload {
   tools?: number;
   clients?: ClientInfo[];
   currentId?: string;
+  latestVersion?: string;
+  updateAvailable?: boolean;
+  updateUrl?: string;
 }
 
 export interface AgentInfo {
@@ -56,6 +59,7 @@ export interface QuotaUsageResult {
   requestsToday: number;
   inputTokensToday: number;
   outputTokensToday: number;
+  costToday: number;
   uniqueUsersToday: number;
   entries: QuotaUsageEntry[];
 }

@@ -11,10 +11,11 @@ const (
 	MethodAgentIdentityGet = "agent.identity.get"
 
 	// Chat
-	MethodChatSend    = "chat.send"
-	MethodChatHistory = "chat.history"
-	MethodChatAbort   = "chat.abort"
-	MethodChatInject  = "chat.inject"
+	MethodChatSend          = "chat.send"
+	MethodChatHistory       = "chat.history"
+	MethodChatAbort         = "chat.abort"
+	MethodChatInject        = "chat.inject"
+	MethodChatSessionStatus = "chat.session.status"
 
 	// Agents management
 	MethodAgentsList     = "agents.list"
@@ -83,6 +84,25 @@ const (
 	MethodSend = "send"
 )
 
+// Agent heartbeat
+const (
+	MethodHeartbeatGet          = "heartbeat.get"
+	MethodHeartbeatSet          = "heartbeat.set"
+	MethodHeartbeatToggle       = "heartbeat.toggle"
+	MethodHeartbeatTest         = "heartbeat.test"
+	MethodHeartbeatLogs         = "heartbeat.logs"
+	MethodHeartbeatChecklistGet = "heartbeat.checklist.get"
+	MethodHeartbeatChecklistSet = "heartbeat.checklist.set"
+	MethodHeartbeatTargets      = "heartbeat.targets"
+)
+
+// Config permissions
+const (
+	MethodConfigPermissionsList   = "config.permissions.list"
+	MethodConfigPermissionsGrant  = "config.permissions.grant"
+	MethodConfigPermissionsRevoke = "config.permissions.revoke"
+)
+
 // Channel instances management
 const (
 	MethodChannelInstancesList   = "channels.instances.list"
@@ -107,16 +127,42 @@ const (
 	MethodTeamsGet      = "teams.get"
 	MethodTeamsDelete   = "teams.delete"
 	MethodTeamsTaskList      = "teams.tasks.list"
+	MethodTeamsTaskGet       = "teams.tasks.get"
+	MethodTeamsTaskGetLight  = "teams.tasks.get-light"
+	MethodTeamsTaskApprove   = "teams.tasks.approve"
+	MethodTeamsTaskReject    = "teams.tasks.reject"
+	MethodTeamsTaskComment   = "teams.tasks.comment"
+	MethodTeamsTaskComments  = "teams.tasks.comments"
+	MethodTeamsTaskEvents    = "teams.tasks.events"
+	MethodTeamsTaskCreate    = "teams.tasks.create"
+	MethodTeamsTaskDelete     = "teams.tasks.delete"
+	MethodTeamsTaskDeleteBulk = "teams.tasks.delete-bulk"
+	MethodTeamsTaskAssign            = "teams.tasks.assign"
+	MethodTeamsTaskActiveBySession   = "teams.tasks.active-by-session"
 	MethodTeamsMembersAdd    = "teams.members.add"
 	MethodTeamsMembersRemove = "teams.members.remove"
 	MethodTeamsUpdate        = "teams.update"
 	MethodTeamsKnownUsers    = "teams.known_users"
+	MethodTeamsScopes        = "teams.scopes"
 )
 
-// Delegation history
+// Team workspace
 const (
-	MethodDelegationsList = "delegations.list"
-	MethodDelegationsGet  = "delegations.get"
+	MethodTeamsWorkspaceList   = "teams.workspace.list"
+	MethodTeamsWorkspaceRead   = "teams.workspace.read"
+	MethodTeamsWorkspaceDelete = "teams.workspace.delete"
+)
+
+// Team events
+const (
+	MethodTeamsEventsList = "teams.events.list"
+)
+
+// API key management
+const (
+	MethodAPIKeysList   = "api_keys.list"
+	MethodAPIKeysCreate = "api_keys.create"
+	MethodAPIKeysRevoke = "api_keys.revoke"
 )
 
 // Phase 3+ - NICE TO HAVE methods

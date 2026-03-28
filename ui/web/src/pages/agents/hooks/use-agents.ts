@@ -5,6 +5,8 @@ import { useAuthStore } from "@/stores/use-auth-store";
 import { Methods } from "@/api/protocol";
 import { queryKeys } from "@/lib/query-keys";
 import { toast } from "@/stores/use-toast-store";
+import i18n from "@/i18n";
+import { userFriendlyError } from "@/lib/error-utils";
 import type { AgentData } from "@/types/agent";
 
 interface AgentInfoWs {
@@ -65,10 +67,24 @@ export function useAgents() {
       try {
         const res = await http.post<AgentData>("/v1/agents", data);
         await invalidate();
-        toast.success("Agent created", `${data.display_name || data.agent_key || "Agent"} has been added`);
+        toast.success(i18n.t("agents:toast.created"), `${data.display_name || data.agent_key || "Agent"} has been added`);
         return res;
       } catch (err) {
-        toast.error("Failed to create agent", err instanceof Error ? err.message : "Unknown error");
+        toast.error(i18n.t("agents:toast.createFailed"), userFriendlyError(err));
+        throw err;
+      }
+    },
+    [http, invalidate],
+  );
+
+  const updateAgent = useCallback(
+    async (id: string, data: Partial<AgentData>) => {
+      try {
+        await http.put(`/v1/agents/${id}`, data);
+        await invalidate();
+        toast.success(i18n.t("agents:toast.updated"), `${data.display_name || data.agent_key || "Agent"} has been updated`);
+      } catch (err) {
+        toast.error(i18n.t("agents:toast.updateFailed"), userFriendlyError(err));
         throw err;
       }
     },
@@ -80,9 +96,9 @@ export function useAgents() {
       try {
         await http.delete(`/v1/agents/${id}`);
         await invalidate();
-        toast.success("Agent deleted");
+        toast.success(i18n.t("agents:toast.deleted"));
       } catch (err) {
-        toast.error("Failed to delete agent", err instanceof Error ? err.message : "Unknown error");
+        toast.error(i18n.t("agents:toast.deleteFailed"), userFriendlyError(err));
         throw err;
       }
     },
@@ -96,5 +112,5 @@ export function useAgents() {
     [http],
   );
 
-  return { agents, loading, error, refresh: invalidate, createAgent, deleteAgent, resummonAgent };
+  return { agents, loading, error, refresh: invalidate, createAgent, updateAgent, deleteAgent, resummonAgent };
 }

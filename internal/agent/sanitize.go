@@ -20,6 +20,8 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // SanitizeAssistantContent applies the full sanitization pipeline to assistant
@@ -280,6 +282,9 @@ func collapseConsecutiveDuplicateBlocks(content string) string {
 
 // --- 7. Strip MEDIA: paths ---
 
+// mediaPathPattern matches "MEDIA:" followed by a path (absolute or relative).
+var mediaPathPattern = regexp.MustCompile(`MEDIA:\S+`)
+
 // stripMediaPaths removes lines containing MEDIA:/path references from LLM output.
 // These are tool result artifacts that should not appear in user-facing text
 // (media files are delivered separately via OutboundMessage.Media).
@@ -295,9 +300,9 @@ func stripMediaPaths(content string) string {
 			continue
 		}
 		// Strip any line containing a MEDIA: path reference, regardless of wrapping format.
-		// LLMs echo these in many forms: bare "MEDIA:/path", markdown "![alt](MEDIA:/path)",
-		// JSON '{"image":"MEDIA:/path"}', etc. The /tmp/ or / after MEDIA: confirms it's a path.
-		if strings.Contains(trimmed, "MEDIA:/") {
+		// LLMs echo these in many forms: bare "MEDIA:/path", markdown "![alt](MEDIA:relative/path)",
+		// JSON '{"image":"MEDIA:/path"}', etc. Match MEDIA: followed by any non-space path char.
+		if mediaPathPattern.MatchString(trimmed) {
 			continue
 		}
 		result = append(result, line)
@@ -322,22 +327,37 @@ var configLeakFileNames = []string{
 	"internal_config", "system prompt",
 }
 
+// Patterns to strip markdown code from content before config leak detection.
+// Mentions inside code blocks/inline code are typically architecture docs, not leaks.
+var fencedCodeBlockPattern = regexp.MustCompile("(?s)```[^`]*```")
+var inlineCodePattern = regexp.MustCompile("`[^`\n]+`")
+
+// stripMarkdownCode removes fenced code blocks and inline code from text.
+func stripMarkdownCode(s string) string {
+	s = fencedCodeBlockPattern.ReplaceAllString(s, "")
+	s = inlineCodePattern.ReplaceAllString(s, "")
+	return s
+}
+
 // StripConfigLeak detects when a predefined agent dumps its internal configuration
 // (e.g. referencing SOUL.md, AGENTS.md, IDENTITY.md) and replaces the entire
 // response with a friendly decline.
 //
 // Only active for predefined agents. Single-gate detection:
-// 3+ distinct internal file names mentioned → replace entire response.
-// A predefined agent legitimately referencing 3+ internal config files in one
-// response is essentially impossible, so this has no false-positive risk.
+// 3+ distinct internal file names mentioned in plain text → replace entire response.
+// Mentions inside markdown code blocks and inline code are excluded from counting,
+// as they typically appear in architecture explanations rather than actual leaks.
 func StripConfigLeak(content, agentType string) string {
-	if agentType != "predefined" || content == "" {
+	if agentType != store.AgentTypePredefined || content == "" {
 		return content
 	}
 
+	// Count hits only in plain text (outside code blocks/inline code)
+	plain := stripMarkdownCode(content)
+
 	hits := 0
 	for _, name := range configLeakFileNames {
-		if strings.Contains(content, name) {
+		if strings.Contains(plain, name) {
 			hits++
 		}
 	}
@@ -386,4 +406,26 @@ func IsSilentReply(text string) bool {
 
 func isWordChar(r rune) bool {
 	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_'
+}
+
+// --- Message Directives ([[name:value]]) ---
+
+// messageDirectivePattern matches structured routing tags: [[word]] or [[word:value]].
+// Single-line only (no (?s) dotall). Does NOT match arbitrary [[...]] content.
+var messageDirectivePattern = regexp.MustCompile(`\[\[\w+(?::[^\]\n]+)?\]\]`)
+
+// StripMessageDirectives removes internal [[...]] routing tags from user-facing text,
+// preserving [[tts...]] tags needed by the TTS auto-apply pipeline.
+func StripMessageDirectives(content string) string {
+	if !strings.Contains(content, "[[") {
+		return content
+	}
+	result := messageDirectivePattern.ReplaceAllStringFunc(content, func(match string) string {
+		inner := match[2 : len(match)-2] // strip [[ and ]]
+		if strings.HasPrefix(inner, "tts") {
+			return match // preserve for TTS AutoTagged mode
+		}
+		return ""
+	})
+	return strings.TrimSpace(result)
 }

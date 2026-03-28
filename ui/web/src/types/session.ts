@@ -14,6 +14,9 @@ export interface SessionInfo {
   userID?: string;
   metadata?: Record<string, string>;
   agentName?: string;
+  estimatedTokens?: number;
+  contextWindow?: number;
+  compactionCount?: number;
 }
 
 export interface SessionPreview {
@@ -29,6 +32,9 @@ export interface Message {
   thinking?: string;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
+  is_error?: boolean;
+  media_refs?: { id: string; mime_type: string; kind: string; path?: string }[];
+  created_at?: string; // ISO 8601 timestamp from server; absent for older messages
 }
 
 export interface ToolCall {

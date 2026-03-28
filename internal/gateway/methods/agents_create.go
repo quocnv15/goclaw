@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/google/uuid"
+
 	"github.com/nextlevelbuilder/goclaw/internal/bootstrap"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
@@ -22,12 +24,18 @@ import (
 func (m *AgentsMethods) handleCreate(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
 	locale := store.LocaleFromContext(ctx)
 	var params struct {
-		Name      string   `json:"name"`
-		Workspace string   `json:"workspace"`
-		Emoji     string   `json:"emoji"`
-		Avatar    string   `json:"avatar"`
-		AgentType string   `json:"agent_type"`          // "open" (default) or "predefined"
-		OwnerIDs  []string `json:"owner_ids,omitempty"` // first entry used as DB owner_id; falls back to "system"
+		Name              string   `json:"name"`
+		Workspace         string   `json:"workspace"`
+		Emoji             string   `json:"emoji"`
+		Avatar            string   `json:"avatar"`
+		Provider          string   `json:"provider"`
+		Model             string   `json:"model"`
+		AgentType         string   `json:"agent_type"`          // "open" (default) or "predefined"
+		OwnerIDs          []string `json:"owner_ids,omitempty"` // first entry used as DB owner_id; falls back to "system"
+		TenantID          string   `json:"tenant_id"`           // required for cross-tenant callers; ignored otherwise
+		ContextWindow     int      `json:"context_window"`
+		MaxToolIterations int      `json:"max_tool_iterations"`
+		BudgetCents       *int     `json:"budget_monthly_cents"`
 		// Per-agent config overrides
 		ToolsConfig      json.RawMessage `json:"tools_config,omitempty"`
 		SubagentsConfig  json.RawMessage `json:"subagents_config,omitempty"`
@@ -66,8 +74,7 @@ func (m *AgentsMethods) handleCreate(ctx context.Context, client *gateway.Client
 	}
 
 	if m.agentStore != nil {
-		// --- Managed mode: create agent in DB ---
-		ctx := context.Background()
+		// --- DB-backed: create agent in store ---
 
 		// Check if agent already exists in DB
 		if existing, _ := m.agentStore.GetByKey(ctx, agentID); existing != nil {
@@ -82,14 +89,44 @@ func (m *AgentsMethods) handleCreate(ctx context.Context, client *gateway.Client
 			ownerID = params.OwnerIDs[0]
 		}
 
+		// Resolve tenant_id: explicit param for cross-tenant; otherwise inherit from connection scope.
+		var tenantID uuid.UUID
+		if client.IsOwner() {
+			if params.TenantID != "" {
+				tid, err := uuid.Parse(params.TenantID)
+				if err != nil {
+					client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidID, "tenant_id")))
+					return
+				}
+				tenantID = tid
+			} else {
+				tenantID = client.TenantID()
+			}
+		} else {
+			tenantID = client.TenantID()
+		}
+
+		provider := params.Provider
+		if provider == "" {
+			provider = m.cfg.Agents.Defaults.Provider
+		}
+		model := params.Model
+		if model == "" {
+			model = m.cfg.Agents.Defaults.Model
+		}
+
 		agentData := &store.AgentData{
 			AgentKey:         agentID,
 			DisplayName:      params.Name,
 			OwnerID:          ownerID,
+			TenantID:         tenantID,
 			AgentType:        agentType,
-			Provider:         m.cfg.Agents.Defaults.Provider,
-			Model:            m.cfg.Agents.Defaults.Model,
+			Provider:         provider,
+			Model:            model,
 			Workspace:        ws,
+			ContextWindow:     params.ContextWindow,
+			MaxToolIterations: params.MaxToolIterations,
+			BudgetMonthlyCents: params.BudgetCents,
 			Status:           store.AgentStatusActive,
 			ToolsConfig:      params.ToolsConfig,
 			SubagentsConfig:  params.SubagentsConfig,
@@ -163,4 +200,5 @@ func (m *AgentsMethods) handleCreate(ctx context.Context, client *gateway.Client
 		"name":      params.Name,
 		"workspace": ws,
 	}))
+	emitAudit(m.eventBus, client, "agent.created", "agent", agentID)
 }

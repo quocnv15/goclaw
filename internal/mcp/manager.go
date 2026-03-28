@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -72,10 +73,11 @@ type Manager struct {
 	// DB-backed servers
 	store store.MCPServerStore
 
-	// Shared connection pool (nil = standalone mode)
+	// Shared connection pool (nil = config-only mode)
 	pool          *Pool
 	poolServers   map[string]struct{}  // server names acquired from pool (for cleanup)
 	poolToolNames map[string][]string  // per-agent tool names for pool-backed servers
+	poolKeys      map[string]string   // server name → pool compound key (tenantID/name) for Release
 
 	// Search mode: deferred tools not registered in registry
 	deferredTools  map[string]*BridgeTool // registeredName → BridgeTool
@@ -146,6 +148,120 @@ func (m *Manager) Start(ctx context.Context) error {
 	return nil
 }
 
+// resolvedServer holds a server config with merged credentials ready for connection.
+type resolvedServer struct {
+	info         store.MCPAccessInfo
+	args         []string
+	env          map[string]string
+	headers      map[string]string
+	hasUserCreds bool
+}
+
+// resolveServerCredentials merges server defaults with per-user credentials.
+// Returns nil if the server should be skipped (disabled or missing required creds).
+func (m *Manager) resolveServerCredentials(ctx context.Context, info store.MCPAccessInfo, userID string) *resolvedServer {
+	srv := info.Server
+	if !srv.Enabled {
+		return nil
+	}
+
+	// Skip server if it requires per-user credentials and user has none
+	if requireUserCreds(srv.Settings) {
+		if userID == "" {
+			return nil
+		}
+		uc, _ := m.store.GetUserCredentials(ctx, srv.ID, userID)
+		if uc == nil || (uc.APIKey == "" && len(uc.Headers) == 0 && len(uc.Env) == 0) {
+			slog.Debug("mcp.skip_no_user_credentials", "server", srv.Name, "user", userID)
+			return nil
+		}
+	}
+
+	args := jsonBytesToStringSlice(srv.Args)
+	env := jsonBytesToStringMap(srv.Env)
+	headers := jsonBytesToStringMap(srv.Headers)
+
+	// Inject APIKey into headers if present (bug fix: was never passed to connections)
+	if srv.APIKey != "" && headers["Authorization"] == "" {
+		if headers == nil {
+			headers = make(map[string]string)
+		}
+		headers["Authorization"] = "Bearer " + srv.APIKey
+	}
+
+	// Merge per-user credentials (user overrides server defaults)
+	if userID != "" && m.store != nil {
+		if userCreds, err := m.store.GetUserCredentials(ctx, srv.ID, userID); err == nil && userCreds != nil {
+			if userCreds.APIKey != "" {
+				if headers == nil {
+					headers = make(map[string]string)
+				}
+				headers["Authorization"] = "Bearer " + userCreds.APIKey
+			}
+			for k, v := range userCreds.Headers {
+				if headers == nil {
+					headers = make(map[string]string)
+				}
+				headers[k] = v
+			}
+			for k, v := range userCreds.Env {
+				if env == nil {
+					env = make(map[string]string)
+				}
+				env[k] = v
+			}
+		}
+	}
+
+	// Per-user credentials change connection params → can't share pool connection.
+	// Fall back to per-agent mode when user has custom credentials.
+	hasUserCreds := userID != "" && m.store != nil
+	if hasUserCreds {
+		if uc, _ := m.store.GetUserCredentials(ctx, srv.ID, userID); uc != nil && (uc.APIKey != "" || len(uc.Headers) > 0 || len(uc.Env) > 0) {
+			hasUserCreds = true
+		} else {
+			hasUserCreds = false
+		}
+	}
+
+	return &resolvedServer{
+		info:         info,
+		args:         args,
+		env:          env,
+		headers:      headers,
+		hasUserCreds: hasUserCreds,
+	}
+}
+
+// connectAndFilter establishes the MCP connection (pool or per-agent mode)
+// and applies tool allow/deny filtering from server grants.
+func (m *Manager) connectAndFilter(ctx context.Context, rs *resolvedServer) error {
+	srv := rs.info.Server
+
+	if m.pool != nil && !rs.hasUserCreds {
+		// Pool mode: acquire shared connection, create per-agent BridgeTools
+		tid := store.TenantIDFromContext(ctx)
+		if err := m.connectViaPool(ctx, tid, srv.Name, srv.Transport, srv.Command,
+			rs.args, rs.env, srv.URL, rs.headers, srv.ToolPrefix, srv.TimeoutSec); err != nil {
+			return err
+		}
+	} else {
+		// Per-agent mode: create per-agent connection
+		if err := m.connectServer(ctx, srv.Name, srv.Transport, srv.Command,
+			rs.args, rs.env, srv.URL, rs.headers,
+			srv.ToolPrefix, srv.TimeoutSec); err != nil {
+			return err
+		}
+	}
+
+	// Apply tool filtering from grants
+	if len(rs.info.ToolAllow) > 0 || len(rs.info.ToolDeny) > 0 {
+		m.filterTools(srv.Name, rs.info.ToolAllow, rs.info.ToolDeny)
+	}
+
+	return nil
+}
+
 // LoadForAgent connects MCP servers accessible by a specific agent+user.
 // Previously registered MCP tools for this manager are cleared and reloaded.
 func (m *Manager) LoadForAgent(ctx context.Context, agentID uuid.UUID, userID string) error {
@@ -162,35 +278,12 @@ func (m *Manager) LoadForAgent(ctx context.Context, agentID uuid.UUID, userID st
 	m.unregisterAllTools()
 
 	for _, info := range accessible {
-		srv := info.Server
-		if !srv.Enabled {
+		rs := m.resolveServerCredentials(ctx, info, userID)
+		if rs == nil {
 			continue
 		}
-
-		args := jsonBytesToStringSlice(srv.Args)
-		env := jsonBytesToStringMap(srv.Env)
-		headers := jsonBytesToStringMap(srv.Headers)
-
-		if m.pool != nil {
-			// Pool mode: acquire shared connection, create per-agent BridgeTools
-			if err := m.connectViaPool(ctx, srv.Name, srv.Transport, srv.Command,
-				args, env, srv.URL, headers, srv.ToolPrefix, srv.TimeoutSec); err != nil {
-				slog.Warn("mcp.server.connect_failed", "server", srv.Name, "error", err)
-				continue
-			}
-		} else {
-			// Standalone mode: create per-agent connection
-			if err := m.connectServer(ctx, srv.Name, srv.Transport, srv.Command,
-				args, env, srv.URL, headers,
-				srv.ToolPrefix, srv.TimeoutSec); err != nil {
-				slog.Warn("mcp.server.connect_failed", "server", srv.Name, "error", err)
-				continue
-			}
-		}
-
-		// Apply tool filtering from grants
-		if len(info.ToolAllow) > 0 || len(info.ToolDeny) > 0 {
-			m.filterTools(srv.Name, info.ToolAllow, info.ToolDeny)
+		if err := m.connectAndFilter(ctx, rs); err != nil {
+			slog.Warn("mcp.server.connect_failed", "server", info.Server.Name, "error", err)
 		}
 	}
 
@@ -315,6 +408,38 @@ func (m *Manager) ActivateTools(names []string) {
 	slog.Info("mcp.tools.activated", "tools", activated)
 }
 
+// ActivateToolIfDeferred activates a single named tool if it is currently deferred.
+// Returns true if the tool is now in the registry.
+// Used by the Registry's deferredActivator callback for lazy tool activation.
+func (m *Manager) ActivateToolIfDeferred(name string) bool {
+	m.mu.Lock()
+	_, isDeferred := m.deferredTools[name]
+	_, isActivated := m.activatedTools[name]
+	if isActivated {
+		m.mu.Unlock()
+		return true // already activated by a concurrent call
+	}
+	if !isDeferred {
+		m.mu.Unlock()
+		return false
+	}
+	// Mark as activated under lock to prevent concurrent ActivateTools races.
+	m.activatedTools[name] = struct{}{}
+	bt := m.deferredTools[name]
+	delete(m.deferredTools, name)
+	activeNames := make([]string, 0, len(m.activatedTools))
+	for n := range m.activatedTools {
+		activeNames = append(activeNames, n)
+	}
+	m.mu.Unlock()
+
+	// Register in registry outside lock (registry has its own sync).
+	m.registry.Register(bt)
+	tools.RegisterToolGroup("mcp", activeNames)
+	slog.Info("mcp.tools.activated", "tools", []string{name})
+	return true
+}
+
 // Stop shuts down all MCP server connections and unregisters tools.
 func (m *Manager) Stop() {
 	m.mu.Lock()
@@ -327,7 +452,9 @@ func (m *Manager) Stop() {
 				m.registry.Unregister(toolName)
 			}
 			if m.pool != nil {
-				m.pool.Release(name)
+				if pkey, ok := m.poolKeys[name]; ok {
+					m.pool.Release(pkey)
+				}
 			}
 		} else {
 			// Standalone: close connection directly
@@ -365,4 +492,16 @@ func (m *Manager) ServerStatus() []ServerStatus {
 		})
 	}
 	return statuses
+}
+
+// requireUserCreds checks if an MCP server's settings mandate per-user credentials.
+func requireUserCreds(settings json.RawMessage) bool {
+	if len(settings) == 0 {
+		return false
+	}
+	var s struct {
+		RequireUserCredentials bool `json:"require_user_credentials"`
+	}
+	_ = json.Unmarshal(settings, &s)
+	return s.RequireUserCredentials
 }

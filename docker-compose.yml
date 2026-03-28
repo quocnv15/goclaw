@@ -1,19 +1,29 @@
 # Base docker-compose — shared service definition.
+# Pre-built images: ghcr.io/nextlevelbuilder/goclaw (also on Docker Hub: digitop/goclaw)
+#
 # Combine with overlays for your deployment:
 #
-#   Recommended (+ Web Dashboard):
+#   Recommended (+ Web Dashboard, pre-built images):
+#     docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.selfservice.yml up -d
+#
+#   Build from source (add --build):
 #     docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.selfservice.yml up -d --build
 #
-#   Without dashboard:  docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --build
+#   Without dashboard:  docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d
 #   With OTel tracing:  docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.otel.yml up -d --build
+#   With Claude CLI:    add -f docker-compose.claude-cli.yml to auto-sync host ~/.claude credentials
 
 services:
   goclaw:
+    image: ghcr.io/nextlevelbuilder/goclaw:latest
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        ENABLE_OTEL: "false"
+        ENABLE_OTEL: "${ENABLE_OTEL:-false}"
+        ENABLE_PYTHON: "${ENABLE_PYTHON:-true}"
+        ENABLE_FULL_SKILLS: "${ENABLE_FULL_SKILLS:-false}"
+        VERSION: "${GOCLAW_VERSION:-dev}"
     ports:
       - "${GOCLAW_PORT:-18790}:18790"
     env_file:
@@ -25,16 +35,23 @@ services:
       - GOCLAW_CONFIG=/app/data/config.json
       - GOCLAW_GATEWAY_TOKEN=${GOCLAW_GATEWAY_TOKEN:-}
       - GOCLAW_ENCRYPTION_KEY=${GOCLAW_ENCRYPTION_KEY:-}
+      - GOCLAW_SKILLS_DIR=/app/data/skills
       # Debug
       - GOCLAW_TRACE_VERBOSE=${GOCLAW_TRACE_VERBOSE:-0}
     volumes:
       - goclaw-data:/app/data
       - goclaw-workspace:/app/workspace
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     security_opt:
       - no-new-privileges:true
+    init: true
     cap_drop:
       - ALL
-    read_only: true
+    cap_add:
+      - SETUID
+      - SETGID
+      - CHOWN
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=256m
     deploy:
@@ -45,7 +62,7 @@ services:
           pids: 200
     networks:
       - default
-      - shared
+      - goclaw-net
     restart: unless-stopped
 
 volumes:
@@ -53,5 +70,6 @@ volumes:
   goclaw-workspace:
 
 networks:
-  shared:
-    external: true
+  goclaw-net:
+    name: goclaw-net
+    driver: bridge

@@ -1,5 +1,4 @@
 import {
-  ArrowRightLeft,
   ListTodo,
   MessageCircle,
   Bot,
@@ -14,13 +13,6 @@ export interface EventCategoryConfig {
   borderColor: string;
   iconColor: string;
 }
-
-const delegation: EventCategoryConfig = {
-  label: "Delegation",
-  icon: ArrowRightLeft,
-  borderColor: "border-l-blue-500",
-  iconColor: "text-blue-500",
-};
 
 const teamTask: EventCategoryConfig = {
   label: "Task",
@@ -39,8 +31,8 @@ const teamMessage: EventCategoryConfig = {
 const agent: EventCategoryConfig = {
   label: "Agent",
   icon: Bot,
-  borderColor: "border-l-purple-500",
-  iconColor: "text-purple-500",
+  borderColor: "border-l-orange-500",
+  iconColor: "text-orange-500",
 };
 
 const teamCrud: EventCategoryConfig = {
@@ -58,7 +50,6 @@ const agentLink: EventCategoryConfig = {
 };
 
 export function getCategoryConfig(event: string): EventCategoryConfig {
-  if (event.startsWith("delegation.")) return delegation;
   if (event.startsWith("team.task.")) return teamTask;
   if (event === "team.message.sent") return teamMessage;
   if (event === "agent") return agent;

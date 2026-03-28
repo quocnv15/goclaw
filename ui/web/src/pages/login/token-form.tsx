@@ -8,7 +8,7 @@ interface TokenFormProps {
 
 export function TokenForm({ onSubmit }: TokenFormProps) {
   const { t } = useTranslation("login");
-  const [userId, setUserId] = useState("");
+  const [userId, setUserId] = useState("system");
   const [token, setToken] = useState("");
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -59,10 +59,13 @@ export function TokenForm({ onSubmit }: TokenFormProps) {
           value={userId}
           onChange={(e) => { setUserId(e.target.value); setError(null); }}
           placeholder={t("token.userIdPlaceholder")}
-          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-base md:text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           autoFocus
           disabled={connecting}
         />
+        <p className="text-xs text-muted-foreground">
+          {t("token.userIdHint")}
+        </p>
       </div>
 
       <div className="space-y-2">
@@ -75,7 +78,7 @@ export function TokenForm({ onSubmit }: TokenFormProps) {
           value={token}
           onChange={(e) => { setToken(e.target.value); setError(null); }}
           placeholder={t("token.tokenPlaceholder")}
-          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-base md:text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           disabled={connecting}
         />
       </div>

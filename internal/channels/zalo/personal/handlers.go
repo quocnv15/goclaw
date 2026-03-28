@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
+	"github.com/nextlevelbuilder/goclaw/internal/channels/media"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/typing"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/zalo/personal/protocol"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
@@ -31,6 +33,8 @@ func (c *Channel) handleMessage(msg protocol.Message) {
 }
 
 func (c *Channel) handleDM(msg protocol.UserMessage) {
+	ctx := context.Background()
+	ctx = store.WithTenantID(ctx, c.TenantID())
 	senderID := msg.Data.UIDFrom
 	threadID := msg.ThreadID()
 
@@ -39,17 +43,29 @@ func (c *Channel) handleDM(msg protocol.UserMessage) {
 		return
 	}
 
-	if !c.checkDMPolicy(senderID, threadID) {
+	if !c.checkDMPolicy(ctx, senderID, threadID) {
 		return
+	}
+
+	// Annotate with sender display name so the agent knows who is messaging.
+	senderName := msg.Data.DName
+	if senderName != "" {
+		content = fmt.Sprintf("[From: %s]\n%s", senderName, content)
 	}
 
 	slog.Debug("zalo_personal DM received",
 		"sender", senderID,
+		"dname", senderName,
 		"thread", threadID,
 		"preview", channels.Truncate(content, 50),
 	)
 
 	c.startTyping(threadID, protocol.ThreadTypeUser)
+
+	// Collect contact for DM messages.
+	if cc := c.ContactCollector(); cc != nil {
+		cc.EnsureContact(ctx, c.Type(), c.Name(), senderID, senderID, senderName, "", "direct")
+	}
 
 	metadata := map[string]string{
 		"message_id": msg.Data.MsgID,
@@ -59,6 +75,8 @@ func (c *Channel) handleDM(msg protocol.UserMessage) {
 }
 
 func (c *Channel) handleGroupMessage(msg protocol.GroupMessage) {
+	ctx := context.Background()
+	ctx = store.WithTenantID(ctx, c.TenantID())
 	senderID := msg.Data.UIDFrom
 	threadID := msg.ThreadID()
 
@@ -68,7 +86,7 @@ func (c *Channel) handleGroupMessage(msg protocol.GroupMessage) {
 	}
 
 	// Step 1: enforce access policy (allowlist/pairing). Hard reject — don't record history.
-	if !c.checkGroupPolicy(senderID, threadID) {
+	if !c.checkGroupPolicy(ctx, senderID, threadID) {
 		return
 	}
 
@@ -85,13 +103,14 @@ func (c *Channel) handleGroupMessage(msg protocol.GroupMessage) {
 				Sender:    senderName,
 				SenderID:  senderID,
 				Body:      content,
+				Media:     media,
 				Timestamp: time.Now(),
 				MessageID: msg.Data.MsgID,
 			}, c.historyLimit)
 
 			// Collect contact even when bot is not mentioned (cache prevents DB spam).
 			if cc := c.ContactCollector(); cc != nil {
-				cc.EnsureContact(context.Background(), c.Type(), c.Name(), senderID, senderID, senderName, "", "group")
+				cc.EnsureContact(ctx, c.Type(), c.Name(), senderID, senderID, senderName, "", "group")
 			}
 
 			slog.Debug("zalo_personal group message recorded (no mention)",
@@ -117,12 +136,22 @@ func (c *Channel) handleGroupMessage(msg protocol.GroupMessage) {
 
 	c.startTyping(threadID, protocol.ThreadTypeGroup)
 
+	// Collect media from pending history entries (images sent before this @mention).
+	// Must come after BuildContext — CollectMedia nulls out Media fields to prevent double-cleanup.
+	histMedia := c.groupHistory.CollectMedia(threadID)
+	allMedia := append(histMedia, media...)
+
+	// Collect contact for group-mentioned messages.
+	if cc := c.ContactCollector(); cc != nil {
+		cc.EnsureContact(ctx, c.Type(), c.Name(), senderID, senderID, senderName, "", "group")
+	}
+
 	metadata := map[string]string{
 		"message_id": msg.Data.MsgID,
 		"platform":   channels.TypeZaloPersonal,
 		"group_id":   threadID,
 	}
-	c.HandleMessage(senderID, threadID, finalContent, media, metadata, "group")
+	c.HandleMessage(senderID, threadID, finalContent, allMedia, metadata, "group")
 
 	// Clear pending history after sending to agent (matches Telegram/Discord/Slack/Feishu pattern).
 	c.groupHistory.Clear(threadID)
@@ -140,48 +169,69 @@ func (c *Channel) startTyping(threadID string, threadType protocol.ThreadType) {
 		},
 	})
 	if prev, ok := c.typingCtrls.Load(threadID); ok {
-		prev.(*typing.Controller).Stop()
+		if ctrl, ok := prev.(*typing.Controller); ok {
+			ctrl.Stop()
+		}
 	}
 	c.typingCtrls.Store(threadID, ctrl)
 	ctrl.Start()
 }
 
-// extractContentAndMedia returns text content and optional local media paths from a message.
-// For text messages, media is nil. For image attachments, the image is downloaded to a temp file.
+// extractContentAndMedia returns text content (with <media:*> tags) and optional local media
+// file paths from a Zalo message. For text messages, media is nil. For attachments, the file
+// is downloaded and classified by MIME type, matching the pattern used by Telegram/Discord/Feishu.
 func extractContentAndMedia(content protocol.Content) (string, []string) {
 	if text := content.Text(); text != "" {
 		return text, nil
 	}
 	att := content.ParseAttachment()
-	if att == nil {
+	if att == nil || att.Href == "" {
 		return "", nil
 	}
-	text := content.AttachmentText()
-	if text == "" {
-		return "", nil
-	}
-	var media []string
-	if att.IsImage() {
-		if path, err := downloadFile(context.Background(), att.Href); err != nil {
-			slog.Warn("zalo_personal: failed to download image", "url", att.Href, "error", err)
-		} else {
-			media = []string{path}
+
+	// Download the attachment file.
+	filePath, err := downloadFile(context.Background(), att.Href)
+	if err != nil {
+		slog.Warn("zalo_personal: failed to download attachment", "url", att.Href, "error", err)
+		// Return human-readable fallback so the message isn't silently dropped.
+		if text := content.AttachmentText(); text != "" {
+			return text, nil
 		}
+		return "", nil
 	}
-	return text, media
+
+	// Classify by MIME type (image, video, audio, document) — same as Discord/Feishu.
+	mimeType := media.DetectMIMEType(filePath)
+	mediaKind := media.MediaKindFromMime(mimeType)
+
+	// For images, also check via Zalo CDN path patterns (e.g. /jpg/, /png/) since
+	// temp files lose the original extension context.
+	if mediaKind != media.TypeImage && att.IsImage() {
+		mediaKind = media.TypeImage
+	}
+
+	// Build the <media:*> tag that the agent loop's enrichImageIDs/enrichMediaIDs expects.
+	tag := media.BuildMediaTags([]media.MediaInfo{{
+		Type:        mediaKind,
+		FilePath:    filePath,
+		ContentType: mimeType,
+		FileName:    att.Title,
+	}})
+
+	return tag, []string{filePath}
 }
 
-const maxImageBytes = 10 * 1024 * 1024 // 10MB
+const maxMediaBytes = 20 * 1024 * 1024 // 20MB (matches Telegram default)
 
-// downloadFile downloads an image URL to a temp file and returns the local path.
-// Validates against SSRF and enforces HTTPS-only, timeout, and size limits.
-func downloadFile(ctx context.Context, imageURL string) (string, error) {
-	if err := tools.CheckSSRF(imageURL); err != nil {
+// downloadFile downloads a URL to a temp file and returns the local path.
+// Validates against SSRF and enforces timeout and size limits.
+func downloadFile(ctx context.Context, fileURL string) (string, error) {
+	if err := tools.CheckSSRF(fileURL); err != nil {
 		return "", fmt.Errorf("ssrf check: %w", err)
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, imageURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("download: %w", err)
 	}
@@ -195,14 +245,14 @@ func downloadFile(ctx context.Context, imageURL string) (string, error) {
 		return "", fmt.Errorf("download status %d", resp.StatusCode)
 	}
 
-	// Strip query params before extracting extension
-	path := imageURL
+	// Strip query params before extracting extension.
+	path := fileURL
 	if i := strings.IndexByte(path, '?'); i >= 0 {
 		path = path[:i]
 	}
 	ext := filepath.Ext(path)
 	if ext == "" || len(ext) > 5 {
-		ext = ".jpg"
+		ext = ".bin"
 	}
 
 	tmpFile, err := os.CreateTemp("", "goclaw_zca_*"+ext)
@@ -211,14 +261,14 @@ func downloadFile(ctx context.Context, imageURL string) (string, error) {
 	}
 	defer tmpFile.Close()
 
-	written, err := io.Copy(tmpFile, io.LimitReader(resp.Body, maxImageBytes+1))
+	written, err := io.Copy(tmpFile, io.LimitReader(resp.Body, maxMediaBytes+1))
 	if err != nil {
 		os.Remove(tmpFile.Name())
 		return "", fmt.Errorf("save: %w", err)
 	}
-	if written > maxImageBytes {
+	if written > maxMediaBytes {
 		os.Remove(tmpFile.Name())
-		return "", fmt.Errorf("image too large: %d bytes", written)
+		return "", fmt.Errorf("file too large: %d bytes (max %d)", written, maxMediaBytes)
 	}
 
 	return tmpFile.Name(), nil

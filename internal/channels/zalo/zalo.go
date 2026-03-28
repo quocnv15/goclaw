@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -185,14 +186,20 @@ func (c *Channel) processUpdate(update zaloUpdate) {
 }
 
 func (c *Channel) handleTextMessage(msg *zaloMessage) {
+	ctx := context.Background()
+	ctx = store.WithTenantID(ctx, c.TenantID())
 	senderID := msg.From.ID
+	if senderID == "" {
+		slog.Warn("zalo: dropping text message with empty sender ID", "message_id", msg.MessageID)
+		return
+	}
 	chatID := msg.Chat.ID
 	if chatID == "" {
 		chatID = senderID
 	}
 
 	// DM policy enforcement (Zalo is DM-only)
-	if !c.checkDMPolicy(senderID, chatID) {
+	if !c.checkDMPolicy(ctx, senderID, chatID) {
 		return
 	}
 
@@ -216,13 +223,19 @@ func (c *Channel) handleTextMessage(msg *zaloMessage) {
 }
 
 func (c *Channel) handleImageMessage(msg *zaloMessage) {
+	ctx := context.Background()
+	ctx = store.WithTenantID(ctx, c.TenantID())
 	senderID := msg.From.ID
+	if senderID == "" {
+		slog.Warn("zalo: dropping image message with empty sender ID", "message_id", msg.MessageID)
+		return
+	}
 	chatID := msg.Chat.ID
 	if chatID == "" {
 		chatID = senderID
 	}
 
-	if !c.checkDMPolicy(senderID, chatID) {
+	if !c.checkDMPolicy(ctx, senderID, chatID) {
 		return
 	}
 
@@ -231,14 +244,32 @@ func (c *Channel) handleImageMessage(msg *zaloMessage) {
 		content = "[image]"
 	}
 
+	// Download photo from Zalo CDN to local temp file (CDN URLs are auth-restricted/expiring)
 	var media []string
-	if msg.Photo != "" {
-		media = []string{msg.Photo}
+	var photoURL string
+	switch {
+	case msg.PhotoURL != "":
+		photoURL = msg.PhotoURL
+	case msg.Photo != "":
+		photoURL = msg.Photo
 	}
 
-	slog.Debug("zalo image message received",
+	if photoURL != "" {
+		localPath, err := c.downloadMedia(photoURL)
+		if err != nil {
+			slog.Warn("zalo photo download failed, passing URL as fallback",
+				"photo_url", photoURL, "error", err)
+			media = []string{photoURL}
+		} else {
+			media = []string{localPath}
+		}
+	}
+
+	slog.Info("zalo image message received",
 		"sender_id", senderID,
 		"chat_id", chatID,
+		"photo_url", photoURL,
+		"has_media", len(media) > 0,
 	)
 
 	metadata := map[string]string{
@@ -251,7 +282,7 @@ func (c *Channel) handleImageMessage(msg *zaloMessage) {
 
 // --- DM Policy ---
 
-func (c *Channel) checkDMPolicy(senderID, chatID string) bool {
+func (c *Channel) checkDMPolicy(ctx context.Context, senderID, chatID string) bool {
 	switch c.dmPolicy {
 	case "disabled":
 		slog.Debug("zalo message rejected: DMs disabled", "sender_id", senderID)
@@ -271,7 +302,14 @@ func (c *Channel) checkDMPolicy(senderID, chatID string) bool {
 		// Check if already paired or in allowlist
 		paired := false
 		if c.pairingService != nil {
-			paired = c.pairingService.IsPaired(senderID, c.Name())
+			p, err := c.pairingService.IsPaired(ctx, senderID, c.Name())
+			if err != nil {
+				slog.Warn("security.pairing_check_failed, assuming paired (fail-open)",
+					"sender_id", senderID, "channel", c.Name(), "error", err)
+				paired = true
+			} else {
+				paired = p
+			}
 		}
 		inAllowList := c.HasAllowList() && c.IsAllowed(senderID)
 
@@ -280,12 +318,12 @@ func (c *Channel) checkDMPolicy(senderID, chatID string) bool {
 		}
 
 		// Send pairing reply (debounced)
-		c.sendPairingReply(senderID, chatID)
+		c.sendPairingReply(ctx, senderID, chatID)
 		return false
 	}
 }
 
-func (c *Channel) sendPairingReply(senderID, chatID string) {
+func (c *Channel) sendPairingReply(ctx context.Context, senderID, chatID string) {
 	if c.pairingService == nil {
 		return
 	}
@@ -297,7 +335,7 @@ func (c *Channel) sendPairingReply(senderID, chatID string) {
 		}
 	}
 
-	code, err := c.pairingService.RequestPairing(senderID, c.Name(), chatID, "default", nil)
+	code, err := c.pairingService.RequestPairing(ctx, senderID, c.Name(), chatID, "default", nil)
 	if err != nil {
 		slog.Debug("zalo pairing request failed", "sender_id", senderID, "error", err)
 		return
@@ -314,6 +352,55 @@ func (c *Channel) sendPairingReply(senderID, chatID string) {
 		c.pairingDebounce.Store(senderID, time.Now())
 		slog.Info("zalo pairing reply sent", "sender_id", senderID, "code", code)
 	}
+}
+
+// --- Media download ---
+
+const maxMediaBytes = 10 * 1024 * 1024 // 10MB
+
+// downloadMedia fetches a photo from a Zalo CDN URL and saves it as a local temp file.
+// Zalo CDN URLs are auth-restricted and expire, so we must download immediately.
+func (c *Channel) downloadMedia(url string) (string, error) {
+	resp, err := c.client.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("fetch: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("http %d", resp.StatusCode)
+	}
+
+	// Detect extension from Content-Type
+	ext := ".jpg"
+	ct := resp.Header.Get("Content-Type")
+	switch {
+	case strings.Contains(ct, "png"):
+		ext = ".png"
+	case strings.Contains(ct, "gif"):
+		ext = ".gif"
+	case strings.Contains(ct, "webp"):
+		ext = ".webp"
+	}
+
+	f, err := os.CreateTemp("", "goclaw_zalo_*"+ext)
+	if err != nil {
+		return "", fmt.Errorf("create temp: %w", err)
+	}
+	defer f.Close()
+
+	n, err := io.Copy(f, io.LimitReader(resp.Body, maxMediaBytes))
+	if err != nil {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("write: %w", err)
+	}
+	if n == 0 {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("empty response")
+	}
+
+	slog.Debug("zalo media downloaded", "path", f.Name(), "size", n)
+	return f.Name(), nil
 }
 
 // --- Chunked text sending ---
@@ -358,6 +445,7 @@ type zaloMessage struct {
 	MessageID string   `json:"message_id"`
 	Text      string   `json:"text"`
 	Photo     string   `json:"photo"`
+	PhotoURL  string   `json:"photo_url"`
 	Caption   string   `json:"caption"`
 	From      zaloFrom `json:"from"`
 	Chat      zaloChat `json:"chat"`

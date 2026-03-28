@@ -3,13 +3,18 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // handleVerifyProvider tests a provider+model combination with a minimal LLM call.
@@ -44,36 +49,57 @@ func (h *ProvidersHandler) handleVerifyProvider(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	// ACP: verify binary exists on the server (no LLM call needed)
+	if p.ProviderType == store.ProviderACP {
+		binary := p.APIBase
+		if binary == "" {
+			binary = "claude"
+		}
+		// Validate binary against known allowlist (same check as registerACPFromDB)
+		if binary != "claude" && binary != "codex" && binary != "gemini" && !filepath.IsAbs(binary) {
+			writeJSON(w, http.StatusOK, map[string]any{"valid": false, "error": "invalid binary path"})
+			return
+		}
+		if _, err := exec.LookPath(binary); err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"valid": false, "error": "binary not found: " + binary})
+		} else {
+			writeJSON(w, http.StatusOK, map[string]any{"valid": true})
+		}
+		return
+	}
+
 	// Claude CLI: validate model alias locally (no LLM call needed)
 	if p.ProviderType == "claude_cli" {
 		validModels := map[string]bool{"sonnet": true, "opus": true, "haiku": true}
 		if validModels[req.Model] {
-			writeJSON(w, http.StatusOK, map[string]interface{}{"valid": true})
+			writeJSON(w, http.StatusOK, map[string]any{"valid": true})
 		} else {
-			writeJSON(w, http.StatusOK, map[string]interface{}{"valid": false, "error": "Invalid model. Use: sonnet, opus, or haiku"})
+			writeJSON(w, http.StatusOK, map[string]any{"valid": false, "error": "Invalid model. Use: sonnet, opus, or haiku"})
 		}
 		return
 	}
 
 	if h.providerReg == nil {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"valid": false, "error": "no provider registry available"})
+		writeJSON(w, http.StatusOK, map[string]any{"valid": false, "error": "no provider registry available"})
 		return
 	}
 
-	provider, err := h.providerReg.Get(p.Name)
+	// Use provider's own TenantID (not request context) so cross-tenant admins
+	// can verify providers belonging to other tenants.
+	provider, err := h.providerReg.GetForTenant(p.TenantID, p.Name)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"valid": false, "error": "provider not registered: " + p.Name})
+		writeJSON(w, http.StatusOK, map[string]any{"valid": false, "error": "provider not registered: " + p.Name})
 		return
 	}
 
 	// Non-chat models (image/video generation) can't be verified via Chat API.
 	// Accept them if the provider is reachable (already validated above).
 	if isNonChatModel(req.Model) {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"valid": true, "note": "generation model accepted (not verifiable via chat)"})
+		writeJSON(w, http.StatusOK, map[string]any{"valid": true, "note": "generation model accepted (not verifiable via chat)"})
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
 	_, err = provider.Chat(ctx, providers.ChatRequest{
@@ -81,16 +107,16 @@ func (h *ProvidersHandler) handleVerifyProvider(w http.ResponseWriter, r *http.R
 			{Role: "user", Content: "hi"},
 		},
 		Model: req.Model,
-		Options: map[string]interface{}{
-			"max_tokens": 1,
+		Options: map[string]any{
+			// Use a small but safe value — reasoning models need headroom beyond 1 token.
+			"max_tokens": 50,
 		},
 	})
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"valid": false, "error": friendlyVerifyError(err)})
+		writeJSON(w, http.StatusOK, map[string]any{"valid": false, "error": friendlyVerifyError(err)})
 		return
 	}
-
-	writeJSON(w, http.StatusOK, map[string]interface{}{"valid": true})
+	writeJSON(w, http.StatusOK, map[string]any{"valid": true})
 }
 
 // handleClaudeCLIAuthStatus checks whether the Claude CLI is authenticated on the server.
@@ -113,19 +139,23 @@ func (h *ProvidersHandler) handleClaudeCLIAuthStatus(w http.ResponseWriter, r *h
 		}
 	}
 
+	inDocker := config.InDocker()
+
 	status, err := providers.CheckClaudeAuthStatus(ctx, cliPath)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]interface{}{
+		writeJSON(w, http.StatusOK, map[string]any{
 			"logged_in": false,
 			"error":     err.Error(),
+			"in_docker": inDocker,
 		})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"logged_in":         status.LoggedIn,
 		"email":             status.Email,
 		"subscription_type": status.SubscriptionType,
+		"in_docker":         inDocker,
 	})
 }
 
@@ -149,6 +179,14 @@ func isNonChatModel(model string) bool {
 // friendlyVerifyError extracts a human-readable message from provider errors.
 // Raw errors often contain JSON blobs like: `HTTP 400: minimax: {"type":"error","error":{"type":"bad_request_error","message":"unknown model ..."}}`
 func friendlyVerifyError(err error) string {
+	// Timeout / context cancellation → user-friendly message
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context deadline exceeded") {
+		return "Verification timed out — the provider took too long to respond. Please try again."
+	}
+	if errors.Is(err, context.Canceled) {
+		return "Verification was cancelled. Please try again."
+	}
+
 	msg := err.Error()
 
 	// Try to extract "message" field from embedded JSON
@@ -161,8 +199,8 @@ func friendlyVerifyError(err error) string {
 			rest = strings.TrimLeft(rest[start+1:], " ")
 			if len(rest) > 0 && rest[0] == '"' {
 				rest = rest[1:]
-				if end := strings.Index(rest, `"`); end >= 0 {
-					extracted := rest[:end]
+				if before, _, ok := strings.Cut(rest, `"`); ok {
+					extracted := before
 					if extracted != "" {
 						return extracted
 					}

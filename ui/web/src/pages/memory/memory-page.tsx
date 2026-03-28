@@ -10,18 +10,22 @@ import { TableSkeleton } from "@/components/shared/loading-skeleton";
 import { Pagination } from "@/components/shared/pagination";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { useAgents } from "@/pages/agents/hooks/use-agents";
+import { useContactResolver } from "@/hooks/use-contact-resolver";
 import { useMemoryDocuments } from "./hooks/use-memory";
 import { MemoryDocumentDialog } from "./memory-document-dialog";
 import { MemoryCreateDialog } from "./memory-create-dialog";
 import { MemorySearchDialog } from "./memory-search-dialog";
 import { useMinLoading } from "@/hooks/use-min-loading";
 import { useDeferredLoading } from "@/hooks/use-deferred-loading";
+import { useEmbeddingStatus } from "@/hooks/use-embedding-status";
 import type { MemoryDocument } from "@/types/memory";
 
 export function MemoryPage() {
   const { t } = useTranslation("memory");
   const { t: tc } = useTranslation("common");
+  const { t: to } = useTranslation("overview");
   const { agents } = useAgents();
+  const { status: embStatus } = useEmbeddingStatus();
   const [agentId, setAgentId] = useState("");
   const [userIdFilter, setUserIdFilter] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
@@ -55,6 +59,9 @@ export function MemoryPage() {
     return Array.from(set).sort();
   }, [documents]);
 
+  // Resolve user IDs to display names via contacts API
+  const { resolve: resolveContact } = useContactResolver(userIds);
+
   // Build agent lookup map for displaying agent names in global view
   const agentMap = useMemo(() => {
     const map = new Map<string, string>();
@@ -78,7 +85,7 @@ export function MemoryPage() {
     if (!deleteTarget) return;
     setDeleteLoading(true);
     try {
-      await deleteDocument(deleteTarget.path, deleteTarget.user_id);
+      await deleteDocument(deleteTarget.path, deleteTarget.user_id, deleteTarget.agent_id);
       setDeleteTarget(null);
     } finally {
       setDeleteLoading(false);
@@ -99,10 +106,19 @@ export function MemoryPage() {
   };
 
   return (
-    <div className="p-4 sm:p-6">
+    <div className="p-4 sm:p-6 pb-10">
       <PageHeader
         title={t("title")}
-        description={t("description")}
+        description={
+          <span className="flex items-center gap-2 flex-wrap">
+            {t("description")}
+            {embStatus && (
+              <Badge variant={embStatus.configured ? "outline" : "secondary"} className="text-xs font-normal">
+                {embStatus.configured ? `${to("embedding.title")}: ${embStatus.model}` : `${to("embedding.title")}: ${to("embedding.notConfigured")}`}
+              </Badge>
+            )}
+          </span>
+        }
         actions={
           <div className="flex gap-2">
             {agentId && (
@@ -130,7 +146,7 @@ export function MemoryPage() {
             id="mem-agent"
             value={agentId}
             onChange={(e) => { setAgentId(e.target.value); setUserIdFilter(""); setPage(1); }}
-            className="h-9 rounded-md border bg-background px-3 text-sm"
+            className="h-9 rounded-md border bg-background px-3 text-base md:text-sm"
           >
             <option value="">{t("filters.allAgents")}</option>
             {agents.map((a) => (
@@ -146,12 +162,12 @@ export function MemoryPage() {
             id="mem-scope"
             value={userIdFilter}
             onChange={(e) => { setUserIdFilter(e.target.value); setPage(1); }}
-            className="h-9 rounded-md border bg-background px-3 text-sm min-w-[180px]"
+            className="h-9 rounded-md border bg-background px-3 text-base md:text-sm min-w-[180px]"
           >
             <option value="">{t("filters.allScope")}</option>
             {userIds.map((uid) => (
               <option key={uid} value={uid}>
-                {formatScopeLabel(uid)}
+                {formatScopeLabel(uid, resolveContact)}
               </option>
             ))}
           </select>
@@ -181,8 +197,8 @@ export function MemoryPage() {
             description={agentId ? t("emptyAgentDescription") : t("emptyGlobalDescription")}
           />
         ) : (
-          <div className="rounded-md border">
-            <table className="w-full text-sm">
+          <div className="overflow-x-auto rounded-md border">
+            <table className="w-full min-w-[600px] text-sm">
               <thead>
                 <tr className="border-b bg-muted/50">
                   <th className="px-4 py-3 text-left font-medium">{t("columns.path")}</th>
@@ -220,7 +236,7 @@ export function MemoryPage() {
                         {doc.user_id ? t("scopeLabel.personal") : t("scopeLabel.global")}
                       </Badge>
                       {doc.user_id && (
-                        <span className="ml-1 text-xs text-muted-foreground">{formatScopeLabel(doc.user_id)}</span>
+                        <span className="ml-1 text-xs text-muted-foreground">{formatScopeLabel(doc.user_id, resolveContact)}</span>
                       )}
                     </td>
                     <td className="px-4 py-3 font-mono text-xs text-muted-foreground">
@@ -295,8 +311,15 @@ export function MemoryPage() {
   );
 }
 
-/** Format user_id into a readable scope label (e.g. "group:telegram:-100xxx" -> "Telegram -100xxx") */
-function formatScopeLabel(userId: string): string {
+/** Format user_id into a readable scope label, preferring contact title if available. */
+function formatScopeLabel(userId: string, resolveContact?: (id: string) => { display_name?: string; username?: string } | null): string {
+  // Try contact resolver first
+  if (resolveContact) {
+    const contact = resolveContact(userId);
+    if (contact?.display_name) return contact.display_name;
+    if (contact?.username) return `@${contact.username}`;
+  }
+  // Fallback: format group IDs nicely
   if (userId.startsWith("group:")) {
     const parts = userId.split(":");
     if (parts.length >= 3) {

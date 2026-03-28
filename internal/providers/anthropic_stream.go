@@ -10,10 +10,7 @@ import (
 )
 
 func (p *AnthropicProvider) ChatStream(ctx context.Context, req ChatRequest, onChunk func(StreamChunk)) (*ChatResponse, error) {
-	model := req.Model
-	if model == "" {
-		model = p.defaultModel
-	}
+	model := resolveAnthropicModel(req.Model, p.defaultModel)
 
 	body := p.buildRequestBody(model, req, true)
 
@@ -37,7 +34,7 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, req ChatRequest, onC
 	thinkingChars := 0
 
 	scanner := bufio.NewScanner(respBody)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 1MB max line for large thinking chunks
+	scanner.Buffer(make([]byte, 0, SSEScanBufInit), SSEScanBufMax)
 	var currentEvent string
 
 	for scanner.Scan() {
@@ -150,6 +147,10 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, req ChatRequest, onC
 		case "message_stop":
 			// Stream complete
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("anthropic stream read error: %w", err)
 	}
 
 	// Parse accumulated tool call JSON arguments

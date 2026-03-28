@@ -60,7 +60,7 @@ export function KGEntitiesTab({ agentId, userId }: KGEntitiesTabProps) {
     extractFromText(text, provider, model, userId);
 
   return (
-    <div>
+    <div className="flex h-full flex-col">
       {/* Search + stats + actions — single compact row */}
       <div className="flex items-center gap-2 mb-3">
         <Input
@@ -121,6 +121,7 @@ export function KGEntitiesTab({ agentId, userId }: KGEntitiesTabProps) {
       </div>
 
       {/* Content area */}
+      <div className="min-h-0 flex-1">
       {viewMode === "graph" ? (
         <KGGraphView
           entities={graphData.entities}
@@ -136,8 +137,8 @@ export function KGEntitiesTab({ agentId, userId }: KGEntitiesTabProps) {
           description={appliedQuery ? t("kg.emptySearchDescription") : t("kg.emptyDescription")}
         />
       ) : (
-        <div className="rounded-md border">
-          <table className="w-full text-sm">
+        <div className="overflow-x-auto rounded-md border">
+          <table className="w-full min-w-[600px] text-sm">
             <thead>
               <tr className="border-b bg-muted/50">
                 <th className="px-4 py-3 text-left font-medium">{t("kg.columns.name")}</th>
@@ -189,6 +190,7 @@ export function KGEntitiesTab({ agentId, userId }: KGEntitiesTabProps) {
           </table>
         </div>
       )}
+      </div>
 
       {/* Entity detail dialog */}
       <KGEntityDetailDialog

@@ -148,7 +148,15 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 		default: // "pairing" or unknown → secure default
 			paired := false
 			if c.pairingService != nil {
-				paired = c.pairingService.IsPaired(userID, c.Name()) || c.pairingService.IsPaired(senderID, c.Name())
+				p1, err1 := c.pairingService.IsPaired(ctx, userID, c.Name())
+				p2, err2 := c.pairingService.IsPaired(ctx, senderID, c.Name())
+				if err1 != nil || err2 != nil {
+					slog.Warn("security.pairing_check_failed, assuming paired (fail-open)",
+						"user_id", userID, "channel", c.Name(), "err1", err1, "err2", err2)
+					paired = true
+				} else {
+					paired = p1 || p2
+				}
 			}
 			inAllowList := c.HasAllowList() && (c.IsAllowed(userID) || c.IsAllowed(senderID))
 
@@ -225,8 +233,47 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 
 	// --- Group mention gating (matching TS mentionGate logic) ---
 	// Also check implicit mention via reply-to-bot
-	if isGroup && topicCfg.effectiveRequireMention(c.requireMention) {
+	//
+	// mention_mode controls multi-bot behavior in groups:
+	//   "strict" (default): only respond when explicitly @mentioned (require_mention=true)
+	//   "yield": respond to all messages UNLESS another bot/user is @mentioned (and not us)
+	//            — enables "shared group" where all bots listen, but yield when someone is called by name
+	mentionMode := topicCfg.effectiveMentionMode(c.mentionMode)
+	if isGroup && (topicCfg.effectiveRequireMention(c.requireMention) || mentionMode == "yield") {
 		botUsername := c.bot.Username()
+
+		// In yield mode, skip messages from other bots to prevent infinite loops.
+		// Bot A responds → Bot B sees it as "no specific mention" → responds → loop.
+		// Only skip when our bot is NOT explicitly mentioned — allow cross-bot @commands.
+		if mentionMode == "yield" && user.IsBot && user.Username != botUsername && !c.detectMention(message, botUsername) {
+			// Respect pairing guard — don't record history in unpaired groups.
+			if topicCfg.groupPolicy == "pairing" && c.pairingService != nil {
+				if _, cached := c.approvedGroups.Load(chatIDStr); !cached {
+					groupSenderID := fmt.Sprintf("group:%d", chatID)
+					paired, pairErr := c.pairingService.IsPaired(ctx, groupSenderID, c.Name())
+					if pairErr != nil {
+						slog.Warn("security.pairing_check_failed, assuming paired (fail-open)",
+							"group_sender", groupSenderID, "channel", c.Name(), "error", pairErr)
+						paired = true
+					}
+					if paired {
+						c.approvedGroups.Store(chatIDStr, true)
+					} else {
+						return
+					}
+				}
+			}
+			c.groupHistory.Record(localKey, channels.HistoryEntry{
+				Sender:    senderLabel,
+				SenderID:  senderID,
+				Body:      content,
+				MediaRefs: extractMediaRefs(message),
+				Timestamp: time.Unix(int64(message.Date), 0),
+				MessageID: fmt.Sprintf("%d", message.MessageID),
+			}, c.historyLimit)
+			return
+		}
+
 		wasMentioned := c.detectMention(message, botUsername)
 
 		// Reply to bot's message counts as implicit mention
@@ -234,26 +281,57 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 			wasMentioned = true
 		}
 
+		// Yield mode: skip only if another bot/user is explicitly mentioned (not us).
+		// If nobody is mentioned → respond. If we are mentioned → respond.
+		if mentionMode == "yield" && !wasMentioned {
+			// In yield mode, respond unless someone else was specifically called out
+			if !c.hasOtherMention(message, botUsername) {
+				wasMentioned = true // treat as mentioned — no specific target, all bots respond
+			}
+		}
+
 		slog.Debug("telegram group mention gate",
 			"chat_id", chatID,
 			"bot_username", botUsername,
 			"require_mention", c.requireMention,
+			"mention_mode", mentionMode,
 			"was_mentioned", wasMentioned,
 			"text_preview", channels.Truncate(content, 60),
 		)
 
 		if !wasMentioned {
+			// Guard: skip recording for unpaired groups — don't leak message data.
+			// Uses approvedGroups cache (same pattern as the pairing gate below).
+			if topicCfg.groupPolicy == "pairing" && c.pairingService != nil {
+				if _, cached := c.approvedGroups.Load(chatIDStr); !cached {
+					groupSenderID := fmt.Sprintf("group:%d", chatID)
+					paired, pairErr := c.pairingService.IsPaired(ctx, groupSenderID, c.Name())
+					if pairErr != nil {
+						slog.Warn("security.pairing_check_failed, assuming paired (fail-open)",
+							"group_sender", groupSenderID, "channel", c.Name(), "error", pairErr)
+						paired = true
+					}
+					if paired {
+						c.approvedGroups.Store(chatIDStr, true)
+					} else {
+						return // silently skip — no pending history, no contact
+					}
+				}
+			}
+
 			c.groupHistory.Record(localKey, channels.HistoryEntry{
 				Sender:    senderLabel,
 				SenderID:  senderID,
 				Body:      content,
+				MediaRefs: extractMediaRefs(message),
 				Timestamp: time.Unix(int64(message.Date), 0),
 				MessageID: fmt.Sprintf("%d", message.MessageID),
 			}, c.historyLimit)
 
 			// Collect contact even when bot is not mentioned (cache prevents DB spam).
 			if cc := c.ContactCollector(); cc != nil {
-				cc.EnsureContact(ctx, c.Type(), c.Name(), userID, userID, user.FirstName, user.Username, "group")
+				contactName := strings.TrimSpace(user.FirstName + " " + user.LastName)
+				cc.EnsureContact(ctx, c.Type(), c.Name(), userID, userID, contactName, user.Username, "group")
 			}
 
 			slog.Debug("telegram group message recorded (no mention)",
@@ -267,7 +345,13 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 	if isGroup && topicCfg.groupPolicy == "pairing" && c.pairingService != nil {
 		if _, cached := c.approvedGroups.Load(chatIDStr); !cached {
 			groupSenderID := fmt.Sprintf("group:%d", chatID)
-			if c.pairingService.IsPaired(groupSenderID, c.Name()) {
+			paired, err := c.pairingService.IsPaired(ctx, groupSenderID, c.Name())
+			if err != nil {
+				slog.Warn("security.pairing_check_failed, assuming paired (fail-open)",
+					"group_sender", groupSenderID, "channel", c.Name(), "error", err)
+				paired = true
+			}
+			if paired {
 				c.approvedGroups.Store(chatIDStr, true)
 			} else {
 				c.sendGroupPairingReply(ctx, chatID, chatIDStr, groupSenderID, localKey, messageThreadID, message.Chat.Title)
@@ -279,16 +363,22 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 	// --- Media download (only when bot will process the message) ---
 	// Deferred until after mention + pairing gates to avoid downloading
 	// media for messages that only get recorded in pending history.
-	mediaList := c.resolveMedia(ctx, message)
-	if message.ReplyToMessage != nil && len(mediaList) == 0 {
-		replyMedia := c.resolveMedia(ctx, message.ReplyToMessage)
+	mediaList, mediaErrors := c.resolveMedia(ctx, message)
+	if message.ReplyToMessage != nil {
+		replyMedia, replyErrors := c.resolveMedia(ctx, message.ReplyToMessage)
 		if len(replyMedia) > 0 {
-			mediaList = append(mediaList, replyMedia...)
+			// Tag reply media so LLM knows which images came from the replied-to message.
+			for i := range replyMedia {
+				replyMedia[i].FromReply = true
+			}
+			// Reply media first (context), current media second.
+			mediaList = append(replyMedia, mediaList...)
 			slog.Debug("telegram: resolved media from replied message",
 				"reply_msg_id", message.ReplyToMessage.MessageID,
 				"media_count", len(replyMedia),
 			)
 		}
+		mediaErrors = append(mediaErrors, replyErrors...)
 	}
 
 	var mediaFiles []bus.MediaFile
@@ -342,6 +432,31 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 		}
 	}
 
+	// Annotate content + notify user for any media download failures.
+	// Replace the per-type lightweight tag with an error-annotated version so the
+	// model knows the specific media was skipped and why.
+	if len(mediaErrors) > 0 {
+		for _, me := range mediaErrors {
+			errTag := fmt.Sprintf("[sent media (%s) — skipped: %s]", me.Type, me.Reason)
+			if lightTag := lightweightTagForType(me.Type, message); lightTag != "" {
+				content = strings.Replace(content, lightTag, errTag, 1)
+			} else {
+				content = errTag + "\n" + content
+			}
+		}
+
+		// Send a short reply so the user knows their file was skipped.
+		for _, me := range mediaErrors {
+			var errText string
+			if me.MaxBytes > 0 {
+				errText = fmt.Sprintf("⚠️ File too large (max %d MB). Skipped.", me.MaxBytes/(1024*1024))
+			} else {
+				errText = "⚠️ Failed to download the attached file. Skipped."
+			}
+			_ = c.sendHTML(ctx, chatID, errText, 0, messageThreadID)
+		}
+	}
+
 	slog.Debug("telegram message received",
 		"sender_id", senderID,
 		"chat_id", fmt.Sprintf("%d", chatID),
@@ -354,10 +469,31 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 	if isGroup {
 		annotated := fmt.Sprintf("[From: %s]\n%s", senderLabel, content)
 		if c.historyLimit > 0 {
+			// Resolve deferred media from history entries (lazy download).
+			if histRefs := c.groupHistory.CollectMediaRefs(localKey); len(histRefs) > 0 {
+				histMedia, histErrors := c.resolveMediaRefs(ctx, histRefs)
+				for _, m := range histMedia {
+					mediaFiles = append(mediaFiles, bus.MediaFile{
+						Path:     m.FilePath,
+						MimeType: m.ContentType,
+					})
+				}
+				if len(histMedia) > 0 {
+					histTags := buildMediaTags(histMedia)
+					annotated = histTags + "\n\n" + annotated
+				}
+				for _, e := range histErrors {
+					slog.Warn("telegram: history media download failed",
+						"type", e.Type, "reason", e.Reason)
+				}
+			}
 			finalContent = c.groupHistory.BuildContext(localKey, annotated, c.historyLimit)
 		} else {
 			finalContent = annotated
 		}
+	} else {
+		// DM: annotate with sender identity so the agent knows who is messaging.
+		finalContent = fmt.Sprintf("[From: %s]\n%s", senderLabel, content)
 	}
 
 	// Send typing indicator with keepalive + TTL safety net.
@@ -393,20 +529,10 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 	_, thinkCancel := context.WithCancel(ctx)
 	c.stopThinking.Store(localKey, &thinkingCancel{fn: thinkCancel})
 
-	// Send "Thinking..." placeholder for DMs.
-	// The streaming system will edit this message progressively (editMessageText),
-	// giving a smooth transition: "Thinking..." → streaming chunks → final formatted response.
-	// Groups: no placeholder; response replies to the sender's message.
-	if !isGroup {
-		thinkMsg := tu.Message(chatIDObj, "Thinking...")
-		if dmThreadID > 0 {
-			thinkMsg.MessageThreadID = dmThreadID
-		}
-		pMsg, err := c.bot.SendMessage(ctx, thinkMsg)
-		if err == nil {
-			c.placeholders.Store(localKey, pMsg.MessageID)
-		}
-	}
+	// No "Thinking..." placeholder — the DraftStream creates its own message
+	// on the first streaming chunk (sendMessage on first flush).
+	// This avoids "reply to deleted message" artifacts and is cleaner UX:
+	// user sees typing indicator → first content appears directly.
 
 	metadata := map[string]string{
 		"message_id": fmt.Sprintf("%d", message.MessageID),
@@ -453,6 +579,11 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 				break
 			}
 		}
+	}
+
+	// Collect contact for processed messages (DM + group-mentioned).
+	if cc := c.ContactCollector(); cc != nil {
+		cc.EnsureContact(ctx, c.Type(), c.Name(), senderID, userID, user.FirstName, user.Username, peerKind)
 	}
 
 	c.Bus().PublishInbound(bus.InboundMessage{

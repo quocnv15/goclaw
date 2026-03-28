@@ -53,7 +53,7 @@ func init() {
 		// HTTP API
 		MsgInvalidAuth:           "身份验证无效",
 		MsgMsgsRequired:          "messages 是必填项",
-		MsgUserIDHeader:          "托管模式下需要 X-GoClaw-User-Id 请求头",
+		MsgUserIDHeader:          "需要 X-GoClaw-User-Id 请求头",
 		MsgFileTooLarge:          "文件过大或 multipart 表单无效",
 		MsgMissingFileField:      "缺少 'file' 字段",
 		MsgInvalidFilename:       "文件名无效",
@@ -93,11 +93,9 @@ func init() {
 		MsgAgentIsTeamLead:      "该Agent已是团队负责人",
 		MsgCannotRemoveTeamLead: "无法移除团队负责人",
 
-		// Delegations
-		MsgDelegationsUnavailable: "委派功能不可用",
-
 		// Channels
 		MsgCannotDeleteDefaultInst: "无法删除默认Channel实例",
+		MsgCannotRemoveLastWriter:  "无法移除最后一个文件管理员",
 
 		// Skills
 		MsgSkillsUpdateNotSupported: "基于文件的Skill不支持 skills.update",
@@ -131,6 +129,7 @@ func init() {
 		MsgStatusPhaseCompact:  "阶段：压缩上下文中...",
 		MsgStatusPhaseDefault:  "阶段：处理中...",
 		MsgCancelledReply:      "✋ 已取消。您接下来想做什么？",
+		MsgInjectedAck:         "收到，我会在当前任务中处理。",
 
 		// Knowledge Graph
 		MsgEntityIDRequired:       "entity_id 是必填项",
@@ -168,10 +167,20 @@ func init() {
 		MsgToolSpawn:           "创建子代理执行后台工作或将任务委派给已链接的代理",
 		MsgToolSkillSearch:     "按关键字或描述搜索可用技能以查找相关功能",
 		MsgToolUseSkill:        "激活技能以使用其专门功能（追踪标记）",
-		MsgToolDelegateSearch:  "当链接代理过多时，按关键字搜索可用的委派目标",
-		MsgToolEvaluateLoop:    "在两个代理之间运行生成→评估→修改循环，用于高质量输出",
-		MsgToolHandoff:         "将对话转移给另一个代理——用户将直接与该代理交谈",
+		MsgToolSkillManage:     "从对话经验中创建、修补或删除技能",
+		MsgToolPublishSkill:    "将技能目录注册到系统数据库中，使其可被发现和授权",
 		MsgToolTeamTasks:       "查看、创建、更新和完成团队任务板上的任务",
-		MsgToolTeamMessage:     "向代理团队中的队友发送直接消息或广播",
+
+		MsgSkillNudgePostscript: "此任务涉及多个步骤。要我将此过程保存为可重用技能吗？回复 **\"保存技能\"** 或 **\"跳过\"**。",
+		MsgSkillNudge70Pct:      "[System] 您已使用 70% 的迭代预算。请考虑本次会话中的模式是否值得保存为技能。",
+		MsgSkillNudge90Pct:      "[System] 您已使用 90% 的迭代预算。如果本次会话涉及可重用的模式，请考虑在完成前将其保存为技能。",
+
+		MsgInvalidRole: "无效角色：允许的值为 owner、admin、operator、member、viewer",
+
+		MsgContactIDsRequired:  "contact_ids 为必填项",
+		MsgMergeTargetRequired: "必须提供 tenant_user_id 或 create_user 其中之一",
+		MsgTenantUserNotFound:  "未找到租户用户",
+		MsgTenantMismatch:      "租户用户不属于此租户",
+		MsgTenantScopeRequired: "此操作需要指定租户范围",
 	})
 }

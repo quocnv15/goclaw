@@ -38,12 +38,12 @@ export function KGExtractDialog({ open, onOpenChange, onExtract }: KGExtractDial
 
   return (
     <Dialog open={open} onOpenChange={(v) => !loading && onOpenChange(v)}>
-      <DialogContent className="max-w-2xl max-h-[85vh] flex flex-col">
+      <DialogContent aria-describedby={undefined} className="max-w-2xl max-h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>{t("kg.extractDialog.title")}</DialogTitle>
         </DialogHeader>
 
-        <div className="flex-1 min-h-0 overflow-y-auto py-2 px-1 -mx-1 space-y-4">
+        <div className="flex-1 min-h-0 overflow-y-auto py-2 -mx-4 px-4 sm:-mx-6 sm:px-6 space-y-4">
           <ProviderModelSelect
             provider={provider}
             onProviderChange={setProvider}

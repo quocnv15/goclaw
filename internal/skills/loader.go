@@ -10,6 +10,7 @@
 package skills
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -100,14 +101,16 @@ func (l *Loader) SetManagedDir(dir string) {
 
 // ListSkills returns all available skills, respecting the priority hierarchy.
 // Higher-priority sources override lower ones by name.
-func (l *Loader) ListSkills() []Info {
+func (l *Loader) ListSkills(_ context.Context) []Info {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	seen := make(map[string]bool)
 	var skills []Info
 
-	// Priority: workspace > project-agents > personal-agents > global > builtin
+	// Priority: workspace > project-agents > personal-agents > global > managed > builtin
+	// Managed (DB-seeded) skills take priority over raw bundled files so agents
+	// always receive paths within the skills-store (workspace-accessible), not /app/bundled-skills/.
 	for _, src := range []struct {
 		dir    string
 		source string
@@ -116,7 +119,6 @@ func (l *Loader) ListSkills() []Info {
 		{l.projectAgentSkills, "agents-project"},
 		{l.personalAgentSkills, "agents-personal"},
 		{l.globalSkills, "global"},
-		{l.builtinSkills, "builtin"},
 	} {
 		if src.dir == "" {
 			continue
@@ -153,8 +155,7 @@ func (l *Loader) ListSkills() []Info {
 		}
 	}
 
-	// Managed skills: versioned subdirectories <managedSkillsDir>/<slug>/<version>/SKILL.md
-	// Only include skills not already seen from higher-priority sources.
+	// Managed skills (versioned, DB-seeded) come before builtin so their workspace paths win.
 	if l.managedSkillsDir != "" {
 		for _, info := range l.listManagedSkills() {
 			if seen[info.Slug] {
@@ -163,6 +164,38 @@ func (l *Loader) ListSkills() []Info {
 			skills = append(skills, info)
 			seen[info.Slug] = true
 			l.cache[info.Slug] = &info
+		}
+	}
+
+	// Builtin (raw bundled files) — lowest priority fallback.
+	if l.builtinSkills != "" {
+		dirs, err := os.ReadDir(l.builtinSkills)
+		if err == nil {
+			for _, d := range dirs {
+				if !d.IsDir() || seen[d.Name()] {
+					continue
+				}
+				skillFile := filepath.Join(l.builtinSkills, d.Name(), "SKILL.md")
+				if _, err := os.Stat(skillFile); err != nil {
+					continue
+				}
+				info := Info{
+					Name:    d.Name(),
+					Slug:    d.Name(),
+					Path:    skillFile,
+					BaseDir: filepath.Join(l.builtinSkills, d.Name()),
+					Source:  "builtin",
+				}
+				if meta := parseMetadata(skillFile); meta != nil {
+					info.Description = meta.Description
+					if meta.Name != "" {
+						info.Name = meta.Name
+					}
+				}
+				skills = append(skills, info)
+				seen[d.Name()] = true
+				l.cache[d.Name()] = &info
+			}
 		}
 	}
 
@@ -245,9 +278,10 @@ func (l *Loader) findLatestVersion(slug string) (int, string) {
 
 // LoadSkill reads and returns the content of a skill by name (frontmatter stripped).
 // The {baseDir} placeholder in SKILL.md is replaced with the skill's absolute directory path.
-func (l *Loader) LoadSkill(name string) (string, bool) {
-	// Check standard (flat) skill directories first
-	for _, dir := range []string{l.workspaceSkills, l.projectAgentSkills, l.personalAgentSkills, l.globalSkills, l.builtinSkills} {
+// Priority: workspace > agents > global > managed > builtin
+func (l *Loader) LoadSkill(_ context.Context, name string) (string, bool) {
+	// Check flat skill directories (workspace, agents, global) first
+	for _, dir := range []string{l.workspaceSkills, l.projectAgentSkills, l.personalAgentSkills, l.globalSkills} {
 		if dir == "" {
 			continue
 		}
@@ -257,12 +291,11 @@ func (l *Loader) LoadSkill(name string) (string, bool) {
 			continue
 		}
 		content := stripFrontmatter(string(data))
-		baseDir := filepath.Join(dir, name)
-		content = strings.ReplaceAll(content, "{baseDir}", baseDir)
+		content = strings.ReplaceAll(content, "{baseDir}", filepath.Join(dir, name))
 		return content, true
 	}
 
-	// Check managed skills directory (versioned structure)
+	// Managed skills (DB-seeded, versioned) take priority over raw builtin files.
 	if l.managedSkillsDir != "" {
 		latestVer, latestDir := l.findLatestVersion(name)
 		if latestVer >= 0 {
@@ -276,17 +309,28 @@ func (l *Loader) LoadSkill(name string) (string, bool) {
 		}
 	}
 
+	// Builtin fallback (only if not in managed)
+	if l.builtinSkills != "" {
+		path := filepath.Join(l.builtinSkills, name, "SKILL.md")
+		data, err := os.ReadFile(path)
+		if err == nil {
+			content := stripFrontmatter(string(data))
+			content = strings.ReplaceAll(content, "{baseDir}", filepath.Join(l.builtinSkills, name))
+			return content, true
+		}
+	}
+
 	return "", false
 }
 
 // LoadForContext loads multiple skills and formats them for system prompt injection.
 // If allowList is nil, all skills are loaded. If non-nil, only listed skills are loaded.
-func (l *Loader) LoadForContext(allowList []string) string {
+func (l *Loader) LoadForContext(ctx context.Context, allowList []string) string {
 	var names []string
 
 	if allowList == nil {
 		// Load all available skills
-		for _, s := range l.ListSkills() {
+		for _, s := range l.ListSkills(ctx) {
 			names = append(names, s.Name)
 		}
 	} else {
@@ -299,7 +343,7 @@ func (l *Loader) LoadForContext(allowList []string) string {
 
 	var parts []string
 	for _, name := range names {
-		content, ok := l.LoadSkill(name)
+		content, ok := l.LoadSkill(ctx, name)
 		if !ok {
 			continue
 		}
@@ -316,8 +360,8 @@ func (l *Loader) LoadForContext(allowList []string) string {
 // BuildSummary returns an XML summary of skills for context injection.
 // If allowList is nil, all skills are included. If non-nil, only listed skills are included.
 // The format matches the TS <available_skills> XML used in system prompts.
-func (l *Loader) BuildSummary(allowList []string) string {
-	allSkills := l.ListSkills()
+func (l *Loader) BuildSummary(ctx context.Context, allowList []string) string {
+	allSkills := l.ListSkills(ctx)
 	if len(allSkills) == 0 {
 		return ""
 	}
@@ -380,8 +424,8 @@ func (l *Loader) Dirs() []string {
 
 // FilterSkills returns skills filtered by an allowlist.
 // If allowList is nil, all skills are returned. If empty slice, none are returned.
-func (l *Loader) FilterSkills(allowList []string) []Info {
-	all := l.ListSkills()
+func (l *Loader) FilterSkills(ctx context.Context, allowList []string) []Info {
+	all := l.ListSkills(ctx)
 	if allowList == nil {
 		return all
 	}
@@ -402,9 +446,9 @@ func (l *Loader) FilterSkills(allowList []string) []Info {
 }
 
 // GetSkill returns info about a specific skill.
-func (l *Loader) GetSkill(name string) (*Info, bool) {
+func (l *Loader) GetSkill(ctx context.Context, name string) (*Info, bool) {
 	// Ensure cache is populated
-	l.ListSkills()
+	l.ListSkills(ctx)
 
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -461,21 +505,76 @@ func stripFrontmatter(content string) string {
 	return frontmatterRe.ReplaceAllString(normalizeLineEndings(content), "")
 }
 
+// parseSimpleYAML parses a subset of YAML: simple key: value pairs,
+// multiline block scalars (| and >), and list values (- item).
 func parseSimpleYAML(content string) map[string]string {
 	result := make(map[string]string)
-	for line := range strings.SplitSeq(content, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+	lines := strings.Split(content, "\n")
+
+	var currentKey string
+	var blockLines []string
+	var inBlock bool
+
+	flushBlock := func() {
+		if currentKey != "" {
+			if len(blockLines) > 0 {
+				result[currentKey] = strings.Join(blockLines, " ")
+			} else {
+				// Empty value (e.g. "slug:" with no indented continuation).
+				result[currentKey] = ""
+			}
+		}
+		currentKey = ""
+		blockLines = nil
+		inBlock = false
+	}
+
+	for _, line := range lines {
+		// Indented continuation line (block scalar or list item)
+		if inBlock && len(line) > 0 && (line[0] == ' ' || line[0] == '\t') {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			// List item: "  - value"
+			if strings.HasPrefix(trimmed, "- ") {
+				blockLines = append(blockLines, strings.TrimSpace(trimmed[2:]))
+			} else if trimmed != "-" {
+				blockLines = append(blockLines, trimmed)
+			}
 			continue
 		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) == 2 {
-			key := strings.TrimSpace(parts[0])
-			val := strings.TrimSpace(parts[1])
-			val = strings.Trim(val, "\"'")
-			result[key] = val
+
+		// Not indented — flush any pending block and parse as top-level key
+		flushBlock()
+
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
 		}
+		parts := strings.SplitN(trimmed, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		val = strings.Trim(val, "\"'")
+
+		if val == "|" || val == ">" || val == "|-" || val == ">-" {
+			// Start of a multiline block — collect subsequent indented lines
+			currentKey = key
+			inBlock = true
+			continue
+		}
+		if val == "" {
+			// Could be start of a list block (e.g. "allowed-tools:\n  - Bash")
+			currentKey = key
+			inBlock = true
+			continue
+		}
+		result[key] = val
 	}
+	flushBlock()
 	return result
 }
 

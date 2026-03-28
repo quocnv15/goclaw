@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Save, ChevronDown, ChevronRight, AlertCircle } from "lucide-react";
+import { Save, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -25,13 +25,11 @@ export function AiDefaultsSection({ data, onSave, saving }: Props) {
   const { t } = useTranslation("config");
   const [draft, setDraft] = useState<AgentsData>(data ?? DEFAULT);
   const [dirty, setDirty] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
   const [openSubs, setOpenSubs] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     setDraft(data ?? DEFAULT);
     setDirty(false);
-    setSaveError(null);
   }, [data]);
 
   const defaults = draft.defaults ?? {};
@@ -86,7 +84,7 @@ export function AiDefaultsSection({ data, onSave, saving }: Props) {
           showVerify
         />
 
-        <div className="grid grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <div className="grid gap-1.5">
             <InfoLabel tip={t("agents.maxTokensTip")}>{t("agents.maxTokens")}</InfoLabel>
             <Input
@@ -128,20 +126,13 @@ export function AiDefaultsSection({ data, onSave, saving }: Props) {
           </div>
         </div>
 
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div className="grid gap-1.5">
             <InfoLabel tip={t("agents.workspaceTip")}>{t("agents.workspace")}</InfoLabel>
             <Input
               value={defaults.workspace ?? ""}
               onChange={(e) => updateDefaults({ workspace: e.target.value })}
               placeholder="~/.goclaw/workspace"
-            />
-          </div>
-          <div className="flex items-center justify-between">
-            <InfoLabel tip={t("agents.restrictToWorkspaceTip")}>{t("agents.restrictToWorkspace")}</InfoLabel>
-            <Switch
-              checked={defaults.restrict_to_workspace ?? false}
-              onCheckedChange={(v) => updateDefaults({ restrict_to_workspace: v })}
             />
           </div>
         </div>
@@ -153,7 +144,7 @@ export function AiDefaultsSection({ data, onSave, saving }: Props) {
           open={openSubs.has("subagents")}
           onToggle={() => toggleSub("subagents")}
         >
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Field label={t("agents.subagents.maxConcurrent")} tip={t("agents.subagents.maxConcurrentTip")} type="number" value={subagents.maxConcurrent} onChange={(v) => updateNested("subagents", { maxConcurrent: Number(v) })} placeholder="20" />
             <Field label={t("agents.subagents.maxSpawnDepth")} tip={t("agents.subagents.maxSpawnDepthTip")} type="number" value={subagents.maxSpawnDepth} onChange={(v) => updateNested("subagents", { maxSpawnDepth: Number(v) })} placeholder="1" />
             <Field label={t("agents.subagents.maxChildrenPerAgent")} tip={t("agents.subagents.maxChildrenPerAgentTip")} type="number" value={subagents.maxChildrenPerAgent} onChange={(v) => updateNested("subagents", { maxChildrenPerAgent: Number(v) })} placeholder="5" />
@@ -185,9 +176,13 @@ export function AiDefaultsSection({ data, onSave, saving }: Props) {
             modelPlaceholder="text-embedding-3-small"
             allowEmpty
           />
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Field label={t("agents.memory.maxResults")} tip={t("agents.memory.maxResultsTip")} type="number" value={memory.max_results} onChange={(v) => updateNested("memory", { max_results: Number(v) })} placeholder="6" />
             <Field label={t("agents.memory.minScore")} tip={t("agents.memory.minScoreTip")} type="number" step="0.01" value={memory.min_score} onChange={(v) => updateNested("memory", { min_score: Number(v) })} placeholder="0.35" />
+          </div>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <Field label={t("agents.memory.maxChunkLen")} tip={t("agents.memory.maxChunkLenTip")} type="number" value={memory.max_chunk_len} onChange={(v) => updateNested("memory", { max_chunk_len: Number(v) })} placeholder="1000" />
+            <Field label={t("agents.memory.chunkOverlap")} tip={t("agents.memory.chunkOverlapTip")} type="number" value={memory.chunk_overlap} onChange={(v) => updateNested("memory", { chunk_overlap: Number(v) })} placeholder="200" />
           </div>
         </SubSection>
 
@@ -197,7 +192,7 @@ export function AiDefaultsSection({ data, onSave, saving }: Props) {
           open={openSubs.has("compaction")}
           onToggle={() => toggleSub("compaction")}
         >
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Field label={t("agents.compaction.reserveTokensFloor")} tip={t("agents.compaction.reserveTokensFloorTip")} type="number" value={compaction.reserveTokensFloor} onChange={(v) => updateNested("compaction", { reserveTokensFloor: Number(v) })} placeholder="20000" />
             <Field label={t("agents.compaction.maxHistoryShare")} tip={t("agents.compaction.maxHistoryShareTip")} type="number" step="0.05" value={compaction.maxHistoryShare} onChange={(v) => updateNested("compaction", { maxHistoryShare: Number(v) })} placeholder="0.75" />
           </div>
@@ -209,7 +204,7 @@ export function AiDefaultsSection({ data, onSave, saving }: Props) {
           open={openSubs.has("pruning")}
           onToggle={() => toggleSub("pruning")}
         >
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div className="grid gap-1.5">
               <Label>{t("agents.pruning.mode")}</Label>
               <Select value={pruning.mode ?? "off"} onValueChange={(v) => updateNested("contextPruning", { mode: v })}>
@@ -230,7 +225,7 @@ export function AiDefaultsSection({ data, onSave, saving }: Props) {
           open={openSubs.has("sandbox")}
           onToggle={() => toggleSub("sandbox")}
         >
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div className="grid gap-1.5">
               <Label>{t("agents.sandbox.mode")}</Label>
               <Select value={sandbox.mode ?? "off"} onValueChange={(v) => updateNested("sandbox", { mode: v })}>
@@ -253,19 +248,13 @@ export function AiDefaultsSection({ data, onSave, saving }: Props) {
           </div>
         </SubSection>
 
-        {saveError && (
-          <div className="flex items-center gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-            <AlertCircle className="h-4 w-4 shrink-0" />
-            {saveError}
-          </div>
-        )}
         {dirty && (
           <div className="flex justify-end pt-2">
             <Button size="sm" onClick={async () => {
-              setSaveError(null);
-              try { await onSave(draft); } catch (err) { setSaveError(err instanceof Error ? err.message : t("agents.saveError")); }
+              try { await onSave(draft); } catch { /* toast shown by hook */ }
             }} disabled={saving} className="gap-1.5">
-              <Save className="h-3.5 w-3.5" /> {saving ? t("saving") : t("save")}
+              {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+              {saving ? t("saving") : t("save")}
             </Button>
           </div>
         )}

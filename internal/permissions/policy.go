@@ -23,6 +23,7 @@ import (
 type Role string
 
 const (
+	RoleOwner    Role = "owner"    // Tenant management + full access (superset of admin)
 	RoleAdmin    Role = "admin"    // Full access to all methods
 	RoleOperator Role = "operator" // Read + write access (no admin operations)
 	RoleViewer   Role = "viewer"   // Read-only access
@@ -37,7 +38,23 @@ const (
 	ScopeWrite     Scope = "operator.write"
 	ScopeApprovals Scope = "operator.approvals"
 	ScopePairing   Scope = "operator.pairing"
+	ScopeProvision Scope = "operator.provision"
 )
+
+// AllScopes is the set of all valid API key scopes.
+var AllScopes = map[Scope]bool{
+	ScopeAdmin:     true,
+	ScopeRead:      true,
+	ScopeWrite:     true,
+	ScopeApprovals: true,
+	ScopePairing:   true,
+	ScopeProvision: true,
+}
+
+// ValidScope reports whether s is a recognised API key scope.
+func ValidScope(s string) bool {
+	return AllScopes[Scope(s)]
+}
 
 // PolicyEngine evaluates user permissions for gateway method access.
 type PolicyEngine struct {
@@ -94,8 +111,9 @@ func RoleFromScopes(scopes []Scope) Role {
 	if slices.Contains(scopes, ScopeAdmin) {
 		return RoleAdmin
 	}
-	hasWrite := slices.Contains(scopes, ScopeWrite)
-	if hasWrite {
+	if slices.Contains(scopes, ScopeWrite) ||
+		slices.Contains(scopes, ScopeApprovals) ||
+		slices.Contains(scopes, ScopePairing) {
 		return RoleOperator
 	}
 	if slices.Contains(scopes, ScopeRead) {
@@ -156,6 +174,12 @@ func isAdminMethod(method string) bool {
 		protocol.MethodTeamsGet,
 		protocol.MethodTeamsDelete,
 		protocol.MethodTeamsTaskList,
+		protocol.MethodTeamsTaskGet,
+		protocol.MethodTeamsTaskComments,
+		protocol.MethodTeamsTaskEvents,
+		protocol.MethodAPIKeysList,
+		protocol.MethodAPIKeysCreate,
+		protocol.MethodAPIKeysRevoke,
 	}
 	return slices.Contains(adminMethods, method)
 }
@@ -177,6 +201,11 @@ func isWriteMethod(method string) bool {
 		"approvals.",
 		"exec.approval.",
 		protocol.MethodSend,
+		protocol.MethodTeamsTaskApprove,
+		protocol.MethodTeamsTaskReject,
+		protocol.MethodTeamsTaskComment,
+		protocol.MethodTeamsTaskCreate,
+		protocol.MethodTeamsTaskAssign,
 	}
 	for _, prefix := range writePrefixes {
 		if strings.HasPrefix(method, prefix) {
@@ -186,8 +215,15 @@ func isWriteMethod(method string) bool {
 	return false
 }
 
+// HasMinRole checks if the given role meets the minimum required level.
+func HasMinRole(role, required Role) bool {
+	return roleLevel(role) >= roleLevel(required)
+}
+
 func roleLevel(r Role) int {
 	switch r {
+	case RoleOwner:
+		return 4
 	case RoleAdmin:
 		return 3
 	case RoleOperator:

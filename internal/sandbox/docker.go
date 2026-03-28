@@ -81,14 +81,15 @@ func newDockerSandbox(ctx context.Context, name string, cfg Config, workspace st
 		args = append(args, "--network", "none")
 	}
 
-	// Workspace mount
+	// Workspace mount — resolve host path for DooD (Docker-out-of-Docker) setups.
 	containerWorkdir := cfg.ContainerWorkdir()
 	if workspace != "" && cfg.WorkspaceAccess != AccessNone {
 		mountOpt := "rw"
 		if cfg.WorkspaceAccess == AccessRO {
 			mountOpt = "ro"
 		}
-		args = append(args, "-v", fmt.Sprintf("%s:%s:%s", workspace, containerWorkdir, mountOpt))
+		hostPath := resolveHostWorkspacePath(ctx, workspace)
+		args = append(args, "-v", fmt.Sprintf("%s:%s:%s", hostPath, containerWorkdir, mountOpt))
 	}
 	args = append(args, "-w", containerWorkdir)
 
@@ -139,7 +140,8 @@ func newDockerSandbox(ctx context.Context, name string, cfg Config, workspace st
 }
 
 // Exec runs a command inside the container.
-func (s *DockerSandbox) Exec(ctx context.Context, command []string, workDir string) (*ExecResult, error) {
+// Optional ExecOption (e.g. WithEnv) injects per-call env vars via docker exec -e.
+func (s *DockerSandbox) Exec(ctx context.Context, command []string, workDir string, opts ...ExecOption) (*ExecResult, error) {
 	s.mu.Lock()
 	s.lastUsed = time.Now()
 	s.mu.Unlock()
@@ -152,7 +154,13 @@ func (s *DockerSandbox) Exec(ctx context.Context, command []string, workDir stri
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	o := ApplyExecOpts(opts)
+
 	args := []string{"exec"}
+	// Inject env vars as -e flags before containerID (credentialed exec)
+	for k, v := range o.Env {
+		args = append(args, "-e", k+"="+v)
+	}
 	if workDir != "" {
 		args = append(args, "-w", workDir)
 	}
@@ -230,8 +238,13 @@ func NewDockerManager(cfg Config) *DockerManager {
 }
 
 // Get returns an existing sandbox or creates a new one for the given key.
-func (m *DockerManager) Get(ctx context.Context, key string, workspace string) (Sandbox, error) {
-	if m.config.Mode == ModeOff {
+// If cfgOverride is non-nil, it is used for new containers instead of the global config.
+func (m *DockerManager) Get(ctx context.Context, key string, workspace string, cfgOverride *Config) (Sandbox, error) {
+	cfg := m.config
+	if cfgOverride != nil {
+		cfg = *cfgOverride
+	}
+	if cfg.Mode == ModeOff {
 		return nil, ErrSandboxDisabled
 	}
 
@@ -250,12 +263,12 @@ func (m *DockerManager) Get(ctx context.Context, key string, workspace string) (
 		return sb, nil
 	}
 
-	prefix := m.config.ContainerPrefix
+	prefix := cfg.ContainerPrefix
 	if prefix == "" {
 		prefix = "goclaw-sbx-"
 	}
 	name := prefix + sanitizeKey(key)
-	sb, err := newDockerSandbox(ctx, name, m.config, workspace)
+	sb, err := newDockerSandbox(ctx, name, cfg, workspace)
 	if err != nil {
 		return nil, err
 	}

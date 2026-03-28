@@ -26,7 +26,6 @@
     "knowledgeGraph": "Knowledge Graph",
     "traces": "Theo dõi",
     "realtimeEvents": "Sự kiện thời gian thực",
-    "delegations": "Ủy quyền",
     "usage": "Sử dụng",
     "logs": "Nhật ký",
     "storage": "Lưu trữ",
@@ -34,6 +33,12 @@
     "config": "Cấu hình",
     "approvals": "Phê duyệt",
     "nodes": "Nodes",
-    "tts": "TTS"
+    "tts": "TTS",
+    "activity": "Hoạt động",
+    "cliCredentials": "Xác thực CLI",
+    "apiKeys": "API Keys",
+    "apiDocs": "Tài liệu API",
+    "packages": "Gói phần mềm",
+    "tenants": "Tổ chức"
   }
 }

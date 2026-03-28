@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -30,7 +31,7 @@ func skillsListCmd() *cobra.Command {
 		Short: "List all available skills",
 		Run: func(cmd *cobra.Command, args []string) {
 			loader := loadSkillsLoader()
-			allSkills := loader.ListSkills()
+			allSkills := loader.ListSkills(context.Background())
 
 			if jsonOutput {
 				data, _ := json.MarshalIndent(allSkills, "", "  ")
@@ -66,7 +67,7 @@ func skillsShowCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			loader := loadSkillsLoader()
-			info, ok := loader.GetSkill(args[0])
+			info, ok := loader.GetSkill(context.Background(), args[0])
 			if !ok {
 				fmt.Fprintf(os.Stderr, "Skill not found: %s\n", args[0])
 				os.Exit(1)
@@ -77,7 +78,7 @@ func skillsShowCmd() *cobra.Command {
 			fmt.Printf("Location:    %s\n", info.Path)
 			fmt.Println()
 
-			content, ok := loader.LoadSkill(args[0])
+			content, ok := loader.LoadSkill(context.Background(), args[0])
 			if ok {
 				fmt.Println("--- Content ---")
 				fmt.Println(content)
@@ -90,6 +91,13 @@ func loadSkillsLoader() *skills.Loader {
 	cfgPath := resolveConfigPath()
 	cfg, _ := config.Load(cfgPath)
 	workspace := config.ExpandHome(cfg.Agents.Defaults.Workspace)
-	globalSkillsDir := filepath.Join(config.ExpandHome("~/.goclaw"), "skills")
-	return skills.NewLoader(workspace, globalSkillsDir, "")
+	globalSkillsDir := os.Getenv("GOCLAW_SKILLS_DIR")
+	if globalSkillsDir == "" {
+		globalSkillsDir = filepath.Join(cfg.ResolvedDataDir(), "skills")
+	}
+	builtinSkillsDir := os.Getenv("GOCLAW_BUILTIN_SKILLS_DIR")
+	if builtinSkillsDir == "" {
+		builtinSkillsDir = "/app/bundled-skills"
+	}
+	return skills.NewLoader(workspace, globalSkillsDir, builtinSkillsDir)
 }

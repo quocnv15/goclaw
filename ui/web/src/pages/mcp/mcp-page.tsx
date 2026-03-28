@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
-import { Plug, Plus, RefreshCw, Pencil, Trash2, Users, Wrench } from "lucide-react";
+import { Plug, Plus, RefreshCw, Pencil, Trash2, Users, Wrench, KeyRound } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { PageHeader } from "@/components/shared/page-header";
@@ -13,6 +13,7 @@ import { useMCP, type MCPServerData, type MCPServerInput } from "./hooks/use-mcp
 import { MCPFormDialog } from "./mcp-form-dialog";
 import { MCPGrantsDialog } from "./mcp-grants-dialog";
 import { MCPToolsDialog } from "./mcp-tools-dialog";
+import { MCPUserCredentialsDialog } from "./mcp-user-credentials-dialog";
 import { useMinLoading } from "@/hooks/use-min-loading";
 import { useDeferredLoading } from "@/hooks/use-deferred-loading";
 import { usePagination } from "@/hooks/use-pagination";
@@ -26,7 +27,7 @@ const transportBadge: Record<string, string> = {
 export function MCPPage() {
   const { t } = useTranslation("mcp");
   const { t: tc } = useTranslation("common");
-  const { servers, loading, refresh, createServer, updateServer, deleteServer, grantAgent, revokeAgent, listAgentGrants, testConnection, listServerTools } = useMCP();
+  const { servers, loading, refresh, createServer, updateServer, deleteServer, grantAgent, revokeAgent, listAgentGrants, testConnection, listServerTools, getUserCredentials, setUserCredentials, deleteUserCredentials } = useMCP();
   const spinning = useMinLoading(loading);
   const showSkeleton = useDeferredLoading(loading && servers.length === 0);
   const [search, setSearch] = useState("");
@@ -36,6 +37,7 @@ export function MCPPage() {
   const [toolsServer, setToolsServer] = useState<MCPServerData | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<MCPServerData | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
+  const [credentialsServer, setCredentialsServer] = useState<MCPServerData | null>(null);
 
   const filtered = servers.filter(
     (s) =>
@@ -68,7 +70,7 @@ export function MCPPage() {
   };
 
   return (
-    <div className="p-4 sm:p-6">
+    <div className="p-4 sm:p-6 pb-10">
       <PageHeader
         title={t("title")}
         description={t("description")}
@@ -103,13 +105,14 @@ export function MCPPage() {
             description={search ? t("noMatchDescription") : t("emptyDescription")}
           />
         ) : (
-          <div className="rounded-md border">
-            <table className="w-full text-sm">
+          <div className="overflow-x-auto rounded-md border">
+            <table className="w-full min-w-[600px] text-sm">
               <thead>
                 <tr className="border-b bg-muted/50">
                   <th className="px-4 py-3 text-left font-medium">{t("columns.name")}</th>
                   <th className="px-4 py-3 text-left font-medium">{t("columns.transport")}</th>
                   <th className="px-4 py-3 text-center font-medium">{t("columns.tools")}</th>
+                  <th className="px-4 py-3 text-center font-medium">{t("columns.agents")}</th>
                   <th className="px-4 py-3 text-left font-medium">{t("columns.enabled")}</th>
                   <th className="px-4 py-3 text-left font-medium">{t("columns.createdBy")}</th>
                   <th className="px-4 py-3 text-right font-medium">{t("columns.actions")}</th>
@@ -149,6 +152,9 @@ export function MCPPage() {
                         <Wrench className="h-3.5 w-3.5" />
                       </Button>
                     </td>
+                    <td className="px-4 py-3 text-center text-muted-foreground">
+                      {srv.agent_count ?? 0}
+                    </td>
                     <td className="px-4 py-3">
                       <Badge variant={srv.enabled ? "default" : "secondary"}>
                         {srv.enabled ? tc("yes") : tc("no")}
@@ -165,6 +171,14 @@ export function MCPPage() {
                           title={t("manageGrants")}
                         >
                           <Users className="h-3.5 w-3.5" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setCredentialsServer(srv)}
+                          title={t("userCredentials.title")}
+                        >
+                          <KeyRound className="h-3.5 w-3.5" />
                         </Button>
                         <Button
                           variant="ghost"
@@ -239,6 +253,17 @@ export function MCPPage() {
         onConfirm={handleDelete}
         loading={deleteLoading}
       />
+
+      {credentialsServer && (
+        <MCPUserCredentialsDialog
+          open={!!credentialsServer}
+          onOpenChange={(open) => !open && setCredentialsServer(null)}
+          server={credentialsServer}
+          onGetCredentials={getUserCredentials}
+          onSetCredentials={setUserCredentials}
+          onDeleteCredentials={deleteUserCredentials}
+        />
+      )}
     </div>
   );
 }

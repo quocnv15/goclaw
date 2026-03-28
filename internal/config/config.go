@@ -40,6 +40,7 @@ func (f *FlexibleStringSlice) UnmarshalJSON(data []byte) error {
 
 // Config is the root configuration for the GoClaw Gateway.
 type Config struct {
+	DataDir   string          `json:"data_dir,omitempty"` // persistent data directory (default: ~/.goclaw/data)
 	Agents    AgentsConfig    `json:"agents"`
 	Channels  ChannelsConfig  `json:"channels"`
 	Providers ProvidersConfig `json:"providers"`
@@ -65,16 +66,18 @@ type TailscaleConfig struct {
 	EnableTLS bool   `json:"enable_tls,omitempty"` // use ListenTLS for auto HTTPS certs
 }
 
-// DatabaseConfig configures the PostgreSQL connection and optional Redis cache.
+// DatabaseConfig configures the database connection and optional Redis cache.
 // DSN fields are NEVER read from config.json (secrets) — only from env vars.
 type DatabaseConfig struct {
-	PostgresDSN string `json:"-"` // from env GOCLAW_POSTGRES_DSN only
-	RedisDSN    string `json:"-"` // from env GOCLAW_REDIS_DSN only (optional, requires -tags redis)
+	PostgresDSN    string `json:"-"` // from env GOCLAW_POSTGRES_DSN only
+	RedisDSN       string `json:"-"` // from env GOCLAW_REDIS_DSN only (optional, requires -tags redis)
+	StorageBackend string `json:"-"` // from env GOCLAW_STORAGE_BACKEND only ("postgres" or "sqlite", default "postgres")
+	SQLitePath     string `json:"-"` // from env GOCLAW_SQLITE_PATH only (default: {dataDir}/goclaw.db)
 }
 
 // SkillsConfig configures the skills storage system.
 type SkillsConfig struct {
-	StorageDir string `json:"storage_dir,omitempty"` // directory for skill content (default: ~/.goclaw/skills-store/)
+	StorageDir string `json:"storage_dir,omitempty"` // directory for skill content (default: dataDir/skills-store/)
 }
 
 // AgentBinding maps a channel/peer pattern to a specific agent.
@@ -124,10 +127,6 @@ type AgentDefaults struct {
 	// Bootstrap context truncation limits (matching TS bootstrapMaxChars / bootstrapTotalMaxChars)
 	BootstrapMaxChars      int `json:"bootstrapMaxChars,omitempty"`      // per-file max before truncation (default 20000)
 	BootstrapTotalMaxChars int `json:"bootstrapTotalMaxChars,omitempty"` // total budget across all files (default 24000)
-	// IntentClassify enables LLM-based intent classification for messages sent while agent is busy.
-	// When enabled, status queries ("what are you doing?") get immediate replies instead of queueing.
-	// Default: true (nil = true).
-	IntentClassify *bool `json:"intent_classify,omitempty"`
 }
 
 // CompactionConfig configures session compaction behaviour.
@@ -135,7 +134,7 @@ type AgentDefaults struct {
 type CompactionConfig struct {
 	ReserveTokensFloor int                `json:"reserveTokensFloor,omitempty"` // min reserve tokens (default 20000)
 	MaxHistoryShare    float64            `json:"maxHistoryShare,omitempty"`    // max share of context for history (default 0.75)
-	MinMessages        int                `json:"minMessages,omitempty"`        // min messages before compaction triggers (default 50)
+	MinMessages        int                `json:"minMessages,omitempty"`        // min messages before compaction triggers (default 200)
 	KeepLastMessages   int                `json:"keepLastMessages,omitempty"`   // messages to keep after compaction (default 4)
 	MemoryFlush        *MemoryFlushConfig `json:"memoryFlush,omitempty"`        // pre-compaction flush
 }
@@ -184,6 +183,7 @@ type MemoryConfig struct {
 	EmbeddingAPIBase  string  `json:"embedding_api_base,omitempty"` // custom endpoint URL
 	MaxResults        int     `json:"max_results,omitempty"`        // default 6
 	MaxChunkLen       int     `json:"max_chunk_len,omitempty"`      // default 1000
+	ChunkOverlap      int     `json:"chunk_overlap,omitempty"`      // overlap chars between chunks (default 200)
 	VectorWeight      float64 `json:"vector_weight,omitempty"`      // hybrid search vector weight (default 0.7)
 	TextWeight        float64 `json:"text_weight,omitempty"`        // hybrid search FTS weight (default 0.3)
 	MinScore          float64 `json:"min_score,omitempty"`          // minimum relevance score (default 0.35)
@@ -296,16 +296,25 @@ func (sc *SandboxConfig) ToSandboxConfig() sandbox.Config {
 	return cfg
 }
 
+// ModelPricing defines per-million-token pricing for a model.
+type ModelPricing struct {
+	InputPerMillion       float64 `json:"input_per_million"`
+	OutputPerMillion      float64 `json:"output_per_million"`
+	CacheReadPerMillion   float64 `json:"cache_read_per_million,omitempty"`
+	CacheCreatePerMillion float64 `json:"cache_create_per_million,omitempty"`
+}
+
 // TelemetryConfig configures OpenTelemetry export for traces and spans.
 // When enabled, spans are exported to an OTLP-compatible backend (Jaeger, Tempo, Datadog, etc.)
 // in addition to PostgreSQL storage.
 type TelemetryConfig struct {
-	Enabled     bool              `json:"enabled,omitempty"`      // enable OTLP export (default false)
-	Endpoint    string            `json:"endpoint,omitempty"`     // OTLP endpoint (e.g. "localhost:4317", "https://otel.example.com:4318")
-	Protocol    string            `json:"protocol,omitempty"`     // "grpc" (default) or "http"
-	Insecure    bool              `json:"insecure,omitempty"`     // skip TLS verification (default false, set true for local dev)
-	ServiceName string            `json:"service_name,omitempty"` // OTEL service name (default "goclaw-gateway")
-	Headers     map[string]string `json:"headers,omitempty"`      // extra headers (e.g. auth tokens for cloud backends)
+	Enabled      bool                       `json:"enabled,omitempty"`       // enable OTLP export (default false)
+	Endpoint     string                     `json:"endpoint,omitempty"`      // OTLP endpoint (e.g. "localhost:4317", "https://otel.example.com:4318")
+	Protocol     string                     `json:"protocol,omitempty"`      // "grpc" (default) or "http"
+	Insecure     bool                       `json:"insecure,omitempty"`      // skip TLS verification (default false, set true for local dev)
+	ServiceName  string                     `json:"service_name,omitempty"`  // OTEL service name (default "goclaw-gateway")
+	Headers      map[string]string          `json:"headers,omitempty"`       // extra headers (e.g. auth tokens for cloud backends)
+	ModelPricing map[string]*ModelPricing    `json:"model_pricing,omitempty"` // cost per model, key = "provider/model" or just "model"
 }
 
 // CronConfig configures the cron job system.
@@ -369,6 +378,7 @@ type AgentSpec struct {
 func (c *Config) ReplaceFrom(src *Config) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.DataDir = src.DataDir
 	c.Agents = src.Agents
 	c.Channels = src.Channels
 	c.Providers = src.Providers

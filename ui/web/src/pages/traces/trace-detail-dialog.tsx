@@ -7,13 +7,19 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
-import { ChevronRight, ChevronDown, Copy, Check } from "lucide-react";
+import { ChevronRight, ChevronDown, Copy, Check, Download, CircleCheck, CircleX, Loader, CircleMinus, Square } from "lucide-react";
 import { useClipboard } from "@/hooks/use-clipboard";
+import { useHttp } from "@/hooks/use-ws";
 import { useWsEvent } from "@/hooks/use-ws-event";
 import { Events } from "@/api/protocol";
+import hljs from "highlight.js/lib/core";
+import json from "highlight.js/lib/languages/json";
 import { formatDate, formatDuration, formatTokens, computeDurationMs } from "@/lib/format";
+import { useUiStore } from "@/stores/use-ui-store";
 import type { TraceData, SpanData } from "./hooks/use-traces";
 import type { AgentEventPayload } from "@/types/chat";
+
+hljs.registerLanguage("json", json);
 
 interface SpanNode {
   span: SpanData;
@@ -47,14 +53,35 @@ interface TraceDetailDialogProps {
   onClose: () => void;
   getTrace: (id: string) => Promise<{ trace: TraceData; spans: SpanData[] } | null>;
   onNavigateTrace?: (traceId: string) => void;
+  onAbortRun?: (trace: TraceData, e: React.MouseEvent) => void;
 }
 
-export function TraceDetailDialog({ traceId, onClose, getTrace, onNavigateTrace }: TraceDetailDialogProps) {
+export function TraceDetailDialog({ traceId, onClose, getTrace, onNavigateTrace, onAbortRun }: TraceDetailDialogProps) {
   const { t } = useTranslation("traces");
+  const tz = useUiStore((s) => s.timezone);
+  const http = useHttp();
   const [trace, setTrace] = useState<TraceData | null>(null);
   const [spans, setSpans] = useState<SpanData[]>([]);
   const [loading, setLoading] = useState(true);
+  const [exporting, setExporting] = useState(false);
   const { copied, copy } = useClipboard();
+
+  const handleExport = useCallback(async () => {
+    setExporting(true);
+    try {
+      const blob = await http.downloadBlob(`/v1/traces/${traceId}/export`);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `trace-${traceId.slice(0, 8)}.json.gz`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      // silently fail — user sees no download
+    } finally {
+      setExporting(false);
+    }
+  }, [http, traceId]);
 
   const fetchTrace = useCallback(() => {
     getTrace(traceId).then((result) => {
@@ -109,21 +136,45 @@ export function TraceDetailDialog({ traceId, onClose, getTrace, onNavigateTrace 
 
   return (
     <Dialog open onOpenChange={() => onClose()}>
-      <DialogContent className="max-h-[85vh] w-[95vw] overflow-y-auto sm:max-w-6xl">
+      <DialogContent className="max-h-[85vh] w-[95vw] flex flex-col sm:max-w-6xl">
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
+          <DialogTitle className="flex items-center gap-2 pr-8">
             {t("detail.title")}
             <button
               type="button"
               onClick={() => copy(traceId)}
-              className="rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-              title={t("detail.copyTraceId")}
+              className="ml-auto flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
             >
               {copied ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className="h-3.5 w-3.5" />}
+              {t("detail.copyTraceId")}
             </button>
+            <button
+              type="button"
+              onClick={handleExport}
+              disabled={exporting || !trace}
+              className="flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
+            >
+              {exporting ? (
+                <div className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-muted-foreground border-t-transparent" />
+              ) : (
+                <Download className="h-3.5 w-3.5" />
+              )}
+              {t("detail.export")}
+            </button>
+            {trace && (trace.status === "running") && onAbortRun && (
+              <button
+                type="button"
+                onClick={(e) => onAbortRun(trace, e)}
+                className="flex cursor-pointer items-center gap-1 rounded-md bg-destructive px-2 py-1 text-xs text-destructive-foreground transition-colors hover:bg-destructive/90"
+              >
+                <Square className="h-3.5 w-3.5" />
+                {t("detail.stopRun")}
+              </button>
+            )}
           </DialogTitle>
         </DialogHeader>
 
+        <div className="overflow-y-auto min-h-0 -mx-4 px-4 sm:-mx-6 sm:px-6">
         {loading && !trace ? (
           <div className="flex items-center justify-center py-12">
             <div className="h-6 w-6 animate-spin rounded-full border-2 border-muted-foreground border-t-transparent" />
@@ -167,7 +218,11 @@ export function TraceDetailDialog({ traceId, onClose, getTrace, onNavigateTrace 
               </div>
               <div>
                 <span className="text-muted-foreground">{t("detail.started")}</span>{" "}
-                {formatDate(trace.start_time)}
+                {formatDate(trace.start_time, tz)}
+              </div>
+              <div>
+                <span className="text-muted-foreground">{t("detail.createdAt")}</span>{" "}
+                {formatDate(trace.created_at, tz)}
               </div>
               {trace.parent_trace_id && (
                 <div>
@@ -184,17 +239,11 @@ export function TraceDetailDialog({ traceId, onClose, getTrace, onNavigateTrace 
             </div>
 
             {trace.input_preview && (
-              <div className="rounded-md border p-3">
-                <p className="mb-1 text-xs font-medium text-muted-foreground">{t("detail.input")}</p>
-                <pre className="max-h-[20vh] overflow-y-auto whitespace-pre-wrap break-all text-sm">{trace.input_preview}</pre>
-              </div>
+              <PreviewBlock label={t("detail.input")} content={trace.input_preview} />
             )}
 
             {trace.output_preview && (
-              <div className="rounded-md border p-3">
-                <p className="mb-1 text-xs font-medium text-muted-foreground">{t("detail.output")}</p>
-                <pre className="max-h-[20vh] overflow-y-auto whitespace-pre-wrap break-all text-sm">{trace.output_preview}</pre>
-              </div>
+              <PreviewBlock label={t("detail.output")} content={trace.output_preview} />
             )}
 
             {trace.error && (
@@ -216,6 +265,7 @@ export function TraceDetailDialog({ traceId, onClose, getTrace, onNavigateTrace 
             )}
           </div>
         )}
+        </div>
       </DialogContent>
     </Dialog>
   );
@@ -223,6 +273,7 @@ export function TraceDetailDialog({ traceId, onClose, getTrace, onNavigateTrace 
 
 function SpanTreeNode({ node, depth }: { node: SpanNode; depth: number }) {
   const { t } = useTranslation("traces");
+  const tz = useUiStore((s) => s.timezone);
   const [expanded, setExpanded] = useState(depth === 0);
   const [detailOpen, setDetailOpen] = useState(false);
   const { span, children } = node;
@@ -273,15 +324,20 @@ function SpanTreeNode({ node, depth }: { node: SpanNode; depth: number }) {
                   </span>
                 )}
                 {(span.metadata?.thinking_tokens ?? 0) > 0 && (
-                  <span className="ml-1 text-purple-400">
+                  <span className="ml-1 text-orange-400">
                     ({formatTokens(span.metadata!.thinking_tokens!)} {t("span.thinking")})
                   </span>
                 )}
               </span>
             )}
-            <span className="shrink-0 text-xs text-muted-foreground">
+            {span.created_at && (
+              <Badge variant="outline" className="hidden shrink-0 text-xs text-muted-foreground lg:inline-flex">
+                {formatDate(span.created_at, tz)}
+              </Badge>
+            )}
+            <Badge variant="outline" className="shrink-0 text-xs text-muted-foreground">
               {formatDuration(span.duration_ms || computeDurationMs(span.start_time, span.end_time))}
-            </span>
+            </Badge>
             <StatusBadge status={span.status} />
           </button>
         </div>
@@ -289,11 +345,23 @@ function SpanTreeNode({ node, depth }: { node: SpanNode; depth: number }) {
         {/* Expanded detail panel */}
         {detailOpen && (
           <div className="max-h-[50vh] space-y-2 overflow-y-auto border-t px-3 py-2">
-            {span.model && (
-              <div className="text-xs">
-                <span className="text-muted-foreground">{t("span.model")}</span> {span.provider}/{span.model}
-              </div>
-            )}
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
+              {span.start_time && (
+                <div>
+                  <span className="text-muted-foreground">{t("span.startTime")}</span> {formatDate(span.start_time, tz)}
+                </div>
+              )}
+              {span.end_time && (
+                <div>
+                  <span className="text-muted-foreground">{t("span.endTime")}</span> {formatDate(span.end_time, tz)}
+                </div>
+              )}
+              {span.model && (
+                <div>
+                  <span className="text-muted-foreground">{t("span.model")}</span> {span.provider}/{span.model}
+                </div>
+              )}
+            </div>
             {(span.input_tokens > 0 || span.output_tokens > 0) && (
               <div className="text-xs">
                 <span className="text-muted-foreground">{t("span.tokens")}</span>{" "}
@@ -312,26 +380,16 @@ function SpanTreeNode({ node, depth }: { node: SpanNode; depth: number }) {
                 )}
                 {(span.metadata?.thinking_tokens ?? 0) > 0 && (
                   <span className="ml-2 text-muted-foreground">
-                    (<span className="text-purple-400">{formatTokens(span.metadata!.thinking_tokens!)} {t("span.thinking")}</span>)
+                    (<span className="text-orange-400">{formatTokens(span.metadata!.thinking_tokens!)} {t("span.thinking")}</span>)
                   </span>
                 )}
               </div>
             )}
             {span.input_preview && (
-              <div>
-                <p className="text-xs text-muted-foreground">{t("span.input")}</p>
-                <pre className="mt-1 max-h-[20vh] overflow-y-auto break-all whitespace-pre-wrap rounded bg-muted/50 p-2 text-xs">
-                  {span.input_preview}
-                </pre>
-              </div>
+              <PreviewBlock label={t("span.input")} content={span.input_preview} />
             )}
             {span.output_preview && (
-              <div>
-                <p className="text-xs text-muted-foreground">{t("span.output")}</p>
-                <pre className="mt-1 max-h-[20vh] overflow-y-auto break-all whitespace-pre-wrap rounded bg-muted/50 p-2 text-xs">
-                  {span.output_preview}
-                </pre>
-              </div>
+              <PreviewBlock label={t("span.output")} content={span.output_preview} />
             )}
             {span.error && (
               <p className="break-all text-xs text-red-300">{span.error}</p>
@@ -348,15 +406,64 @@ function SpanTreeNode({ node, depth }: { node: SpanNode; depth: number }) {
   );
 }
 
-function StatusBadge({ status }: { status: string }) {
-  const variant =
-    status === "ok" || status === "success" || status === "completed"
-      ? "success"
-      : status === "error" || status === "failed"
-        ? "destructive"
-        : status === "running" || status === "pending"
-          ? "info"
-          : "secondary";
+/** Try to pretty-print JSON; returns { text, isJson }. */
+function formatPreview(text: string): { text: string; isJson: boolean } {
+  const trimmed = text.trim();
+  if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+    try {
+      const pretty = JSON.stringify(JSON.parse(trimmed), null, 2);
+      return { text: pretty, isJson: true };
+    } catch {
+      // not valid JSON
+    }
+  }
+  return { text, isJson: false };
+}
 
-  return <Badge variant={variant} className="text-xs">{status || "unknown"}</Badge>;
+function PreviewBlock({ label, content }: { label: string; content: string }) {
+  const { t } = useTranslation("traces");
+  const { copied, copy } = useClipboard();
+  const { text: formatted, isJson } = useMemo(() => formatPreview(content), [content]);
+  const highlightedHtml = useMemo(() => {
+    if (!isJson) return null;
+    return hljs.highlight(formatted, { language: "json" }).value;
+  }, [formatted, isJson]);
+
+  return (
+    <div className="relative rounded-md border p-3">
+      <p className="mb-1 text-xs font-medium text-muted-foreground">{label}</p>
+      <button
+        type="button"
+        onClick={() => copy(content)}
+        className="absolute right-2 top-2 flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+      >
+        {copied ? <Check className="h-3 w-3 text-green-500" /> : <Copy className="h-3 w-3" />}
+        {t("detail.copy")}
+      </button>
+      {highlightedHtml ? (
+        <pre
+          className="hljs mt-1 max-h-[20vh] overflow-y-auto whitespace-pre-wrap break-all text-xs sm:max-h-[40vh]"
+          dangerouslySetInnerHTML={{ __html: highlightedHtml }}
+        />
+      ) : (
+        <pre className="mt-1 max-h-[20vh] overflow-y-auto whitespace-pre-wrap break-all text-xs sm:max-h-[40vh]">{formatted}</pre>
+      )}
+    </div>
+  );
+}
+
+function StatusBadge({ status }: { status: string }) {
+  const isOk = status === "ok" || status === "success" || status === "completed";
+  const isError = status === "error" || status === "failed";
+  const isRunning = status === "running" || status === "pending";
+
+  const variant = isOk ? "success" : isError ? "destructive" : isRunning ? "info" : "secondary";
+  const Icon = isOk ? CircleCheck : isError ? CircleX : isRunning ? Loader : CircleMinus;
+
+  return (
+    <Badge variant={variant} className="text-xs">
+      <Icon className={"h-3 w-3 sm:hidden" + (isRunning ? " animate-spin" : "")} />
+      <span className="hidden sm:inline">{status || "unknown"}</span>
+    </Badge>
+  );
 }

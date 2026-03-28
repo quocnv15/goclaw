@@ -20,10 +20,16 @@ func GenNewID() uuid.UUID {
 
 // StoreConfig configures the store layer.
 type StoreConfig struct {
-	// PostgresDSN is the Postgres connection string (required).
+	// PostgresDSN is the Postgres connection string (required for postgres backend).
 	PostgresDSN string
 
-	// SkillsStorageDir is the directory for skill file content (default: ~/.goclaw/skills-store/).
+	// SQLitePath is the path to the SQLite database file (required for sqlite backend).
+	SQLitePath string
+
+	// StorageBackend selects the database backend: "postgres" (default) or "sqlite".
+	StorageBackend string
+
+	// SkillsStorageDir is the directory for skill file content (default: dataDir/skills-store/).
 	SkillsStorageDir string
 
 	// Workspace is the default agent workspace path.

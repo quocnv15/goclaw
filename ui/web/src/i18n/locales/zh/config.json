@@ -36,7 +36,7 @@
   "gateway.allowedOriginsTip": "HTTP API 的 CORS 允许来源。使用 * 允许所有来源。",
   "gateway.allowedOriginsPlaceholder": "https://yourdomain.com",
   "gateway.toolStatus": "工具状态消息",
-  "gateway.blockReply": "阻塞回复",
+  "gateway.blockReply": "中间回复",
   "gateway.maxMessageChars": "最大消息字符数",
   "gateway.maxMessageCharsTip": "每条入站消息允许的最大字符数，超出限制的消息将被拒绝。",
   "gateway.rateLimitRpm": "速率限制（RPM）",
@@ -87,6 +87,10 @@
   "agents.memory.embeddingModelTip": "嵌入模型名称。留空则使用提供商默认值。",
   "agents.memory.maxResults": "最大结果数",
   "agents.memory.maxResultsTip": "每次召回查询返回的最大记忆条目数。",
+  "agents.memory.maxChunkLen": "最大块长度",
+  "agents.memory.maxChunkLenTip": "每个记忆块分割前的最大字符数。",
+  "agents.memory.chunkOverlap": "块重叠",
+  "agents.memory.chunkOverlapTip": "连续块之间的重叠字符数，用于保持上下文连续性。",
   "agents.memory.minScore": "最低分数",
   "agents.memory.minScoreTip": "记忆条目被纳入结果的最低相似度分数（0-1）。",
 
@@ -120,8 +124,8 @@
   "behavior.uxDescription": "影响网关与用户交互方式的高影响开关",
   "behavior.toolStatusHint": "在 Agent 运行期间向用户显示实时工具执行状态消息。",
   "behavior.toolStatusInfo": "当 Agent 读取文件、运行命令和调用 API 时，用户将看到实时更新。",
-  "behavior.blockReplyHint": "在发送中间状态更新之前等待 Agent 完成。",
-  "behavior.blockReplyInfo": "仅发送最终响应，中间工具状态消息被抑制。",
+  "behavior.blockReplyHint": "在工具调用过程中向频道发送部分助手文本。",
+  "behavior.blockReplyInfo": "工具执行期间向用户发送中间文本，而非仅发送最终响应。",
   "behavior.intentClassifyHint": "在路由之前对用户意图进行分类，以减少不必要的 Agent 调用。",
   "behavior.intentClassifyInfo": "仅当分类器检测到可执行意图时才调用 Agent。",
   "behavior.pendingCompactionTitle": "待处理消息压缩",
@@ -282,7 +286,26 @@
   "channels.allowFrom": "允许来自",
   "channels.allowFromPlaceholder": "user_id_1, user_id_2, ...",
   "channels.dmStreaming": "私信流式传输",
+  "channels.dmStreamingHint": "私聊中逐步更新消息",
   "channels.groupStreaming": "群组流式传输",
+  "channels.groupStreamingHint": "群聊中逐步更新消息",
+  "channels.streaming": "流式传输",
+  "channels.draftTransport": "草稿预览",
+  "channels.draftTransportHint": "私聊中静默流式预览（每次编辑无通知）",
+  "channels.reasoningStream": "显示推理",
+  "channels.reasoningStreamHint": "将AI思考过程显示为单独的消息",
   "channels.reactionLevel": "反应级别",
-  "channels.connectionMode": "连接模式"
+  "channels.connectionMode": "连接模式",
+  "channels.reactionOff": "关闭",
+  "channels.reactionMinimal": "最小",
+  "channels.reactionFull": "完整",
+  "channels.connectionWebsocket": "WebSocket",
+  "channels.connectionWebhook": "Webhook",
+
+  "bindings.any": "任意",
+
+  "toast": {
+    "saved": "配置已保存",
+    "saveFailed": "保存配置失败"
+  }
 }

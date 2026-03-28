@@ -1,9 +1,15 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { useTranslation } from "react-i18next";
-import { Activity, GitFork, RefreshCw, Search } from "lucide-react";
+import { Activity, GitFork, RefreshCw, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { PageHeader } from "@/components/shared/page-header";
 import { EmptyState } from "@/components/shared/empty-state";
 import { Pagination } from "@/components/shared/pagination";
@@ -13,34 +19,68 @@ import { useTraces, type TraceData } from "./hooks/use-traces";
 import { TraceDetailDialog } from "./trace-detail-dialog";
 import { useMinLoading } from "@/hooks/use-min-loading";
 import { useDeferredLoading } from "@/hooks/use-deferred-loading";
+import { useUiStore } from "@/stores/use-ui-store";
+import { useAgents } from "@/pages/agents/hooks/use-agents";
+import { useChannelInstances } from "@/pages/channels/hooks/use-channel-instances";
+import { useWs } from "@/hooks/use-ws";
+import { Methods } from "@/api/protocol";
+import { toast } from "@/stores/use-toast-store";
 
 export function TracesPage() {
   const { t } = useTranslation("traces");
   const { t: tc } = useTranslation("common");
-  const [agentFilter, setAgentFilter] = useState("");
-  const [appliedAgentFilter, setAppliedAgentFilter] = useState("");
+  const tz = useUiStore((s) => s.timezone);
+  const [agentFilter, setAgentFilter] = useState<string>();
+  const [channelFilter, setChannelFilter] = useState<string>();
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
 
+  const ws = useWs();
+  const { agents } = useAgents();
+  const { instances: channels } = useChannelInstances();
+
+  const [abortingRunId, setAbortingRunId] = useState<string | null>(null);
+
   const { traces, total, loading, fetching, refresh, getTrace } = useTraces({
-    agentId: appliedAgentFilter || undefined,
+    agentId: agentFilter,
+    channel: channelFilter,
     limit: pageSize,
     offset: (page - 1) * pageSize,
   });
+
   const spinning = useMinLoading(fetching);
   const showSkeleton = useDeferredLoading(loading && traces.length === 0);
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
-  const handleFilterSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    setAppliedAgentFilter(agentFilter);
-    setPage(1);
-  };
+  const handleAbortRun = useCallback(
+    async (trace: TraceData, e: React.MouseEvent) => {
+      e.stopPropagation();
+      if (!ws.isConnected || abortingRunId) return;
+      setAbortingRunId(trace.run_id);
+      try {
+        const res = await ws.call(Methods.CHAT_ABORT, {
+          sessionKey: trace.session_key,
+          runId: trace.run_id,
+        }) as { aborted?: boolean };
+        if (res?.aborted) {
+          toast.success(t("toast.abortSent"));
+          refresh();
+        } else {
+          toast.info(t("toast.abortNotFound"));
+        }
+      } catch {
+        toast.error(t("toast.abortFailed"));
+      } finally {
+        setAbortingRunId(null);
+      }
+    },
+    [ws, t, refresh, abortingRunId],
+  );
 
   return (
-    <div className="p-4 sm:p-6">
+    <div className="p-4 sm:p-6 pb-10">
       <PageHeader
         title={t("title")}
         description={t("description")}
@@ -51,20 +91,39 @@ export function TracesPage() {
         }
       />
 
-      <form onSubmit={handleFilterSubmit} className="mt-4 flex gap-2">
-        <div className="relative max-w-sm flex-1">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={agentFilter}
-            onChange={(e) => setAgentFilter(e.target.value)}
-            placeholder={t("filterPlaceholder")}
-            className="pl-9"
-          />
-        </div>
-        <Button type="submit" variant="outline" size="sm">
-          {t("filter")}
-        </Button>
-      </form>
+      <div className="mt-4 flex flex-wrap items-center gap-2">
+        {/* Agent filter */}
+        <Select
+          value={agentFilter ?? "__all__"}
+          onValueChange={(v) => { setAgentFilter(v === "__all__" ? undefined : v); setPage(1); }}
+        >
+          <SelectTrigger className="h-8 w-44 text-xs">
+            <SelectValue placeholder={t("allAgents")} />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__all__">{t("allAgents")}</SelectItem>
+            {agents.map((a) => (
+              <SelectItem key={a.id} value={a.id}>{a.display_name || a.agent_key || a.id}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+
+        {/* Channel filter */}
+        <Select
+          value={channelFilter ?? "__all__"}
+          onValueChange={(v) => { setChannelFilter(v === "__all__" ? undefined : v); setPage(1); }}
+        >
+          <SelectTrigger className="h-8 w-44 text-xs">
+            <SelectValue placeholder={t("allChannels")} />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__all__">{t("allChannels")}</SelectItem>
+            {channels.map((ch) => (
+              <SelectItem key={ch.id} value={ch.name}>{ch.display_name || ch.name}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
 
       <div className="mt-4">
         {showSkeleton ? (
@@ -107,7 +166,20 @@ export function TracesPage() {
                       )}
                     </td>
                     <td className="px-4 py-3">
-                      <StatusBadge status={trace.status} />
+                      <div className="flex items-center gap-1.5">
+                        <StatusBadge status={trace.status} />
+                        {(trace.status === "running") && (
+                          <Button
+                            variant="destructive"
+                            size="icon-xs"
+                            onClick={(e) => handleAbortRun(trace, e)}
+                            disabled={abortingRunId === trace.run_id}
+                            title={t("stopRun")}
+                          >
+                            <Square className="h-3 w-3" />
+                          </Button>
+                        )}
+                      </div>
                     </td>
                     <td className="px-4 py-3 text-muted-foreground">
                       {formatDuration(trace.duration_ms || computeDurationMs(trace.start_time, trace.end_time))}
@@ -124,7 +196,7 @@ export function TracesPage() {
                       {trace.span_count}
                     </td>
                     <td className="px-4 py-3 text-muted-foreground">
-                      {formatDate(trace.start_time)}
+                      {formatDate(trace.start_time, tz)}
                     </td>
                   </tr>
                 ))}
@@ -148,6 +220,7 @@ export function TracesPage() {
           onClose={() => setSelectedTraceId(null)}
           getTrace={getTrace}
           onNavigateTrace={setSelectedTraceId}
+          onAbortRun={handleAbortRun}
         />
       )}
     </div>

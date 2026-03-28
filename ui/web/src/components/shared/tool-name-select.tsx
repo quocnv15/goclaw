@@ -1,9 +1,9 @@
-import { useMemo, useState, useRef, useEffect } from "react";
+import { useMemo, useState, useRef, useEffect, useLayoutEffect } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { X, ChevronDownIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useBuiltinTools } from "@/pages/builtin-tools/hooks/use-builtin-tools";
-import { useCustomTools } from "@/pages/custom-tools/hooks/use-custom-tools";
 
 interface ToolNameSelectProps {
   value: string[];
@@ -15,7 +15,7 @@ interface ToolNameSelectProps {
 interface ToolOption {
   name: string;
   displayName: string;
-  group: "built-in" | "custom";
+  group: "built-in";
 }
 
 export function ToolNameSelect({
@@ -26,25 +26,20 @@ export function ToolNameSelect({
 }: ToolNameSelectProps) {
   const { t } = useTranslation("common");
   const { tools: builtinTools } = useBuiltinTools();
-  const { tools: customTools } = useCustomTools();
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   const containerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const [dropdownStyle, setDropdownStyle] = useState<React.CSSProperties>({});
 
   const allTools = useMemo<ToolOption[]>(() => {
-    const builtin: ToolOption[] = builtinTools.map((t) => ({
+    return builtinTools.map((t) => ({
       name: t.name,
       displayName: t.display_name || t.name,
-      group: "built-in",
+      group: "built-in" as const,
     }));
-    const custom: ToolOption[] = customTools.map((t) => ({
-      name: t.name,
-      displayName: t.name,
-      group: "custom",
-    }));
-    return [...builtin, ...custom];
-  }, [builtinTools, customTools]);
+  }, [builtinTools]);
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase();
@@ -54,16 +49,31 @@ export function ToolNameSelect({
   }, [allTools, value, search]);
 
   const grouped = useMemo(() => {
-    const builtinGroup = filtered.filter((t) => t.group === "built-in");
-    const customGroup = filtered.filter((t) => t.group === "custom");
-    return { builtin: builtinGroup, custom: customGroup };
+    return { builtin: filtered };
   }, [filtered]);
+
+  // Compute dropdown position for portal rendering
+  useLayoutEffect(() => {
+    if (!open || !containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    setDropdownStyle({
+      position: "fixed",
+      top: rect.bottom + 4,
+      left: rect.left,
+      width: rect.width,
+      zIndex: 9999,
+    });
+  }, [open, search]);
 
   // Close on outside click
   useEffect(() => {
     if (!open) return;
     const handler = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (
+        containerRef.current && !containerRef.current.contains(target) &&
+        (!dropdownRef.current || !dropdownRef.current.contains(target))
+      ) {
         setOpen(false);
       }
     };
@@ -130,15 +140,19 @@ export function ToolNameSelect({
           onFocus={() => setOpen(true)}
           onKeyDown={handleKeyDown}
           placeholder={value.length === 0 ? (placeholder ?? t("selectOrTypeTools")) : ""}
-          className="placeholder:text-muted-foreground min-w-[80px] flex-1 bg-transparent py-0.5 text-sm outline-none"
+          className="placeholder:text-muted-foreground min-w-[80px] flex-1 bg-transparent py-0.5 text-base md:text-sm outline-none"
         />
         <ChevronDownIcon
           className="text-muted-foreground size-4 shrink-0 cursor-pointer opacity-50"
           onClick={() => setOpen(!open)}
         />
       </div>
-      {open && (grouped.builtin.length > 0 || grouped.custom.length > 0) && (
-        <div className="bg-popover text-popover-foreground absolute top-full left-0 z-50 mt-1 max-h-60 w-full overflow-y-auto rounded-md border p-1 shadow-md">
+      {open && grouped.builtin.length > 0 && createPortal(
+        <div
+          ref={dropdownRef}
+          style={dropdownStyle}
+          className="bg-popover text-popover-foreground pointer-events-auto max-h-60 overflow-y-auto rounded-md border p-1 shadow-md"
+        >
           {grouped.builtin.length > 0 && (
             <>
               <div className="text-muted-foreground px-2 py-1 text-[10px] font-semibold uppercase tracking-wider">
@@ -158,25 +172,8 @@ export function ToolNameSelect({
               ))}
             </>
           )}
-          {grouped.custom.length > 0 && (
-            <>
-              <div className="text-muted-foreground mt-1 px-2 py-1 text-[10px] font-semibold uppercase tracking-wider">
-                {t("customTools")}
-              </div>
-              {grouped.custom.map((t) => (
-                <button
-                  key={t.name}
-                  type="button"
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => addTool(t.name)}
-                  className="hover:bg-accent hover:text-accent-foreground flex w-full cursor-pointer items-center rounded-sm px-2 py-1.5 text-sm outline-hidden select-none"
-                >
-                  <span className="truncate">{t.name}</span>
-                </button>
-              ))}
-            </>
-          )}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

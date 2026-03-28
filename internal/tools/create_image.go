@@ -63,6 +63,10 @@ func (t *CreateImageTool) Parameters() map[string]any {
 				"type":        "string",
 				"description": "Aspect ratio: '1:1' (default), '3:4', '4:3', '9:16', '16:9'.",
 			},
+			"filename_hint": map[string]any{
+				"type":        "string",
+				"description": "Short descriptive filename (no extension). Example: 'sunset-beach', 'company-logo'.",
+			},
 		},
 		"required": []string{"prompt"},
 	}
@@ -77,15 +81,9 @@ func (t *CreateImageTool) Execute(ctx context.Context, args map[string]any) *Res
 	if aspectRatio == "" {
 		aspectRatio = "1:1"
 	}
+	filenameHint, _ := args["filename_hint"].(string)
 
-	// Extract per-agent config for backward compat
-	var perAgentProvider, perAgentModel string
-	if cfg := ImageGenConfigFromCtx(ctx); cfg != nil {
-		perAgentProvider = cfg.Provider
-		perAgentModel = cfg.Model
-	}
-
-	chain := ResolveMediaProviderChain(ctx, "create_image", perAgentProvider, perAgentModel,
+	chain := ResolveMediaProviderChain(ctx, "create_image", "", "",
 		imageGenProviderPriority, imageGenModelDefaults, t.registry)
 
 	// Inject prompt and aspect_ratio into each chain entry's params
@@ -111,12 +109,20 @@ func (t *CreateImageTool) Execute(ctx context.Context, args map[string]any) *Res
 	if err := os.MkdirAll(dateDir, 0755); err != nil {
 		return ErrorResult(fmt.Sprintf("failed to create output directory: %v", err))
 	}
-	imagePath := filepath.Join(dateDir, fmt.Sprintf("goclaw_gen_%d.png", time.Now().UnixNano()))
+	imagePath := filepath.Join(dateDir, mediaFileName(ctx, "image", filenameHint, "png"))
 	if err := os.WriteFile(imagePath, chainResult.Data, 0644); err != nil {
 		return ErrorResult(fmt.Sprintf("failed to save generated image: %v", err))
 	}
 
-	result := &Result{ForLLM: fmt.Sprintf("MEDIA:%s", imagePath)}
+	// Verify file was persisted (diagnostic for disappearing files).
+	if fi, err := os.Stat(imagePath); err != nil {
+		slog.Warn("create_image: file missing immediately after write", "path", imagePath, "error", err)
+		return ErrorResult(fmt.Sprintf("generated image file missing after write: %v", err))
+	} else {
+		slog.Info("create_image: file saved", "path", imagePath, "size", fi.Size(), "data_len", len(chainResult.Data))
+	}
+
+	result := &Result{ForLLM: fmt.Sprintf("MEDIA:%s\nUse the EXACT filename when referencing: %s", imagePath, filepath.Base(imagePath))}
 	result.Media = []bus.MediaFile{{Path: imagePath, MimeType: "image/png"}}
 	result.Deliverable = fmt.Sprintf("[Generated image: %s]\nPrompt: %s", filepath.Base(imagePath), prompt)
 	result.Provider = chainResult.Provider
@@ -129,13 +135,16 @@ func (t *CreateImageTool) Execute(ctx context.Context, args map[string]any) *Res
 
 // callProvider dispatches to the correct image generation implementation based on provider type.
 func (t *CreateImageTool) callProvider(ctx context.Context, cp credentialProvider, providerName, model string, params map[string]any) ([]byte, *providers.Usage, error) {
+	if cp == nil {
+		return nil, nil, fmt.Errorf("provider %q does not expose API credentials required for image generation", providerName)
+	}
 	prompt := GetParamString(params, "prompt", "")
 	aspectRatio := GetParamString(params, "aspect_ratio", "1:1")
 
 	slog.Info("create_image: calling image generation API",
 		"provider", providerName, "model", model, "aspect_ratio", aspectRatio)
 
-	switch ProviderTypeFromName(providerName) {
+	switch GetParamString(params, "_provider_type", providerTypeFromName(providerName)) {
 	case "gemini":
 		return t.callGeminiNativeImageGen(ctx, cp.APIKey(), cp.APIBase(), model, prompt, params)
 	case "openrouter":

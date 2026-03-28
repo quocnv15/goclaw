@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { CheckCircle2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
@@ -12,21 +12,49 @@ import { useProviderModels } from "@/pages/providers/hooks/use-provider-models";
 import { useProviderVerify } from "@/pages/providers/hooks/use-provider-verify";
 import type { ProviderData } from "@/types/provider";
 
+const VERIFY_TIMEOUT_SECS = 30;
+
 interface StepModelProps {
   provider: ProviderData;
   onComplete: (model: string) => void;
+  onBack?: () => void;
+  initialModel?: string | null;
 }
 
-export function StepModel({ provider, onComplete }: StepModelProps) {
+export function StepModel({ provider, onComplete, onBack, initialModel }: StepModelProps) {
   const { t } = useTranslation("setup");
   const { models, loading: modelsLoading } = useProviderModels(provider.id, provider.provider_type);
   const { verify, verifying, result: verifyResult, reset: resetVerify } = useProviderVerify();
 
-  const [model, setModel] = useState("");
+  const [model, setModel] = useState(initialModel ?? "");
   const [error, setError] = useState("");
+  const [countdown, setCountdown] = useState(0);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Reset verification when model changes
   useEffect(() => { resetVerify(); setError(""); }, [model, resetVerify]);
+
+  // Countdown timer — starts when verifying, stops on result
+  useEffect(() => {
+    if (verifying) {
+      setCountdown(VERIFY_TIMEOUT_SECS);
+      timerRef.current = setInterval(() => {
+        setCountdown((prev) => (prev <= 1 ? 0 : prev - 1));
+      }, 1000);
+    } else {
+      setCountdown(0);
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    }
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, [verifying]);
 
   const isVerified = verifyResult?.valid === true;
 
@@ -41,9 +69,15 @@ export function StepModel({ provider, onComplete }: StepModelProps) {
 
   const providerLabel = provider.display_name || provider.name;
 
+  const verifyButtonLabel = verifying
+    ? `${t("model.verifying")} (${countdown}s)`
+    : isVerified
+      ? t("model.verified")
+      : t("model.verify");
+
   return (
-    <Card>
-      <CardContent className="space-y-4 pt-6">
+    <Card className="py-0 gap-0">
+      <CardContent className="space-y-4 px-6 py-5">
         <TooltipProvider>
           <div className="space-y-1">
             <h2 className="text-lg font-semibold">{t("model.title")}</h2>
@@ -90,17 +124,24 @@ export function StepModel({ provider, onComplete }: StepModelProps) {
             </div>
           )}
 
-          <div className="flex justify-end gap-2">
-            <Button
-              variant="outline"
-              onClick={handleVerify}
-              disabled={!model.trim() || verifying || isVerified}
-            >
-              {verifying ? t("model.verifying") : isVerified ? t("model.verified") : t("model.verify")}
-            </Button>
-            <Button onClick={() => onComplete(model.trim())} disabled={!isVerified}>
-              {t("model.continue")}
-            </Button>
+          <div className={`flex ${onBack ? "justify-between" : "justify-end"} gap-2`}>
+            {onBack && (
+              <Button variant="secondary" onClick={onBack}>
+                ← {t("common.back")}
+              </Button>
+            )}
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                onClick={handleVerify}
+                disabled={!model.trim() || verifying || isVerified}
+              >
+                {verifyButtonLabel}
+              </Button>
+              <Button onClick={() => onComplete(model.trim())} disabled={!isVerified}>
+                {t("model.continue")}
+              </Button>
+            </div>
           </div>
         </TooltipProvider>
       </CardContent>

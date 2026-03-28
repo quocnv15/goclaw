@@ -1,5 +1,8 @@
-import { useState, useEffect, useMemo, useRef } from "react";
-import { Save, Check, AlertCircle, Users, FileText, Search, UserPlus } from "lucide-react";
+import { useState, useEffect, useMemo, useRef, useLayoutEffect } from "react";
+import { createPortal } from "react-dom";
+import { Save, Loader2, Users, FileText, Search, UserPlus } from "lucide-react";
+import { toast } from "@/stores/use-toast-store";
+import { userFriendlyError } from "@/lib/error-utils";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -19,14 +22,11 @@ export function AgentInstancesTab({ agentId }: AgentInstancesTabProps) {
   const [content, setContent] = useState("");
   const [originalContent, setOriginalContent] = useState("");
   const [loadingFiles, setLoadingFiles] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!selected) return;
     let cancelled = false;
     setLoadingFiles(true);
-    setError(null);
     getFiles(selected).then((files) => {
       if (cancelled) return;
       const userFile = files.find((f) => f.file_name === "USER.md");
@@ -34,7 +34,7 @@ export function AgentInstancesTab({ agentId }: AgentInstancesTabProps) {
       setContent(c);
       setOriginalContent(c);
     }).catch((err) => {
-      if (!cancelled) setError(err instanceof Error ? err.message : t("instances.loading"));
+      if (!cancelled) toast.error(t("instances.loading"), userFriendlyError(err));
     }).finally(() => {
       if (!cancelled) setLoadingFiles(false);
     });
@@ -43,15 +43,11 @@ export function AgentInstancesTab({ agentId }: AgentInstancesTabProps) {
 
   const handleSave = async () => {
     if (!selected) return;
-    setError(null);
-    setSaved(false);
     try {
       await setFile(selected, "USER.md", content);
       setOriginalContent(content);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 3000);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : t("instances.saving"));
+    } catch {
+      // toast shown by hook
     }
   };
 
@@ -126,20 +122,9 @@ export function AgentInstancesTab({ agentId }: AgentInstancesTabProps) {
               placeholder="(empty)"
               style={{ minHeight: 300 }}
             />
-            {error && (
-              <div className="flex items-center gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-                <AlertCircle className="h-4 w-4 shrink-0" />
-                {error}
-              </div>
-            )}
             <div className="flex items-center justify-end gap-2">
-              {saved && (
-                <span className="flex items-center gap-1 text-sm text-success">
-                  <Check className="h-3.5 w-3.5" /> {t("instances.saved")}
-                </span>
-              )}
               <Button onClick={handleSave} disabled={saving || !isDirty} size="sm">
-                {!saving && <Save className="h-4 w-4" />}
+                {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                 {saving ? t("instances.saving") : t("instances.save")}
               </Button>
             </div>
@@ -157,15 +142,34 @@ function ContactSearchBox({ existingIDs, onSelect }: { existingIDs: Set<string>;
   const [open, setOpen] = useState(false);
   const { contacts } = useContactSearch(search);
   const containerRef = useRef<HTMLDivElement>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const [dropdownStyle, setDropdownStyle] = useState<React.CSSProperties>({});
 
   // Filter out contacts already in instances
   const filtered = contacts.filter((c) => !existingIDs.has(c.sender_id));
+
+  // Compute dropdown position for portal rendering
+  useLayoutEffect(() => {
+    if (!open || !containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    setDropdownStyle({
+      position: "fixed",
+      top: rect.bottom + 4,
+      left: rect.left,
+      width: rect.width,
+      zIndex: 9999,
+    });
+  }, [open, search]);
 
   // Close on outside click
   useEffect(() => {
     if (!open) return;
     const handler = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (
+        containerRef.current && !containerRef.current.contains(target) &&
+        (!dropdownRef.current || !dropdownRef.current.contains(target))
+      ) {
         setOpen(false);
       }
     };
@@ -182,11 +186,11 @@ function ContactSearchBox({ existingIDs, onSelect }: { existingIDs: Set<string>;
           onChange={(e) => { setSearch(e.target.value); setOpen(true); }}
           onFocus={() => search.length >= 2 && setOpen(true)}
           placeholder={t("instances.searchContacts")}
-          className="h-8 w-full rounded-md border bg-transparent pl-7 pr-2 text-xs placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+          className="h-8 w-full rounded-md border bg-transparent pl-7 pr-2 text-base md:text-xs placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
         />
       </div>
-      {open && search.length >= 2 && filtered.length > 0 && (
-        <div className="absolute left-1 right-1 z-50 mt-1 max-h-48 overflow-y-auto rounded-md border bg-popover p-1 shadow-md">
+      {open && search.length >= 2 && filtered.length > 0 && createPortal(
+        <div ref={dropdownRef} style={dropdownStyle} className="max-h-48 overflow-y-auto rounded-md border bg-popover p-1 shadow-md">
           {filtered.map((c) => (
             <button
               key={c.id}
@@ -211,12 +215,14 @@ function ContactSearchBox({ existingIDs, onSelect }: { existingIDs: Set<string>;
               </div>
             </button>
           ))}
-        </div>
+        </div>,
+        document.body,
       )}
-      {open && search.length >= 2 && filtered.length === 0 && contacts.length === 0 && (
-        <div className="absolute left-1 right-1 z-50 mt-1 rounded-md border bg-popover p-3 text-center text-xs text-muted-foreground shadow-md">
+      {open && search.length >= 2 && filtered.length === 0 && contacts.length === 0 && createPortal(
+        <div ref={dropdownRef} style={dropdownStyle} className="rounded-md border bg-popover p-3 text-center text-xs text-muted-foreground shadow-md">
           {t("instances.noContactsFound")}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

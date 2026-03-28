@@ -53,7 +53,7 @@ func init() {
 		// HTTP API
 		MsgInvalidAuth:           "xác thực không hợp lệ",
 		MsgMsgsRequired:          "messages là bắt buộc",
-		MsgUserIDHeader:          "header X-GoClaw-User-Id là bắt buộc ở chế độ managed",
+		MsgUserIDHeader:          "header X-GoClaw-User-Id là bắt buộc",
 		MsgFileTooLarge:          "tệp quá lớn hoặc form multipart không hợp lệ",
 		MsgMissingFileField:      "thiếu trường 'file'",
 		MsgInvalidFilename:       "tên tệp không hợp lệ",
@@ -93,11 +93,9 @@ func init() {
 		MsgAgentIsTeamLead:      "agent đã là trưởng nhóm",
 		MsgCannotRemoveTeamLead: "không thể xóa trưởng nhóm",
 
-		// Delegations
-		MsgDelegationsUnavailable: "ủy quyền không khả dụng",
-
 		// Channels
 		MsgCannotDeleteDefaultInst: "không thể xóa phiên bản channel mặc định",
+		MsgCannotRemoveLastWriter:  "không thể xóa người quản lý cuối cùng",
 
 		// Skills
 		MsgSkillsUpdateNotSupported: "skills.update không được hỗ trợ với skill dựa trên tệp",
@@ -131,6 +129,7 @@ func init() {
 		MsgStatusPhaseCompact:  "Giai đoạn: Đang nén ngữ cảnh...",
 		MsgStatusPhaseDefault:  "Giai đoạn: Đang xử lý...",
 		MsgCancelledReply:      "✋ Đã hủy. Bạn muốn làm gì tiếp?",
+		MsgInjectedAck:         "Đã nhận, tôi sẽ xử lý trong tác vụ hiện tại.",
 
 		// Knowledge Graph
 		MsgEntityIDRequired:       "entity_id là bắt buộc",
@@ -140,11 +139,11 @@ func init() {
 		MsgInvalidProviderOrModel: "provider hoặc model không hợp lệ",
 
 		// Mô tả công cụ tích hợp
-		MsgToolReadFile:        "Đọc nội dung tệp từ không gian làm việc của agent theo đường dẫn",
-		MsgToolWriteFile:       "Ghi nội dung vào tệp trong không gian làm việc, tự động tạo thư mục nếu cần",
+		MsgToolReadFile:        "Đọc nội dung tệp từ workspace của agent theo đường dẫn",
+		MsgToolWriteFile:       "Ghi nội dung vào tệp trong workspace, tự động tạo thư mục nếu cần",
 		MsgToolListFiles:       "Liệt kê tệp và thư mục trong đường dẫn chỉ định",
 		MsgToolEdit:            "Chỉnh sửa tệp bằng cách tìm và thay thế đoạn văn bản cụ thể",
-		MsgToolExec:            "Thực thi lệnh shell trong không gian làm việc và trả về kết quả",
+		MsgToolExec:            "Thực thi lệnh shell trong workspace và trả về kết quả",
 		MsgToolWebSearch:       "Tìm kiếm thông tin trên web bằng công cụ tìm kiếm (Brave hoặc DuckDuckGo)",
 		MsgToolWebFetch:        "Tải trang web hoặc API endpoint và trích xuất nội dung văn bản",
 		MsgToolMemorySearch:    "Tìm kiếm trong bộ nhớ dài hạn của agent bằng độ tương đồng ngữ nghĩa",
@@ -168,10 +167,20 @@ func init() {
 		MsgToolSpawn:           "Tạo subagent chạy nền hoặc giao việc cho agent đã liên kết",
 		MsgToolSkillSearch:     "Tìm kiếm kỹ năng có sẵn theo từ khóa hoặc mô tả",
 		MsgToolUseSkill:        "Kích hoạt kỹ năng để sử dụng khả năng chuyên biệt (đánh dấu tracing)",
-		MsgToolDelegateSearch:  "Tìm kiếm agent mục tiêu ủy quyền theo từ khóa khi có quá nhiều agent liên kết",
-		MsgToolEvaluateLoop:    "Chạy vòng lặp tạo→đánh giá→sửa đổi giữa hai agent cho nội dung cần chất lượng cao",
-		MsgToolHandoff:         "Chuyển cuộc hội thoại sang agent khác — người dùng sẽ nói chuyện trực tiếp với agent đó",
+		MsgToolSkillManage:     "Tạo, sửa hoặc xóa kỹ năng từ trải nghiệm hội thoại",
+		MsgToolPublishSkill:    "Đăng ký thư mục kỹ năng vào hệ thống, cho phép tìm kiếm và cấp quyền",
 		MsgToolTeamTasks:       "Xem, tạo, cập nhật và hoàn thành tác vụ trên bảng tác vụ nhóm",
-		MsgToolTeamMessage:     "Gửi tin nhắn trực tiếp hoặc broadcast đến đồng đội trong nhóm agent",
+
+		MsgSkillNudgePostscript: "Tác vụ này cần nhiều bước. Bạn muốn tôi lưu quy trình này thành kỹ năng tái sử dụng không? Trả lời **\"lưu kỹ năng\"** hoặc **\"bỏ qua\"**.",
+		MsgSkillNudge70Pct:      "[System] Bạn đã dùng 70% ngân sách vòng lặp. Cân nhắc xem các mẫu trong phiên này có nên lưu thành kỹ năng không.",
+		MsgSkillNudge90Pct:      "[System] Bạn đã dùng 90% ngân sách vòng lặp. Nếu phiên này có quy trình tái sử dụng, hãy cân nhắc lưu thành kỹ năng trước khi hoàn thành.",
+
+		MsgInvalidRole: "vai trò không hợp lệ: giá trị cho phép là owner, admin, operator, member, viewer",
+
+		MsgContactIDsRequired:  "contact_ids là bắt buộc",
+		MsgMergeTargetRequired: "cần chính xác một trong tenant_user_id hoặc create_user",
+		MsgTenantUserNotFound:  "không tìm thấy tenant user",
+		MsgTenantMismatch:      "tenant user không thuộc tenant này",
+		MsgTenantScopeRequired: "cần xác định tenant để thực hiện thao tác này",
 	})
 }

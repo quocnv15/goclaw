@@ -8,32 +8,78 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/oauth"
+	"github.com/nextlevelbuilder/goclaw/internal/permissions"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
 // ProvidersHandler handles LLM provider CRUD endpoints.
 type ProvidersHandler struct {
-	store          store.ProviderStore
-	secretStore    store.ConfigSecretsStore
-	token          string
-	providerReg    *providers.Registry
-	gatewayAddr    string                   // for injecting MCP bridge into Claude CLI providers
-	mcpLookup      providers.MCPServerLookup // optional: resolves per-agent MCP servers
-	cliMu          sync.Mutex               // serializes Claude CLI provider create to prevent duplicates
+	store           store.ProviderStore
+	secretStore     store.ConfigSecretsStore
+	providerReg     *providers.Registry
+	gatewayAddr     string                           // for injecting MCP bridge into Claude CLI providers
+	mcpLookup       providers.MCPServerLookup        // optional: resolves per-agent MCP servers
+	apiBaseFallback func(providerType string) string // optional: config/env fallback for api_base
+	cliMu           sync.Mutex                       // serializes Claude CLI provider create to prevent duplicates
+	msgBus          *bus.MessageBus
+	sysConfigStore  store.SystemConfigStore
 }
 
 // NewProvidersHandler creates a handler for provider management endpoints.
-func NewProvidersHandler(s store.ProviderStore, secretStore store.ConfigSecretsStore, token string, providerReg *providers.Registry, gatewayAddr string) *ProvidersHandler {
-	return &ProvidersHandler{store: s, secretStore: secretStore, token: token, providerReg: providerReg, gatewayAddr: gatewayAddr}
+func NewProvidersHandler(s store.ProviderStore, secretStore store.ConfigSecretsStore, providerReg *providers.Registry, gatewayAddr string) *ProvidersHandler {
+	return &ProvidersHandler{store: s, secretStore: secretStore, providerReg: providerReg, gatewayAddr: gatewayAddr}
+}
+
+// SetMessageBus sets the message bus for audit event broadcasting.
+// Must be called before serving requests (not thread-safe).
+func (h *ProvidersHandler) SetMessageBus(msgBus *bus.MessageBus) {
+	h.msgBus = msgBus
+}
+
+// SetSystemConfigStore sets the system config store for embedding status checks.
+func (h *ProvidersHandler) SetSystemConfigStore(s store.SystemConfigStore) {
+	h.sysConfigStore = s
 }
 
 // SetMCPServerLookup sets the per-agent MCP server lookup for Claude CLI providers.
 // Must be called before serving requests (not thread-safe).
 func (h *ProvidersHandler) SetMCPServerLookup(lookup providers.MCPServerLookup) {
 	h.mcpLookup = lookup
+}
+
+// SetAPIBaseFallback sets a function that returns config/env api_base by provider type.
+// Used as fallback when DB providers have no api_base set.
+func (h *ProvidersHandler) SetAPIBaseFallback(fn func(providerType string) string) {
+	h.apiBaseFallback = fn
+}
+
+// resolveAPIBase returns the provider's api_base, falling back to config/env if empty.
+func (h *ProvidersHandler) resolveAPIBase(p *store.LLMProviderData) string {
+	if p.APIBase != "" {
+		return p.APIBase
+	}
+	if h.apiBaseFallback != nil {
+		return h.apiBaseFallback(p.ProviderType)
+	}
+	return ""
+}
+
+// emitProviderCacheInvalidate broadcasts a provider cache invalidation event.
+// Subscribers (e.g. ACP re-registration in gateway_managed.go) react to reload from DB.
+func (h *ProvidersHandler) emitProviderCacheInvalidate(name string) {
+	if h.msgBus == nil {
+		return
+	}
+	h.msgBus.Broadcast(bus.Event{
+		Name:    protocol.EventCacheInvalidate,
+		Payload: bus.CacheInvalidatePayload{Kind: bus.CacheKindProvider, Key: name},
+	})
 }
 
 // RegisterRoutes registers all provider management routes on the given mux.
@@ -50,22 +96,17 @@ func (h *ProvidersHandler) RegisterRoutes(mux *http.ServeMux) {
 
 	// Provider + model verification (pre-flight check)
 	mux.HandleFunc("POST /v1/providers/{id}/verify", h.auth(h.handleVerifyProvider))
+	mux.HandleFunc("POST /v1/providers/{id}/verify-embedding", h.auth(h.handleVerifyEmbedding))
+
+	// Embedding system status
+	mux.HandleFunc("GET /v1/embedding/status", h.auth(h.handleEmbeddingStatus))
 
 	// Claude CLI auth status (global — not per-provider)
 	mux.HandleFunc("GET /v1/providers/claude-cli/auth-status", h.auth(h.handleClaudeCLIAuthStatus))
 }
 
 func (h *ProvidersHandler) auth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if h.token != "" {
-			if extractBearerToken(r) != h.token {
-				locale := extractLocale(r)
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": i18n.T(locale, i18n.MsgUnauthorized)})
-				return
-			}
-		}
-		next(w, r)
-	}
+	return requireAuth(permissions.RoleAdmin, next)
 }
 
 // maskAPIKey replaces non-empty API keys with "***".
@@ -81,6 +122,11 @@ func (h *ProvidersHandler) registerInMemory(p *store.LLMProviderData) {
 	if h.providerReg == nil || !p.Enabled {
 		return
 	}
+	// ACP agents don't need an API key — skip in-memory registration
+	// (ACP providers are registered via gateway_providers.go on startup or restart)
+	if p.ProviderType == store.ProviderACP {
+		return
+	}
 	// Claude CLI doesn't need an API key — register immediately
 	if p.ProviderType == store.ProviderClaudeCLI {
 		cliPath := p.APIBase // reuse APIBase field for CLI path
@@ -90,37 +136,52 @@ func (h *ProvidersHandler) registerInMemory(p *store.LLMProviderData) {
 		var cliOpts []providers.ClaudeCLIOption
 		cliOpts = append(cliOpts, providers.WithClaudeCLISecurityHooks("", true))
 		if h.gatewayAddr != "" {
-			mcpData := providers.BuildCLIMCPConfigData(nil, h.gatewayAddr, h.token)
+			mcpData := providers.BuildCLIMCPConfigData(nil, h.gatewayAddr, pkgGatewayToken)
 			mcpData.AgentMCPLookup = h.mcpLookup
 			cliOpts = append(cliOpts, providers.WithClaudeCLIMCPConfigData(mcpData))
 		}
-		h.providerReg.Register(providers.NewClaudeCLIProvider(cliPath, cliOpts...))
+		h.providerReg.RegisterForTenant(p.TenantID, providers.NewClaudeCLIProvider(cliPath, cliOpts...))
+		return
+	}
+	// Ollama doesn't need an API key — handle before the key guard (same as startup).
+	// In Docker, swap localhost → host.docker.internal so the container can reach the host.
+	if p.ProviderType == store.ProviderOllama {
+		host := p.APIBase
+		if host == "" {
+			host = "http://localhost:11434"
+		}
+		h.providerReg.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, "ollama", config.DockerLocalhost(host+"/v1"), "llama3.3"))
 		return
 	}
 	if p.APIKey == "" {
 		return
 	}
+	apiBase := h.resolveAPIBase(p)
 	switch p.ProviderType {
 	case store.ProviderChatGPTOAuth:
-		ts := oauth.NewDBTokenSource(h.store, h.secretStore, p.Name)
-		h.providerReg.Register(providers.NewCodexProvider(p.Name, ts, p.APIBase, ""))
+		ts := oauth.NewDBTokenSource(h.store, h.secretStore, p.Name).WithTenantID(p.TenantID)
+		codex := providers.NewCodexProvider(p.Name, ts, apiBase, "")
+		if oauthSettings := store.ParseChatGPTOAuthProviderSettings(p.Settings); oauthSettings != nil {
+			codex.WithRoutingDefaults(oauthSettings.CodexPool.Strategy, oauthSettings.CodexPool.ExtraProviderNames)
+		}
+		h.providerReg.RegisterForTenant(p.TenantID, codex)
 	case store.ProviderAnthropicNative:
-		h.providerReg.Register(providers.NewAnthropicProvider(p.APIKey,
-			providers.WithAnthropicBaseURL(p.APIBase)))
+		h.providerReg.RegisterForTenant(p.TenantID, providers.NewAnthropicProvider(p.APIKey,
+			providers.WithAnthropicBaseURL(apiBase)))
 	case store.ProviderDashScope:
-		h.providerReg.Register(providers.NewDashScopeProvider(p.APIKey, p.APIBase, ""))
+		h.providerReg.RegisterForTenant(p.TenantID, providers.NewDashScopeProvider(p.Name, p.APIKey, apiBase, ""))
 	case store.ProviderBailian:
-		base := p.APIBase
+		base := apiBase
 		if base == "" {
 			base = "https://coding-intl.dashscope.aliyuncs.com/v1"
 		}
-		h.providerReg.Register(providers.NewOpenAIProvider(p.Name, p.APIKey, base, "qwen3.5-plus"))
+		h.providerReg.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, p.APIKey, base, "qwen3.5-plus"))
 	default:
-		prov := providers.NewOpenAIProvider(p.Name, p.APIKey, p.APIBase, "")
+		prov := providers.NewOpenAIProvider(p.Name, p.APIKey, apiBase, "")
 		if p.ProviderType == store.ProviderMiniMax {
 			prov.WithChatPath("/text/chatcompletion_v2")
 		}
-		h.providerReg.Register(prov)
+		h.providerReg.RegisterForTenant(p.TenantID, prov)
 	}
 }
 
@@ -139,7 +200,7 @@ func (h *ProvidersHandler) handleListProviders(w http.ResponseWriter, r *http.Re
 		maskAPIKey(&providers[i])
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{"providers": providers})
+	writeJSON(w, http.StatusOK, map[string]any{"providers": providers})
 }
 
 func (h *ProvidersHandler) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
@@ -180,6 +241,11 @@ func (h *ProvidersHandler) handleCreateProvider(w http.ResponseWriter, r *http.R
 		}
 	}
 
+	if err := validateChatGPTOAuthProviderCandidate(r.Context(), h.store, uuid.Nil, &p); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
 	if err := h.store.CreateProvider(r.Context(), &p); err != nil {
 		slog.Error("providers.create", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -188,7 +254,9 @@ func (h *ProvidersHandler) handleCreateProvider(w http.ResponseWriter, r *http.R
 
 	// Register in-memory so verify/chat work without restart
 	h.registerInMemory(&p)
+	h.emitProviderCacheInvalidate(p.Name)
 
+	emitAudit(h.msgBus, r, "provider.created", "provider", p.ID.String())
 	maskAPIKey(&p)
 	writeJSON(w, http.StatusCreated, p)
 }
@@ -219,7 +287,7 @@ func (h *ProvidersHandler) handleUpdateProvider(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	var updates map[string]interface{}
+	var updates map[string]any
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&updates); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
 		return
@@ -251,16 +319,52 @@ func (h *ProvidersHandler) handleUpdateProvider(w http.ResponseWriter, r *http.R
 		}
 	}
 
-	// Prevent updating immutable fields
-	delete(updates, "id")
-	delete(updates, "created_at")
+	// Allowlist: only permit known provider columns.
+	updates = filterAllowedKeys(updates, providerAllowedFields)
+
+	currentProvider, err := h.store.GetProvider(r.Context(), id)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": i18n.T(locale, i18n.MsgNotFound, "provider", id.String())})
+		return
+	}
+
+	candidate := *currentProvider
+	if name, ok := updates["name"].(string); ok && name != "" {
+		candidate.Name = name
+	}
+	if providerType, ok := updates["provider_type"].(string); ok && providerType != "" {
+		candidate.ProviderType = providerType
+	}
+	if apiKey, ok := updates["api_key"].(string); ok {
+		candidate.APIKey = apiKey
+	}
+	if apiBase, ok := updates["api_base"].(string); ok {
+		candidate.APIBase = apiBase
+	}
+	if enabled, ok := updates["enabled"].(bool); ok {
+		candidate.Enabled = enabled
+	}
+	if displayName, ok := updates["display_name"].(string); ok {
+		candidate.DisplayName = displayName
+	}
+	if settings, ok := updates["settings"]; ok {
+		rawSettings, err := marshalJSONRaw(settings)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+			return
+		}
+		candidate.Settings = rawSettings
+	}
+
+	if err := validateChatGPTOAuthProviderCandidate(r.Context(), h.store, id, &candidate); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 
 	// Track old name before update for registry cleanup
 	var oldName string
 	if h.providerReg != nil {
-		if old, err := h.store.GetProvider(r.Context(), id); err == nil {
-			oldName = old.Name
-		}
+		oldName = currentProvider.Name
 	}
 
 	if err := h.store.UpdateProvider(r.Context(), id, updates); err != nil {
@@ -274,16 +378,25 @@ func (h *ProvidersHandler) handleUpdateProvider(w http.ResponseWriter, r *http.R
 		if updated, err := h.store.GetProvider(r.Context(), id); err == nil {
 			// Unregister old name if renamed to prevent ghost entries
 			if oldName != "" && oldName != updated.Name {
-				h.providerReg.Unregister(oldName)
+				h.providerReg.UnregisterForTenant(updated.TenantID, oldName)
 			}
 			if !updated.Enabled {
-				h.providerReg.Unregister(updated.Name)
+				h.providerReg.UnregisterForTenant(updated.TenantID, updated.Name)
 			} else {
 				h.registerInMemory(updated)
 			}
 		}
 	}
 
+	// Notify subscribers (e.g. ACP re-registration) about the change
+	if updated, err := h.store.GetProvider(r.Context(), id); err == nil {
+		h.emitProviderCacheInvalidate(updated.Name)
+		if oldName != "" && oldName != updated.Name {
+			h.emitProviderCacheInvalidate(oldName)
+		}
+	}
+
+	emitAudit(h.msgBus, r, "provider.updated", "provider", id.String())
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
@@ -295,10 +408,12 @@ func (h *ProvidersHandler) handleDeleteProvider(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Read provider name before deleting so we can unregister it
+	// Read provider before deleting so we can unregister it
 	var providerName string
+	var providerTenantID uuid.UUID
 	if p, err := h.store.GetProvider(r.Context(), id); err == nil {
 		providerName = p.Name
+		providerTenantID = p.TenantID
 	}
 
 	if err := h.store.DeleteProvider(r.Context(), id); err != nil {
@@ -308,8 +423,12 @@ func (h *ProvidersHandler) handleDeleteProvider(w http.ResponseWriter, r *http.R
 	}
 
 	if h.providerReg != nil && providerName != "" {
-		h.providerReg.Unregister(providerName)
+		h.providerReg.UnregisterForTenant(providerTenantID, providerName)
+	}
+	if providerName != "" {
+		h.emitProviderCacheInvalidate(providerName)
 	}
 
+	emitAudit(h.msgBus, r, "provider.deleted", "provider", id.String())
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }

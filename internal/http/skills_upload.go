@@ -12,8 +12,8 @@ import (
 	"strings"
 
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
+	"github.com/nextlevelbuilder/goclaw/internal/skills"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
-	"github.com/nextlevelbuilder/goclaw/internal/store/pg"
 )
 
 // handleUpload processes a ZIP file upload containing a skill (must have SKILL.md at root).
@@ -89,25 +89,36 @@ func (h *SkillsHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, "failed to read SKILL.md")})
 		return
 	}
+	if strings.TrimSpace(skillContent) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, "SKILL.md is empty")})
+		return
+	}
 
-	name, description, slug, frontmatter := parseSkillFrontmatter(skillContent)
+	name, description, slug, frontmatter := skills.ParseSkillFrontmatter(skillContent)
 	if name == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgRequired, "name in SKILL.md frontmatter")})
 		return
 	}
 	if slug == "" {
-		slug = slugify(name)
+		slug = skills.Slugify(name)
 	}
-	if !slugRegexp.MatchString(slug) {
+	if !skills.SlugRegexp.MatchString(slug) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidSlug, "slug")})
 		return
 	}
 
-	// Determine version (always increment — includes archived skills so re-upload gets v2+)
-	version := h.skills.GetNextVersion(slug)
+	// Check slug conflict with system skill
+	if h.skills.IsSystemSkill(slug) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, "slug conflicts with a system skill")})
+		return
+	}
 
-	// Extract to filesystem: baseDir/slug/version/
-	destDir := filepath.Join(h.baseDir, slug, fmt.Sprintf("%d", version))
+	// Determine version (always increment — includes archived skills so re-upload gets v2+)
+	version := h.skills.GetNextVersion(r.Context(), slug)
+
+	// Extract to filesystem: tenant-scoped skills-store/slug/version/
+	tenantSkillsBase := h.tenantSkillsDir(r)
+	destDir := filepath.Join(tenantSkillsBase, slug, fmt.Sprintf("%d", version))
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": i18n.T(locale, i18n.MsgInternalError, "failed to create skill directory")})
 		return
@@ -130,7 +141,7 @@ func (h *SkillsHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		// Skip macOS/system artifacts
-		if isSystemArtifact(entryName) {
+		if skills.IsSystemArtifact(entryName) {
 			continue
 		}
 		// Security: prevent path traversal
@@ -154,7 +165,7 @@ func (h *SkillsHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	// Save metadata to DB
 	desc := description
-	skill := pg.SkillCreateParams{
+	skill := store.SkillCreateParams{
 		Name:        name,
 		Slug:        slug,
 		Description: &desc,
@@ -174,12 +185,25 @@ func (h *SkillsHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.skills.BumpVersion()
+	emitAudit(h.msgBus, r, "skill.uploaded", "skill", slug)
 	slog.Info("skill uploaded", "id", id, "slug", slug, "version", version, "size", header.Size)
 
-	writeJSON(w, http.StatusCreated, map[string]interface{}{
+	// Scan and check dependencies
+	response := map[string]any{
 		"id":      id,
 		"slug":    slug,
 		"version": version,
 		"name":    name,
-	})
+	}
+	manifest := skills.ScanSkillDeps(destDir)
+	if manifest != nil && !manifest.IsEmpty() {
+		ok, missing := skills.CheckSkillDeps(manifest)
+		if !ok {
+			// Set skill to archived due to missing deps
+			_ = h.skills.UpdateSkill(r.Context(), id, map[string]any{"status": "archived"})
+			response["deps_warning"] = "missing dependencies: " + skills.FormatMissing(missing)
+		}
+	}
+
+	writeJSON(w, http.StatusCreated, response)
 }

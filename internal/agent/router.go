@@ -3,13 +3,18 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // ResolverFunc is called when an agent isn't found in the cache.
-// Used to lazy-create agents from DB.
-type ResolverFunc func(agentKey string) (Agent, error)
+// Used to lazy-create agents from DB. Context carries tenant scope.
+type ResolverFunc func(ctx context.Context, agentKey string) (Agent, error)
 
 const defaultRouterTTL = 10 * time.Minute
 
@@ -64,9 +69,12 @@ func (r *Router) Register(ag Agent) {
 
 // Get returns an agent by ID. Lazy-creates from DB via resolver if needed.
 // Cached entries expire after TTL as a safety net for multi-instance deployments.
-func (r *Router) Get(agentID string) (Agent, error) {
+// Cache key includes tenant so the same agent_key in different tenants resolves independently.
+func (r *Router) Get(ctx context.Context, agentID string) (Agent, error) {
+	cacheKey := agentCacheKey(ctx, agentID)
+
 	r.mu.RLock()
-	entry, ok := r.agents[agentID]
+	entry, ok := r.agents[cacheKey]
 	resolver := r.resolver
 	r.mu.RUnlock()
 
@@ -77,23 +85,23 @@ func (r *Router) Get(agentID string) (Agent, error) {
 	// TTL expired → remove stale entry so resolver re-creates
 	if ok {
 		r.mu.Lock()
-		delete(r.agents, agentID)
+		delete(r.agents, cacheKey)
 		r.mu.Unlock()
 	}
 
 	// Try resolver (create from DB)
 	if resolver != nil {
-		ag, err := resolver(agentID)
+		ag, err := resolver(ctx, agentID)
 		if err != nil {
 			return nil, err
 		}
 		r.mu.Lock()
 		// Double-check: another goroutine might have created it
-		if existing, ok := r.agents[agentID]; ok {
+		if existing, ok := r.agents[cacheKey]; ok {
 			r.mu.Unlock()
 			return existing.agent, nil
 		}
-		r.agents[agentID] = &agentEntry{agent: ag, cachedAt: time.Now()}
+		r.agents[cacheKey] = &agentEntry{agent: ag, cachedAt: time.Now()}
 		r.mu.Unlock()
 		return ag, nil
 	}
@@ -101,11 +109,26 @@ func (r *Router) Get(agentID string) (Agent, error) {
 	return nil, fmt.Errorf("agent not found: %s", agentID)
 }
 
+// agentCacheKey builds a tenant-scoped cache key for the agent router.
+func agentCacheKey(ctx context.Context, agentID string) string {
+	tid := store.TenantIDFromContext(ctx)
+	if tid == uuid.Nil {
+		return agentID
+	}
+	return tid.String() + ":" + agentID
+}
+
 // Remove removes an agent from the router.
+// Matches both plain and tenant-scoped keys (same as InvalidateAgent).
 func (r *Router) Remove(agentID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.agents, agentID)
+	suffix := ":" + agentID
+	for key := range r.agents {
+		if key == agentID || strings.HasSuffix(key, suffix) {
+			delete(r.agents, key)
+		}
+	}
 }
 
 // List returns all registered agent IDs.
@@ -153,25 +176,31 @@ func (r *Router) IsRunning(agentID string) bool {
 
 // --- Active Run Tracking (matching TS chat-abort.ts) ---
 
-// ActiveRun tracks a running agent invocation so it can be aborted via chat.abort.
+// ActiveRun tracks a running agent invocation so it can be aborted via chat.abort
+// and supports mid-run message injection via InjectCh.
 type ActiveRun struct {
 	RunID      string
 	SessionKey string
 	AgentID    string
 	Cancel     context.CancelFunc
 	StartedAt  time.Time
+	InjectCh   chan InjectedMessage // buffered channel for mid-run user message injection
 }
 
 // RegisterRun records an active run so it can be aborted later.
-func (r *Router) RegisterRun(runID, sessionKey, agentID string, cancel context.CancelFunc) {
+// Returns a receive-only channel for mid-run message injection.
+func (r *Router) RegisterRun(runID, sessionKey, agentID string, cancel context.CancelFunc) <-chan InjectedMessage {
+	injectCh := make(chan InjectedMessage, injectBufferSize)
 	r.activeRuns.Store(runID, &ActiveRun{
 		RunID:      runID,
 		SessionKey: sessionKey,
 		AgentID:    agentID,
 		Cancel:     cancel,
 		StartedAt:  time.Now(),
+		InjectCh:   injectCh,
 	})
 	r.sessionRuns.Store(sessionKey, runID)
+	return injectCh
 }
 
 // UnregisterRun removes a completed/cancelled run from tracking.
@@ -202,6 +231,26 @@ func (r *Router) AbortRun(runID, sessionKey string) bool {
 	r.sessionRuns.Delete(run.SessionKey)
 	r.activeRuns.Delete(runID)
 	return true
+}
+
+// InjectMessage sends a user message to the running loop for a session.
+// Returns true if the message was accepted, false if no active run or channel full.
+func (r *Router) InjectMessage(sessionKey string, msg InjectedMessage) bool {
+	runIDVal, ok := r.sessionRuns.Load(sessionKey)
+	if !ok {
+		return false
+	}
+	runVal, ok := r.activeRuns.Load(runIDVal)
+	if !ok {
+		return false
+	}
+	run := runVal.(*ActiveRun)
+	select {
+	case run.InjectCh <- msg:
+		return true
+	default:
+		return false // channel full
+	}
 }
 
 // InvalidateUserWorkspace clears the cached workspace for a user across all cached agent loops.

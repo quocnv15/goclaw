@@ -9,6 +9,7 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
+	"github.com/nextlevelbuilder/goclaw/internal/providerresolve"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
@@ -17,16 +18,15 @@ import (
 type PendingMessagesHandler struct {
 	store       store.PendingMessageStore
 	agentStore  store.AgentStore
-	token       string
 	providerReg *providers.Registry
-	keepRecent    int    // global keepRecent from config (0 = use default 15)
-	maxTokens     int    // max output tokens for LLM summarization (0 = use default)
-	cfgProvider   string // config-level provider override (empty = resolve from agent)
-	cfgModel      string // config-level model override (empty = resolve from agent)
+	keepRecent  int    // global keepRecent from config (0 = use default 15)
+	maxTokens   int    // max output tokens for LLM summarization (0 = use default)
+	cfgProvider string // config-level provider override (empty = resolve from agent)
+	cfgModel    string // config-level model override (empty = resolve from agent)
 }
 
-func NewPendingMessagesHandler(s store.PendingMessageStore, agentStore store.AgentStore, token string, providerReg *providers.Registry) *PendingMessagesHandler {
-	return &PendingMessagesHandler{store: s, agentStore: agentStore, token: token, providerReg: providerReg}
+func NewPendingMessagesHandler(s store.PendingMessageStore, agentStore store.AgentStore, providerReg *providers.Registry) *PendingMessagesHandler {
+	return &PendingMessagesHandler{store: s, agentStore: agentStore, providerReg: providerReg}
 }
 
 // SetKeepRecent sets the global keepRecent value from config.
@@ -49,19 +49,7 @@ func (h *PendingMessagesHandler) RegisterRoutes(mux *http.ServeMux) {
 }
 
 func (h *PendingMessagesHandler) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if h.token != "" {
-			if extractBearerToken(r) != h.token {
-				locale := extractLocale(r)
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": i18n.T(locale, i18n.MsgUnauthorized)})
-				return
-			}
-		}
-		locale := extractLocale(r)
-		ctx := store.WithLocale(r.Context(), locale)
-		r = r.WithContext(ctx)
-		next(w, r)
-	}
+	return requireAuth("", next)
 }
 
 // GET /v1/pending-messages — list all groups with resolved titles
@@ -81,7 +69,7 @@ func (h *PendingMessagesHandler) handleListGroups(w http.ResponseWriter, r *http
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{"groups": groups})
+	writeJSON(w, http.StatusOK, map[string]any{"groups": groups})
 }
 
 // GET /v1/pending-messages/messages?channel=X&key=Y — list messages for a group
@@ -99,7 +87,7 @@ func (h *PendingMessagesHandler) handleListMessages(w http.ResponseWriter, r *ht
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"messages": msgs})
+	writeJSON(w, http.StatusOK, map[string]any{"messages": msgs})
 }
 
 // DELETE /v1/pending-messages?channel=X&key=Y — clear a group
@@ -139,7 +127,7 @@ func (h *PendingMessagesHandler) handleCompact(w http.ResponseWriter, r *http.Re
 	}
 
 	// Resolve an LLM provider for summarization using the default agent's config
-	provider, model := h.resolveProviderAndModel()
+	provider, model := h.resolveProviderAndModel(r.Context())
 	if provider == nil {
 		// Fallback: hard delete if no provider available
 		slog.Warn("compact.no_provider", "channel", req.ChannelName, "key", req.HistoryKey)
@@ -151,34 +139,38 @@ func (h *PendingMessagesHandler) handleCompact(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Detach from HTTP request context so LLM summarization isn't
-	// cancelled when the browser closes the connection.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 180*time.Second)
-	defer cancel()
-
+	// Run compaction in background so the HTTP response returns immediately.
+	// The long-running LLM call (30-120s) was blocking the response, which
+	// caused browser WebSocket connections to drop (pong timeout).
 	keepRecent := h.keepRecent
 	if keepRecent <= 0 {
 		keepRecent = 15
 	}
-	remaining, err := channels.CompactGroup(ctx, h.store, req.ChannelName, req.HistoryKey, provider, model, keepRecent, h.maxTokens)
-	if err != nil {
-		slog.Warn("compact.failed", "channel", req.ChannelName, "key", req.HistoryKey, "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ok", "method": "summarized", "remaining": remaining})
+	tenantID := store.TenantIDFromContext(r.Context())
+	go func() {
+		ctx, cancel := context.WithTimeout(store.WithTenantID(context.Background(), tenantID), 180*time.Second)
+		defer cancel()
+		remaining, err := channels.CompactGroup(ctx, h.store, req.ChannelName, req.HistoryKey, provider, model, keepRecent, h.maxTokens)
+		if err != nil {
+			slog.Warn("compact.failed", "channel", req.ChannelName, "key", req.HistoryKey, "error", err)
+		} else {
+			slog.Info("compact.done", "channel", req.ChannelName, "key", req.HistoryKey, "remaining", remaining)
+		}
+	}()
+
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted", "method": "summarizing"})
 }
 
 // resolveProviderAndModel resolves the LLM provider+model for pending message compaction.
 // Priority: config provider/model > default agent's provider/model > first available provider.
-func (h *PendingMessagesHandler) resolveProviderAndModel() (providers.Provider, string) {
+func (h *PendingMessagesHandler) resolveProviderAndModel(ctx context.Context) (providers.Provider, string) {
 	if h.providerReg == nil {
 		return nil, ""
 	}
 
 	// Config-level provider/model override.
 	if h.cfgProvider != "" {
-		if p, err := h.providerReg.Get(h.cfgProvider); err == nil {
+		if p, err := h.providerReg.Get(ctx, h.cfgProvider); err == nil {
 			model := h.cfgModel
 			if model == "" {
 				model = p.DefaultModel()
@@ -191,8 +183,8 @@ func (h *PendingMessagesHandler) resolveProviderAndModel() (providers.Provider, 
 
 	// Fallback: default agent's provider+model.
 	if h.agentStore != nil {
-		if ag, err := h.agentStore.GetDefault(context.Background()); err == nil && ag.Provider != "" {
-			if p, err := h.providerReg.Get(ag.Provider); err == nil {
+		if ag, err := h.agentStore.GetDefault(ctx); err == nil && ag.Provider != "" {
+			if p, err := providerresolve.ResolveConfiguredProvider(h.providerReg, ag); err == nil {
 				model := ag.Model
 				if model == "" {
 					model = p.DefaultModel()
@@ -205,8 +197,8 @@ func (h *PendingMessagesHandler) resolveProviderAndModel() (providers.Provider, 
 	}
 
 	// Fallback: first provider with a valid default model
-	for _, name := range h.providerReg.List() {
-		p, err := h.providerReg.Get(name)
+	for _, name := range h.providerReg.List(ctx) {
+		p, err := h.providerReg.Get(ctx, name)
 		if err != nil {
 			continue
 		}

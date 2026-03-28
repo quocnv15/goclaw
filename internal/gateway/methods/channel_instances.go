@@ -14,15 +14,24 @@ import (
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
+// channelInstanceAllowed mirrors the HTTP allowlist in internal/http/validate.go.
+var channelInstanceAllowed = map[string]bool{
+	"channel_type": true, "credentials": true, "agent_id": true,
+	"enabled": true, "group_policy": true, "allow_from": true,
+	"metadata": true, "webhook_secret": true, "config": true,
+	"display_name": true,
+}
+
 // ChannelInstancesMethods handles channel instance CRUD via WebSocket RPC.
 type ChannelInstancesMethods struct {
-	store  store.ChannelInstanceStore
-	msgBus *bus.MessageBus
+	store    store.ChannelInstanceStore
+	msgBus   *bus.MessageBus
+	eventBus bus.EventPublisher
 }
 
 // NewChannelInstancesMethods creates a new handler for channel instance management.
-func NewChannelInstancesMethods(s store.ChannelInstanceStore, msgBus *bus.MessageBus) *ChannelInstancesMethods {
-	return &ChannelInstancesMethods{store: s, msgBus: msgBus}
+func NewChannelInstancesMethods(s store.ChannelInstanceStore, msgBus *bus.MessageBus, eventBus bus.EventPublisher) *ChannelInstancesMethods {
+	return &ChannelInstancesMethods{store: s, msgBus: msgBus, eventBus: eventBus}
 }
 
 // Register registers all channel instance RPC methods.
@@ -141,6 +150,7 @@ func (m *ChannelInstancesMethods) handleCreate(ctx context.Context, client *gate
 	}
 
 	m.emitCacheInvalidate()
+	emitAudit(m.eventBus, client, "channel_instance.created", "channel_instance", inst.ID.String())
 	client.SendResponse(protocol.NewOKResponse(req.ID, maskInstance(*inst)))
 }
 
@@ -160,10 +170,20 @@ func (m *ChannelInstancesMethods) handleUpdate(ctx context.Context, client *gate
 		return
 	}
 
-	var updates map[string]any
-	if err := json.Unmarshal(params.Updates, &updates); err != nil {
+	var raw map[string]any
+	if err := json.Unmarshal(params.Updates, &raw); err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidUpdates)))
 		return
+	}
+
+	// Allowlist: only permit known channel instance columns (matches HTTP handler).
+	updates := make(map[string]any, len(raw))
+	for k, v := range raw {
+		if channelInstanceAllowed[k] {
+			updates[k] = v
+		} else {
+			slog.Warn("security.filtered_unknown_field", "field", k, "handler", "channels.instances.update")
+		}
 	}
 
 	if err := m.store.Update(ctx, id, updates); err != nil {
@@ -173,6 +193,7 @@ func (m *ChannelInstancesMethods) handleUpdate(ctx context.Context, client *gate
 	}
 
 	m.emitCacheInvalidate()
+	emitAudit(m.eventBus, client, "channel_instance.updated", "channel_instance", id.String())
 	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{"status": "updated"}))
 }
 
@@ -209,6 +230,7 @@ func (m *ChannelInstancesMethods) handleDelete(ctx context.Context, client *gate
 	}
 
 	m.emitCacheInvalidate()
+	emitAudit(m.eventBus, client, "channel_instance.deleted", "channel_instance", id.String())
 	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{"status": "deleted"}))
 }
 

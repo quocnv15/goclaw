@@ -26,51 +26,72 @@ func (s *PGTracingStore) CreateTrace(ctx context.Context, trace *store.TraceData
 	if trace.ID == uuid.Nil {
 		trace.ID = store.GenNewID()
 	}
+	tenantID := store.TenantIDFromContext(ctx)
+	if tenantID == uuid.Nil {
+		tenantID = store.MasterTenantID
+	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO traces (id, parent_trace_id, agent_id, user_id, session_key, run_id, start_time, end_time,
 		 duration_ms, name, channel, input_preview, output_preview,
-		 total_input_tokens, total_output_tokens, span_count, llm_call_count, tool_call_count,
-		 status, error, metadata, tags, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)`,
+		 total_input_tokens, total_output_tokens, total_cost, span_count, llm_call_count, tool_call_count,
+		 status, error, metadata, tags, team_id, created_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)`,
 		trace.ID, nilUUID(trace.ParentTraceID), nilUUID(trace.AgentID), nilStr(trace.UserID), nilStr(trace.SessionKey),
 		nilStr(trace.RunID), trace.StartTime, nilTime(trace.EndTime),
 		nilInt(trace.DurationMS), nilStr(trace.Name), nilStr(trace.Channel),
 		nilStr(trace.InputPreview), nilStr(trace.OutputPreview),
-		trace.TotalInputTokens, trace.TotalOutputTokens, trace.SpanCount, trace.LLMCallCount, trace.ToolCallCount,
-		trace.Status, nilStr(trace.Error), jsonOrEmpty(trace.Metadata), pqStringArray(trace.Tags), trace.CreatedAt,
+		trace.TotalInputTokens, trace.TotalOutputTokens, trace.TotalCost, trace.SpanCount, trace.LLMCallCount, trace.ToolCallCount,
+		trace.Status, nilStr(trace.Error), jsonOrEmpty(trace.Metadata), pqStringArray(trace.Tags), nilUUID(trace.TeamID), trace.CreatedAt, tenantID,
 	)
 	return err
 }
 
 func (s *PGTracingStore) UpdateTrace(ctx context.Context, traceID uuid.UUID, updates map[string]any) error {
-	return execMapUpdate(ctx, s.db, "traces", traceID, updates)
+	if store.IsCrossTenant(ctx) {
+		return execMapUpdate(ctx, s.db, "traces", traceID, updates)
+	}
+	tid := store.TenantIDFromContext(ctx)
+	if tid == uuid.Nil {
+		return fmt.Errorf("tenant_id required for update")
+	}
+	return execMapUpdateWhereTenant(ctx, s.db, "traces", updates, traceID, tid)
 }
 
 func (s *PGTracingStore) GetTrace(ctx context.Context, traceID uuid.UUID) (*store.TraceData, error) {
 	var d store.TraceData
-	var parentTraceID, agentID *uuid.UUID
+	var parentTraceID, agentID, teamID *uuid.UUID
 	var userID, sessionKey, runID, name, channel, inputPreview, outputPreview, errStr *string
 	var endTime *time.Time
 	var durationMS *int
 	var metadata *[]byte
 	var tags []byte
 
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id, parent_trace_id, agent_id, user_id, session_key, run_id, start_time, end_time,
+	query := `SELECT id, parent_trace_id, agent_id, user_id, session_key, run_id, start_time, end_time,
 		 duration_ms, name, channel, input_preview, output_preview,
-		 total_input_tokens, total_output_tokens, span_count, llm_call_count, tool_call_count,
-		 status, error, metadata, tags, created_at
-		 FROM traces WHERE id = $1`, traceID,
-	).Scan(&d.ID, &parentTraceID, &agentID, &userID, &sessionKey, &runID, &d.StartTime, &endTime,
+		 total_input_tokens, total_output_tokens, COALESCE(total_cost, 0), span_count, llm_call_count, tool_call_count,
+		 status, error, metadata, tags, team_id, created_at
+		 FROM traces WHERE id = $1`
+	qArgs := []any{traceID}
+	if !store.IsCrossTenant(ctx) {
+		tenantID := store.TenantIDFromContext(ctx)
+		if tenantID == uuid.Nil {
+			return nil, sql.ErrNoRows
+		}
+		query += ` AND tenant_id = $2`
+		qArgs = append(qArgs, tenantID)
+	}
+
+	err := s.db.QueryRowContext(ctx, query, qArgs...).Scan(&d.ID, &parentTraceID, &agentID, &userID, &sessionKey, &runID, &d.StartTime, &endTime,
 		&durationMS, &name, &channel, &inputPreview, &outputPreview,
-		&d.TotalInputTokens, &d.TotalOutputTokens, &d.SpanCount, &d.LLMCallCount, &d.ToolCallCount,
-		&d.Status, &errStr, &metadata, &tags, &d.CreatedAt)
+		&d.TotalInputTokens, &d.TotalOutputTokens, &d.TotalCost, &d.SpanCount, &d.LLMCallCount, &d.ToolCallCount,
+		&d.Status, &errStr, &metadata, &tags, &teamID, &d.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 
 	d.ParentTraceID = parentTraceID
 	d.AgentID = agentID
+	d.TeamID = teamID
 	d.UserID = derefStr(userID)
 	d.SessionKey = derefStr(sessionKey)
 	d.RunID = derefStr(runID)
@@ -90,10 +111,20 @@ func (s *PGTracingStore) GetTrace(ctx context.Context, traceID uuid.UUID) (*stor
 	return &d, nil
 }
 
-func buildTraceWhere(opts store.TraceListOpts) (string, []any) {
+func buildTraceWhere(ctx context.Context, opts store.TraceListOpts) (string, []any) {
 	var conditions []string
 	var args []any
 	argIdx := 1
+
+	if !store.IsCrossTenant(ctx) {
+		tenantID := store.TenantIDFromContext(ctx)
+		if tenantID == uuid.Nil {
+			return " WHERE 1=0", nil // fail-closed: no tenant = no results
+		}
+		conditions = append(conditions, fmt.Sprintf("tenant_id = $%d", argIdx))
+		args = append(args, tenantID)
+		argIdx++
+	}
 
 	if opts.AgentID != nil {
 		conditions = append(conditions, fmt.Sprintf("agent_id = $%d", argIdx))
@@ -115,6 +146,11 @@ func buildTraceWhere(opts store.TraceListOpts) (string, []any) {
 		args = append(args, opts.Status)
 		argIdx++
 	}
+	if opts.Channel != "" {
+		conditions = append(conditions, fmt.Sprintf("channel = $%d", argIdx))
+		args = append(args, opts.Channel)
+		argIdx++
+	}
 
 	where := ""
 	if len(conditions) > 0 {
@@ -124,19 +160,19 @@ func buildTraceWhere(opts store.TraceListOpts) (string, []any) {
 }
 
 func (s *PGTracingStore) CountTraces(ctx context.Context, opts store.TraceListOpts) (int, error) {
-	where, args := buildTraceWhere(opts)
+	where, args := buildTraceWhere(ctx, opts)
 	var count int
 	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM traces"+where, args...).Scan(&count)
 	return count, err
 }
 
 func (s *PGTracingStore) ListTraces(ctx context.Context, opts store.TraceListOpts) ([]store.TraceData, error) {
-	where, args := buildTraceWhere(opts)
+	where, args := buildTraceWhere(ctx, opts)
 
 	q := `SELECT id, parent_trace_id, agent_id, user_id, session_key, run_id, start_time, end_time,
 		 duration_ms, name, channel, input_preview, output_preview,
-		 total_input_tokens, total_output_tokens, span_count, llm_call_count, tool_call_count,
-		 status, error, metadata, tags, created_at
+		 total_input_tokens, total_output_tokens, COALESCE(total_cost, 0), span_count, llm_call_count, tool_call_count,
+		 status, error, metadata, tags, team_id, created_at
 		 FROM traces` + where
 
 	limit := opts.Limit
@@ -154,7 +190,7 @@ func (s *PGTracingStore) ListTraces(ctx context.Context, opts store.TraceListOpt
 	var result []store.TraceData
 	for rows.Next() {
 		var d store.TraceData
-		var parentTraceID, agentID *uuid.UUID
+		var parentTraceID, agentID, teamID *uuid.UUID
 		var userID, sessionKey, runID, name, channel, inputPreview, outputPreview, errStr *string
 		var endTime *time.Time
 		var durationMS *int
@@ -163,13 +199,79 @@ func (s *PGTracingStore) ListTraces(ctx context.Context, opts store.TraceListOpt
 
 		if err := rows.Scan(&d.ID, &parentTraceID, &agentID, &userID, &sessionKey, &runID, &d.StartTime, &endTime,
 			&durationMS, &name, &channel, &inputPreview, &outputPreview,
-			&d.TotalInputTokens, &d.TotalOutputTokens, &d.SpanCount, &d.LLMCallCount, &d.ToolCallCount,
-			&d.Status, &errStr, &metadata, &tags, &d.CreatedAt); err != nil {
+			&d.TotalInputTokens, &d.TotalOutputTokens, &d.TotalCost, &d.SpanCount, &d.LLMCallCount, &d.ToolCallCount,
+			&d.Status, &errStr, &metadata, &tags, &teamID, &d.CreatedAt); err != nil {
 			continue
 		}
 
 		d.ParentTraceID = parentTraceID
 		d.AgentID = agentID
+		d.TeamID = teamID
+		d.UserID = derefStr(userID)
+		d.SessionKey = derefStr(sessionKey)
+		d.RunID = derefStr(runID)
+		d.EndTime = endTime
+		if durationMS != nil {
+			d.DurationMS = *durationMS
+		}
+		d.Name = derefStr(name)
+		d.Channel = derefStr(channel)
+		d.InputPreview = derefStr(inputPreview)
+		d.OutputPreview = derefStr(outputPreview)
+		d.Error = derefStr(errStr)
+		if metadata != nil {
+			d.Metadata = *metadata
+		}
+		scanStringArray(tags, &d.Tags)
+		result = append(result, d)
+	}
+	return result, nil
+}
+
+func (s *PGTracingStore) ListChildTraces(ctx context.Context, parentTraceID uuid.UUID) ([]store.TraceData, error) {
+	q := `SELECT id, parent_trace_id, agent_id, user_id, session_key, run_id, start_time, end_time,
+		 duration_ms, name, channel, input_preview, output_preview,
+		 total_input_tokens, total_output_tokens, COALESCE(total_cost, 0), span_count, llm_call_count, tool_call_count,
+		 status, error, metadata, tags, team_id, created_at
+		 FROM traces WHERE parent_trace_id = $1`
+	qArgs := []any{parentTraceID}
+
+	if !store.IsCrossTenant(ctx) {
+		tid := store.TenantIDFromContext(ctx)
+		if tid == uuid.Nil {
+			return nil, fmt.Errorf("tenant_id required")
+		}
+		q += " AND tenant_id = $2"
+		qArgs = append(qArgs, tid)
+	}
+	q += " ORDER BY created_at"
+
+	rows, err := s.db.QueryContext(ctx, q, qArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []store.TraceData
+	for rows.Next() {
+		var d store.TraceData
+		var parentID, agentID, teamID *uuid.UUID
+		var userID, sessionKey, runID, name, channel, inputPreview, outputPreview, errStr *string
+		var endTime *time.Time
+		var durationMS *int
+		var metadata *[]byte
+		var tags []byte
+
+		if err := rows.Scan(&d.ID, &parentID, &agentID, &userID, &sessionKey, &runID, &d.StartTime, &endTime,
+			&durationMS, &name, &channel, &inputPreview, &outputPreview,
+			&d.TotalInputTokens, &d.TotalOutputTokens, &d.TotalCost, &d.SpanCount, &d.LLMCallCount, &d.ToolCallCount,
+			&d.Status, &errStr, &metadata, &tags, &teamID, &d.CreatedAt); err != nil {
+			continue
+		}
+
+		d.ParentTraceID = parentID
+		d.AgentID = agentID
+		d.TeamID = teamID
 		d.UserID = derefStr(userID)
 		d.SessionKey = derefStr(sessionKey)
 		d.RunID = derefStr(runID)
@@ -195,18 +297,22 @@ func (s *PGTracingStore) CreateSpan(ctx context.Context, span *store.SpanData) e
 	if span.ID == uuid.Nil {
 		span.ID = store.GenNewID()
 	}
+	tenantID := span.TenantID
+	if tenantID == uuid.Nil {
+		tenantID = store.MasterTenantID
+	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO spans (id, trace_id, parent_span_id, agent_id, span_type, name,
 		 start_time, end_time, duration_ms, status, error, level,
 		 model, provider, input_tokens, output_tokens, finish_reason,
 		 model_params, tool_name, tool_call_id, input_preview, output_preview,
-		 metadata, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`,
+		 metadata, team_id, created_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)`,
 		span.ID, span.TraceID, span.ParentSpanID, span.AgentID, span.SpanType, nilStr(span.Name),
 		span.StartTime, nilTime(span.EndTime), nilInt(span.DurationMS), span.Status, nilStr(span.Error), span.Level,
 		nilStr(span.Model), nilStr(span.Provider), nilInt(span.InputTokens), nilInt(span.OutputTokens), nilStr(span.FinishReason),
 		jsonOrNull(span.ModelParams), nilStr(span.ToolName), nilStr(span.ToolCallID), nilStr(span.InputPreview), nilStr(span.OutputPreview),
-		jsonOrNull(span.Metadata), span.CreatedAt,
+		jsonOrNull(span.Metadata), nilUUID(span.TeamID), span.CreatedAt, tenantID,
 	)
 	return err
 }
@@ -221,7 +327,7 @@ func (s *PGTracingStore) GetTraceSpans(ctx context.Context, traceID uuid.UUID) (
 		 start_time, end_time, duration_ms, status, error, level,
 		 model, provider, input_tokens, output_tokens, finish_reason,
 		 model_params, tool_name, tool_call_id, input_preview, output_preview,
-		 metadata, created_at
+		 metadata, team_id, created_at
 		 FROM spans WHERE trace_id = $1 ORDER BY start_time`, traceID)
 	if err != nil {
 		return nil, err
@@ -231,7 +337,7 @@ func (s *PGTracingStore) GetTraceSpans(ctx context.Context, traceID uuid.UUID) (
 	var result []store.SpanData
 	for rows.Next() {
 		var d store.SpanData
-		var parentSpanID, agentID *uuid.UUID
+		var parentSpanID, agentID, teamID *uuid.UUID
 		var name, errStr, level, model, provider, finishReason, toolName, toolCallID, inputPreview, outputPreview *string
 		var status *string
 		var endTime *time.Time
@@ -242,13 +348,14 @@ func (s *PGTracingStore) GetTraceSpans(ctx context.Context, traceID uuid.UUID) (
 			&d.StartTime, &endTime, &durationMS, &status, &errStr, &level,
 			&model, &provider, &inputTokens, &outputTokens, &finishReason,
 			&modelParams, &toolName, &toolCallID, &inputPreview, &outputPreview,
-			&metadata, &d.CreatedAt); err != nil {
+			&metadata, &teamID, &d.CreatedAt); err != nil {
 			slog.Warn("tracing: span scan failed", "trace_id", traceID, "error", err)
 			continue
 		}
 
 		d.ParentSpanID = parentSpanID
 		d.AgentID = agentID
+		d.TeamID = teamID
 		d.Name = derefStr(name)
 		d.EndTime = endTime
 		d.Status = derefStr(status)
@@ -287,7 +394,7 @@ func (s *PGTracingStore) BatchCreateSpans(ctx context.Context, spans []store.Spa
 	}
 
 	// Build multi-row INSERT
-	const cols = 24
+	const cols = 26
 	valueGroups := make([]string, len(spans))
 	args := make([]any, 0, len(spans)*cols)
 
@@ -295,6 +402,10 @@ func (s *PGTracingStore) BatchCreateSpans(ctx context.Context, spans []store.Spa
 		if span.ID == uuid.Nil {
 			span.ID = store.GenNewID()
 			spans[i].ID = span.ID
+		}
+		tenantID := span.TenantID
+		if tenantID == uuid.Nil {
+			tenantID = store.MasterTenantID
 		}
 		base := i * cols
 		placeholders := make([]string, cols)
@@ -308,7 +419,7 @@ func (s *PGTracingStore) BatchCreateSpans(ctx context.Context, spans []store.Spa
 			span.StartTime, nilTime(span.EndTime), nilInt(span.DurationMS), span.Status, nilStr(span.Error), span.Level,
 			nilStr(span.Model), nilStr(span.Provider), nilInt(span.InputTokens), nilInt(span.OutputTokens), nilStr(span.FinishReason),
 			jsonOrNull(span.ModelParams), nilStr(span.ToolName), nilStr(span.ToolCallID), nilStr(span.InputPreview), nilStr(span.OutputPreview),
-			jsonOrNull(span.Metadata), span.CreatedAt,
+			jsonOrNull(span.Metadata), nilUUID(span.TeamID), span.CreatedAt, tenantID,
 		)
 	}
 
@@ -316,7 +427,7 @@ func (s *PGTracingStore) BatchCreateSpans(ctx context.Context, spans []store.Spa
 		 start_time, end_time, duration_ms, status, error, level,
 		 model, provider, input_tokens, output_tokens, finish_reason,
 		 model_params, tool_name, tool_call_id, input_preview, output_preview,
-		 metadata, created_at)
+		 metadata, team_id, created_at, tenant_id)
 		 VALUES ` + strings.Join(valueGroups, ", ")
 
 	_, err := s.db.ExecContext(ctx, q, args...)
@@ -346,6 +457,7 @@ func (s *PGTracingStore) BatchUpdateTraceAggregates(ctx context.Context, traceID
 			tool_call_count = (SELECT COUNT(*) FROM spans WHERE trace_id = $1 AND span_type = 'tool_call'),
 			total_input_tokens = COALESCE((SELECT SUM(input_tokens) FROM spans WHERE trace_id = $1 AND span_type = 'llm_call' AND input_tokens IS NOT NULL), 0),
 			total_output_tokens = COALESCE((SELECT SUM(output_tokens) FROM spans WHERE trace_id = $1 AND span_type = 'llm_call' AND output_tokens IS NOT NULL), 0),
+			total_cost = COALESCE((SELECT SUM(total_cost) FROM spans WHERE trace_id = $1 AND total_cost IS NOT NULL), 0),
 			metadata = (
 				SELECT jsonb_build_object(
 					'total_cache_read_tokens', COALESCE(SUM((metadata->>'cache_read_tokens')::int), 0),
@@ -355,4 +467,100 @@ func (s *PGTracingStore) BatchUpdateTraceAggregates(ctx context.Context, traceID
 			)
 		WHERE id = $1`, traceID)
 	return err
+}
+
+func (s *PGTracingStore) GetMonthlyAgentCost(ctx context.Context, agentID uuid.UUID, year int, month time.Month) (float64, error) {
+	start := time.Date(year, month, 1, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(0, 1, 0)
+
+	q := `SELECT COALESCE(SUM(total_cost), 0) FROM traces
+		 WHERE agent_id = $1 AND created_at >= $2 AND created_at < $3 AND parent_trace_id IS NULL`
+	qArgs := []any{agentID, start, end}
+
+	if !store.IsCrossTenant(ctx) {
+		tid := store.TenantIDFromContext(ctx)
+		if tid != uuid.Nil {
+			q += " AND tenant_id = $4"
+			qArgs = append(qArgs, tid)
+		}
+	}
+
+	var cost float64
+	err := s.db.QueryRowContext(ctx, q, qArgs...).Scan(&cost)
+	return cost, err
+}
+
+func (s *PGTracingStore) GetCostSummary(ctx context.Context, opts store.CostSummaryOpts) ([]store.CostSummaryRow, error) {
+	var conditions []string
+	var args []any
+	argIdx := 1
+
+	// Only root traces (not delegations)
+	conditions = append(conditions, "parent_trace_id IS NULL")
+
+	if !store.IsCrossTenant(ctx) {
+		tenantID := store.TenantIDFromContext(ctx)
+		if tenantID != uuid.Nil {
+			conditions = append(conditions, fmt.Sprintf("tenant_id = $%d", argIdx))
+			args = append(args, tenantID)
+			argIdx++
+		}
+	}
+
+	if opts.AgentID != nil {
+		conditions = append(conditions, fmt.Sprintf("agent_id = $%d", argIdx))
+		args = append(args, *opts.AgentID)
+		argIdx++
+	}
+	if opts.From != nil {
+		conditions = append(conditions, fmt.Sprintf("created_at >= $%d", argIdx))
+		args = append(args, *opts.From)
+		argIdx++
+	}
+	if opts.To != nil {
+		conditions = append(conditions, fmt.Sprintf("created_at < $%d", argIdx))
+		args = append(args, *opts.To)
+		argIdx++
+	}
+
+	where := " WHERE " + strings.Join(conditions, " AND ")
+
+	q := `SELECT agent_id, COALESCE(SUM(total_cost), 0), COALESCE(SUM(total_input_tokens), 0),
+		  COALESCE(SUM(total_output_tokens), 0), COUNT(*)
+		  FROM traces` + where + ` GROUP BY agent_id ORDER BY SUM(total_cost) DESC`
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []store.CostSummaryRow
+	for rows.Next() {
+		var r store.CostSummaryRow
+		var agentID *uuid.UUID
+		if err := rows.Scan(&agentID, &r.TotalCost, &r.TotalInputTokens, &r.TotalOutputTokens, &r.TraceCount); err != nil {
+			continue
+		}
+		r.AgentID = agentID
+		result = append(result, r)
+	}
+	return result, nil
+}
+
+// DeleteTracesOlderThan deletes traces and their spans older than cutoff.
+// Spans are deleted first (FK), then traces. Returns total traces deleted.
+func (s *PGTracingStore) DeleteTracesOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	// Delete spans belonging to old traces.
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM spans WHERE trace_id IN (SELECT id FROM traces WHERE created_at < $1)`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("delete old spans: %w", err)
+	}
+
+	res, err := s.db.ExecContext(ctx, `DELETE FROM traces WHERE created_at < $1`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("delete old traces: %w", err)
+	}
+	return res.RowsAffected()
 }

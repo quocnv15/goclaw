@@ -10,9 +10,11 @@
 package tools
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -60,19 +62,22 @@ type SubagentTask struct {
 	CreatedAt        int64  `json:"createdAt"`
 	CompletedAt      int64  `json:"completedAt,omitempty"`
 	Media            []bus.MediaFile `json:"-"` // media files from tool results
+	OriginTenantID   uuid.UUID `json:"-"` // parent's tenant for announce routing
 	OriginTraceID    uuid.UUID `json:"-"` // parent trace for announce linking
 	OriginRootSpanID uuid.UUID `json:"-"` // parent agent's root span ID
 	cancelFunc       context.CancelFunc `json:"-"` // per-task context cancel
+	spawnConfig      SubagentConfig `json:"-"` // resolved config at spawn time (per-agent override merged)
 }
 
 // SubagentManager manages the lifecycle of spawned subagents.
 type SubagentManager struct {
-	mu       sync.RWMutex
-	tasks    map[string]*SubagentTask
-	config   SubagentConfig
-	provider providers.Provider
-	model    string
-	msgBus   *bus.MessageBus
+	mu          sync.RWMutex
+	tasks       map[string]*SubagentTask
+	config      SubagentConfig
+	provider    providers.Provider   // default provider (fallback)
+	providerReg *providers.Registry  // registry for resolving parent's provider
+	model       string
+	msgBus      *bus.MessageBus
 
 	// createTools builds a tool registry for subagents (without spawn/subagent tools).
 	createTools   func() *Registry
@@ -82,6 +87,7 @@ type SubagentManager struct {
 // NewSubagentManager creates a new subagent manager.
 func NewSubagentManager(
 	provider providers.Provider,
+	providerReg *providers.Registry,
 	model string,
 	msgBus *bus.MessageBus,
 	createTools func() *Registry,
@@ -91,6 +97,7 @@ func NewSubagentManager(
 		tasks:       make(map[string]*SubagentTask),
 		config:      cfg,
 		provider:    provider,
+		providerReg: providerReg,
 		model:       model,
 		msgBus:      msgBus,
 		createTools: createTools,
@@ -103,17 +110,86 @@ func (sm *SubagentManager) SetAnnounceQueue(q *AnnounceQueue) {
 	sm.announceQueue = q
 }
 
-// CountRunningForParent returns the number of running tasks for a parent.
-func (sm *SubagentManager) CountRunningForParent(parentID string) int {
+// effectiveConfig returns the per-agent context override merged with defaults,
+// or falls back to sm.config when no override is present.
+func (sm *SubagentManager) effectiveConfig(ctx context.Context) SubagentConfig {
+	override := SubagentConfigFromCtx(ctx)
+	if override == nil {
+		return sm.config
+	}
+	cfg := sm.config
+	if override.MaxConcurrent > 0 {
+		cfg.MaxConcurrent = override.MaxConcurrent
+	}
+	if override.MaxSpawnDepth > 0 {
+		cfg.MaxSpawnDepth = override.MaxSpawnDepth
+	}
+	if override.MaxChildrenPerAgent > 0 {
+		cfg.MaxChildrenPerAgent = override.MaxChildrenPerAgent
+	}
+	if override.ArchiveAfterMinutes > 0 {
+		cfg.ArchiveAfterMinutes = override.ArchiveAfterMinutes
+	}
+	if override.Model != "" {
+		cfg.Model = override.Model
+	}
+	return cfg
+}
+
+// SubagentRosterEntry summarizes one subagent task for the roster.
+type SubagentRosterEntry struct {
+	Label  string
+	Status string // "running", "completed", "failed", "cancelled"
+}
+
+// SubagentRoster holds the full roster of subagent tasks for a parent,
+// including per-agent config limits for deterministic LLM context.
+type SubagentRoster struct {
+	Entries     []SubagentRosterEntry
+	Total       int // total tasks for this parent
+	MaxPerAgent int // from spawnConfig.MaxChildrenPerAgent
+}
+
+// RosterForParent returns the full roster of tasks for a parent.
+// Sorted: completed/failed/cancelled first, then running (deterministic output).
+func (sm *SubagentManager) RosterForParent(parentID string) SubagentRoster {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	count := 0
+
+	var entries []SubagentRosterEntry
+	maxPerAgent := 0
 	for _, t := range sm.tasks {
-		if t.ParentID == parentID && t.Status == TaskStatusRunning {
-			count++
+		if t.ParentID != parentID {
+			continue
+		}
+		entries = append(entries, SubagentRosterEntry{
+			Label:  t.Label,
+			Status: t.Status,
+		})
+		if maxPerAgent == 0 {
+			maxPerAgent = t.spawnConfig.MaxChildrenPerAgent
 		}
 	}
-	return count
+
+	// Sort: non-running first (completed/failed/cancelled), then running.
+	// Within same group, sort alphabetically by label for determinism.
+	slices.SortFunc(entries, func(a, b SubagentRosterEntry) int {
+		aRunning := a.Status == TaskStatusRunning
+		bRunning := b.Status == TaskStatusRunning
+		if aRunning != bRunning {
+			if aRunning {
+				return 1 // running goes last
+			}
+			return -1
+		}
+		return cmp.Compare(a.Label, b.Label)
+	})
+
+	return SubagentRoster{
+		Entries:     entries,
+		Total:       len(entries),
+		MaxPerAgent: maxPerAgent,
+	}
 }
 
 // SubagentDenyAlways is the list of tools always denied to subagents.
@@ -147,12 +223,13 @@ func (sm *SubagentManager) Spawn(
 	channel, chatID, peerKind string,
 	callback AsyncCallback,
 ) (string, error) {
+	cfg := sm.effectiveConfig(ctx)
 	sm.mu.Lock()
 
 	// Check depth limit
-	if depth >= sm.config.MaxSpawnDepth {
+	if depth >= cfg.MaxSpawnDepth {
 		sm.mu.Unlock()
-		return "", fmt.Errorf("spawn depth limit reached (%d/%d)", depth, sm.config.MaxSpawnDepth)
+		return "", fmt.Errorf("spawn depth limit reached (%d/%d)", depth, cfg.MaxSpawnDepth)
 	}
 
 	// Check concurrent limit
@@ -162,9 +239,9 @@ func (sm *SubagentManager) Spawn(
 			running++
 		}
 	}
-	if running >= sm.config.MaxConcurrent {
+	if running >= cfg.MaxConcurrent {
 		sm.mu.Unlock()
-		return "", fmt.Errorf("max concurrent subagents reached (%d/%d)", running, sm.config.MaxConcurrent)
+		return "", fmt.Errorf("max concurrent subagents reached (%d/%d)", running, cfg.MaxConcurrent)
 	}
 
 	// Check per-parent children limit
@@ -174,9 +251,9 @@ func (sm *SubagentManager) Spawn(
 			childCount++
 		}
 	}
-	if childCount >= sm.config.MaxChildrenPerAgent {
+	if childCount >= cfg.MaxChildrenPerAgent {
 		sm.mu.Unlock()
-		return "", fmt.Errorf("max children per agent reached (%d/%d)", childCount, sm.config.MaxChildrenPerAgent)
+		return "", fmt.Errorf("max children per agent reached (%d/%d)", childCount, cfg.MaxChildrenPerAgent)
 	}
 
 	id := generateSubagentID()
@@ -198,12 +275,17 @@ func (sm *SubagentManager) Spawn(
 		OriginLocalKey:    ToolLocalKeyFromCtx(ctx),
 		OriginUserID:      store.UserIDFromContext(ctx),
 		OriginSessionKey:  ToolSessionKeyFromCtx(ctx),
+		OriginTenantID:    store.TenantIDFromContext(ctx),
 		OriginTraceID:     tracing.TraceIDFromContext(ctx),
 		OriginRootSpanID:  tracing.ParentSpanIDFromContext(ctx),
 		CreatedAt:         time.Now().UnixMilli(),
+		spawnConfig:       cfg,
 	}
-	// Create per-task context for real goroutine cancellation
-	taskCtx, taskCancel := context.WithCancel(ctx)
+	// Detach from parent's cancellation chain so subagent survives after parent run completes.
+	// WithoutCancel preserves all context values (agent ID, workspace, trace info, etc.)
+	// but parent Done() no longer propagates. Manual cancel via taskCancel() still works.
+	detached := context.WithoutCancel(ctx)
+	taskCtx, taskCancel := context.WithCancel(detached)
 	subTask.cancelFunc = taskCancel
 
 	sm.tasks[id] = subTask
@@ -225,11 +307,13 @@ func (sm *SubagentManager) RunSync(
 	task, label string,
 	channel, chatID string,
 ) (string, int, error) {
+	cfg := sm.effectiveConfig(ctx)
+
 	sm.mu.Lock()
 
-	if depth >= sm.config.MaxSpawnDepth {
+	if depth >= cfg.MaxSpawnDepth {
 		sm.mu.Unlock()
-		return "", 0, fmt.Errorf("spawn depth limit reached (%d/%d)", depth, sm.config.MaxSpawnDepth)
+		return "", 0, fmt.Errorf("spawn depth limit reached (%d/%d)", depth, cfg.MaxSpawnDepth)
 	}
 
 	id := generateSubagentID()
@@ -251,6 +335,7 @@ func (sm *SubagentManager) RunSync(
 		OriginTraceID:    tracing.TraceIDFromContext(ctx),
 		OriginRootSpanID: tracing.ParentSpanIDFromContext(ctx),
 		CreatedAt:        time.Now().UnixMilli(),
+		spawnConfig:      cfg,
 	}
 	sm.tasks[id] = subTask
 	sm.mu.Unlock()

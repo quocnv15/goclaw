@@ -14,6 +14,7 @@ import (
 // MemorySearchTool implements the memory_search tool for hybrid semantic + FTS search.
 type MemorySearchTool struct {
 	memStore store.MemoryStore // Postgres-backed
+	hasKG    bool              // knowledge_graph_search tool is available
 }
 
 func NewMemorySearchTool() *MemorySearchTool {
@@ -23,6 +24,11 @@ func NewMemorySearchTool() *MemorySearchTool {
 // SetMemoryStore enables Postgres queries with agentID/userID scoping.
 func (t *MemorySearchTool) SetMemoryStore(ms store.MemoryStore) {
 	t.memStore = ms
+}
+
+// SetHasKG enables the KG hint in search results.
+func (t *MemorySearchTool) SetHasKG(has bool) {
+	t.hasKG = has
 }
 
 func (t *MemorySearchTool) Name() string { return "memory_search" }
@@ -72,22 +78,51 @@ func (t *MemorySearchTool) Execute(ctx context.Context, args map[string]any) *Re
 		return ErrorResult("memory system not available")
 	}
 
-	userID := store.UserIDFromContext(ctx)
-	results, err := t.memStore.Search(ctx, query, agentID.String(), userID, store.MemorySearchOptions{
+	userID := store.MemoryUserID(ctx)
+	searchOpts := store.MemorySearchOptions{
 		MaxResults: maxResults,
 		MinScore:   minScore,
-	})
+	}
+	// Apply per-agent memory config overrides if set
+	if mc := MemoryConfigFromCtx(ctx); mc != nil {
+		if mc.MaxResults > 0 && searchOpts.MaxResults <= 0 {
+			searchOpts.MaxResults = mc.MaxResults
+		}
+		if mc.VectorWeight > 0 {
+			searchOpts.VectorWeight = mc.VectorWeight
+		}
+		if mc.TextWeight > 0 {
+			searchOpts.TextWeight = mc.TextWeight
+		}
+		if mc.MinScore > 0 && searchOpts.MinScore <= 0 {
+			searchOpts.MinScore = mc.MinScore
+		}
+	}
+	agentStr := agentID.String()
+	results, err := t.memStore.Search(ctx, query, agentStr, userID, searchOpts)
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("memory search failed: %v", err))
+	}
+	// Fallback: also search leader's memory for team members and merge results.
+	if leaderID := LeaderAgentIDFromCtx(ctx); leaderID != "" && leaderID != agentStr {
+		leaderResults, lerr := t.memStore.Search(ctx, query, leaderID, userID, searchOpts)
+		if lerr != nil && userID != "" {
+			leaderResults, _ = t.memStore.Search(ctx, query, leaderID, "", searchOpts)
+		}
+		results = append(results, leaderResults...)
 	}
 	if len(results) == 0 {
 		return NewResult("No memory results found for query: " + query)
 	}
 
-	data, _ := json.MarshalIndent(map[string]any{
+	output := map[string]any{
 		"results": results,
 		"count":   len(results),
-	}, "", "  ")
+	}
+	if t.hasKG {
+		output["hint"] = "Also run knowledge_graph_search if the query involves people, teams, projects, or connections between entities."
+	}
+	data, _ := json.MarshalIndent(output, "", "  ")
 	return NewResult(string(data))
 }
 
@@ -151,13 +186,23 @@ func (t *MemoryGetTool) Execute(ctx context.Context, args map[string]any) *Resul
 		return ErrorResult("memory system not available")
 	}
 
-	userID := store.UserIDFromContext(ctx)
+	userID := store.MemoryUserID(ctx)
+
+	agentStr := agentID.String()
 
 	// Try per-user first, then global
-	content, err := t.memStore.GetDocument(ctx, agentID.String(), userID, path)
+	content, err := t.memStore.GetDocument(ctx, agentStr, userID, path)
 	if err != nil && userID != "" {
-		// Fallback to global
-		content, err = t.memStore.GetDocument(ctx, agentID.String(), "", path)
+		content, err = t.memStore.GetDocument(ctx, agentStr, "", path)
+	}
+	// Fallback: try leader's memory for team members.
+	if err != nil {
+		if leaderID := LeaderAgentIDFromCtx(ctx); leaderID != "" && leaderID != agentStr {
+			content, err = t.memStore.GetDocument(ctx, leaderID, userID, path)
+			if err != nil && userID != "" {
+				content, err = t.memStore.GetDocument(ctx, leaderID, "", path)
+			}
+		}
 	}
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("failed to read %s: %v", path, err))

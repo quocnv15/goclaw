@@ -59,6 +59,10 @@ func (t *CreateVideoTool) Parameters() map[string]any {
 				"type":        "string",
 				"description": "Aspect ratio: '16:9' (default) or '9:16'.",
 			},
+			"filename_hint": map[string]any{
+				"type":        "string",
+				"description": "Short descriptive filename (no extension). Example: 'cat-playing-piano', 'product-demo'.",
+			},
 		},
 		"required": []string{"prompt"},
 	}
@@ -69,6 +73,7 @@ func (t *CreateVideoTool) Execute(ctx context.Context, args map[string]any) *Res
 	if prompt == "" {
 		return ErrorResult("prompt is required")
 	}
+	filenameHint, _ := args["filename_hint"].(string)
 
 	// Parse and enforce duration. Veo supports 4, 6, or 8 seconds.
 	duration := 8
@@ -122,12 +127,20 @@ func (t *CreateVideoTool) Execute(ctx context.Context, args map[string]any) *Res
 	if err := os.MkdirAll(dateDir, 0755); err != nil {
 		return ErrorResult(fmt.Sprintf("failed to create output directory: %v", err))
 	}
-	videoPath := filepath.Join(dateDir, fmt.Sprintf("goclaw_gen_%d.mp4", time.Now().UnixNano()))
+	videoPath := filepath.Join(dateDir, mediaFileName(ctx, "video", filenameHint, "mp4"))
 	if err := os.WriteFile(videoPath, chainResult.Data, 0644); err != nil {
 		return ErrorResult(fmt.Sprintf("failed to save generated video: %v", err))
 	}
 
-	result := &Result{ForLLM: fmt.Sprintf("MEDIA:%s", videoPath)}
+	// Verify file was persisted.
+	if fi, err := os.Stat(videoPath); err != nil {
+		slog.Warn("create_video: file missing immediately after write", "path", videoPath, "error", err)
+		return ErrorResult(fmt.Sprintf("generated video file missing after write: %v", err))
+	} else {
+		slog.Info("create_video: file saved", "path", videoPath, "size", fi.Size(), "data_len", len(chainResult.Data))
+	}
+
+	result := &Result{ForLLM: fmt.Sprintf("MEDIA:%s\nUse the EXACT filename when referencing: %s", videoPath, filepath.Base(videoPath))}
 	result.Media = []bus.MediaFile{{Path: videoPath, MimeType: "video/mp4"}}
 	result.Deliverable = fmt.Sprintf("[Generated video: %s]\nPrompt: %s", filepath.Base(videoPath), prompt)
 	result.Provider = chainResult.Provider
@@ -140,6 +153,9 @@ func (t *CreateVideoTool) Execute(ctx context.Context, args map[string]any) *Res
 
 // callProvider dispatches to the correct video generation implementation based on provider type.
 func (t *CreateVideoTool) callProvider(ctx context.Context, cp credentialProvider, providerName, model string, params map[string]any) ([]byte, *providers.Usage, error) {
+	if cp == nil {
+		return nil, nil, fmt.Errorf("provider %q does not expose API credentials required for video generation", providerName)
+	}
 	prompt := GetParamString(params, "prompt", "")
 	duration := GetParamInt(params, "duration", 8)
 	aspectRatio := GetParamString(params, "aspect_ratio", "16:9")
@@ -147,7 +163,7 @@ func (t *CreateVideoTool) callProvider(ctx context.Context, cp credentialProvide
 	slog.Info("create_video: calling video generation API",
 		"provider", providerName, "model", model, "duration", duration, "aspect_ratio", aspectRatio)
 
-	switch ProviderTypeFromName(providerName) {
+	switch GetParamString(params, "_provider_type", providerTypeFromName(providerName)) {
 	case "gemini":
 		return t.callGeminiVideoGen(ctx, cp.APIKey(), cp.APIBase(), model, prompt, duration, aspectRatio, params)
 	case "minimax":

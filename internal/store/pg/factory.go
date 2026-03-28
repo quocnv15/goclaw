@@ -18,9 +18,8 @@ func NewPGStores(cfg store.StoreConfig) (*store.Stores, error) {
 
 	skillsDir := cfg.SkillsStorageDir
 	if skillsDir == "" {
-		skillsDir = "~/.goclaw/skills-store"
+		skillsDir = config.ResolvedDataDirFromEnv() + "/skills-store"
 	}
-	skillsDir = config.ExpandHome(skillsDir)
 
 	return &store.Stores{
 		DB:        db,
@@ -33,7 +32,6 @@ func NewPGStores(cfg store.StoreConfig) (*store.Stores, error) {
 		Providers: NewPGProviderStore(db, cfg.EncryptionKey),
 		Tracing:   NewPGTracingStore(db),
 		MCP:              NewPGMCPServerStore(db, cfg.EncryptionKey),
-		CustomTools:      NewPGCustomToolStore(db, cfg.EncryptionKey),
 		ChannelInstances: NewPGChannelInstanceStore(db, cfg.EncryptionKey),
 		ConfigSecrets:    NewPGConfigSecretsStore(db, cfg.EncryptionKey),
 		AgentLinks:       NewPGAgentLinkStore(db),
@@ -42,5 +40,15 @@ func NewPGStores(cfg store.StoreConfig) (*store.Stores, error) {
 		PendingMessages:  NewPGPendingMessageStore(db),
 		KnowledgeGraph:   NewPGKnowledgeGraphStore(db),
 		Contacts:         NewPGContactStore(db),
+		Activity:         NewPGActivityStore(db),
+		Snapshots:        NewPGSnapshotStore(db),
+		SecureCLI:        NewPGSecureCLIStore(db, cfg.EncryptionKey),
+		APIKeys:           NewPGAPIKeyStore(db),
+		Heartbeats:        NewPGHeartbeatStore(db),
+		ConfigPermissions:     NewPGConfigPermissionStore(db),
+		Tenants:               NewPGTenantStore(db),
+		BuiltinToolTenantCfgs: NewPGBuiltinToolTenantConfigStore(db),
+		SkillTenantCfgs:       NewPGSkillTenantConfigStore(db),
+		SystemConfigs:         NewPGSystemConfigStore(db),
 	}, nil
 }

@@ -29,6 +29,7 @@ const EMPTY_BINDING: Binding = { agentId: "", match: { channel: "", peer: { kind
 
 export function BindingsSection({ data, onSave, saving }: Props) {
   const { t } = useTranslation("config");
+  const { t: tc } = useTranslation("common");
   const [draft, setDraft] = useState<Binding[]>(data ?? []);
   const [dirty, setDirty] = useState(false);
 
@@ -91,20 +92,20 @@ export function BindingsSection({ data, onSave, saving }: Props) {
         ) : (
           draft.map((binding, idx) => (
             <div key={idx} className="flex items-start gap-3 rounded-md border p-3">
-              <div className="grid flex-1 grid-cols-4 gap-3">
+              <div className="grid flex-1 grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
                 <div className="grid gap-1">
                   <Label className="text-xs">{t("bindings.agentId")}</Label>
                   <Input
                     value={binding.agentId ?? ""}
                     onChange={(e) => updateBinding(idx, { agentId: e.target.value })}
-                    placeholder="default"
+                    placeholder={tc("default")}
                   />
                 </div>
                 <div className="grid gap-1">
                   <Label className="text-xs">{t("bindings.channel")}</Label>
                   <Select value={binding.match?.channel ?? ""} onValueChange={(v) => updateMatch(idx, { channel: v })}>
                     <SelectTrigger>
-                      <SelectValue placeholder="Any" />
+                      <SelectValue placeholder={t("bindings.any")} />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="telegram">Telegram</SelectItem>
@@ -120,7 +121,7 @@ export function BindingsSection({ data, onSave, saving }: Props) {
                   <Label className="text-xs">{t("bindings.peerKind")}</Label>
                   <Select value={binding.match?.peer?.kind ?? ""} onValueChange={(v) => updatePeer(idx, { kind: v })}>
                     <SelectTrigger>
-                      <SelectValue placeholder="Any" />
+                      <SelectValue placeholder={t("bindings.any")} />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="direct">Direct</SelectItem>
@@ -133,7 +134,7 @@ export function BindingsSection({ data, onSave, saving }: Props) {
                   <Input
                     value={binding.match?.peer?.id ?? ""}
                     onChange={(e) => updatePeer(idx, { id: e.target.value })}
-                    placeholder="Optional"
+                    placeholder={tc("optional")}
                   />
                 </div>
               </div>

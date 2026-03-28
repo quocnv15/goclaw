@@ -53,7 +53,7 @@ func init() {
 		// HTTP API
 		MsgInvalidAuth:           "invalid authentication",
 		MsgMsgsRequired:          "messages is required",
-		MsgUserIDHeader:          "X-GoClaw-User-Id header is required in managed mode",
+		MsgUserIDHeader:          "X-GoClaw-User-Id header is required",
 		MsgFileTooLarge:          "file too large or invalid multipart form",
 		MsgMissingFileField:      "missing 'file' field",
 		MsgInvalidFilename:       "invalid filename",
@@ -93,11 +93,9 @@ func init() {
 		MsgAgentIsTeamLead:      "agent is already the team lead",
 		MsgCannotRemoveTeamLead: "cannot remove the team lead",
 
-		// Delegations
-		MsgDelegationsUnavailable: "delegations not available",
-
 		// Channels
 		MsgCannotDeleteDefaultInst: "cannot delete default channel instance",
+		MsgCannotRemoveLastWriter:  "cannot remove the last file writer",
 
 		// Skills
 		MsgSkillsUpdateNotSupported: "skills.update not supported for file-based skills",
@@ -131,6 +129,7 @@ func init() {
 		MsgStatusPhaseCompact:  "Phase: Compacting context...",
 		MsgStatusPhaseDefault:  "Phase: Processing...",
 		MsgCancelledReply:      "✋ Cancelled. What would you like to do next?",
+		MsgInjectedAck:         "Got it, I'll incorporate that into what I'm working on.",
 
 		// Knowledge Graph
 		MsgEntityIDRequired:       "entity_id is required",
@@ -168,10 +167,20 @@ func init() {
 		MsgToolSpawn:           "Spawn a subagent for background work or delegate a task to a linked agent",
 		MsgToolSkillSearch:     "Search for available skills by keyword or description to find relevant capabilities",
 		MsgToolUseSkill:        "Activate a skill to use its specialized capabilities (tracing marker)",
-		MsgToolDelegateSearch:  "Search for available delegation targets by keyword when there are too many linked agents to list",
-		MsgToolEvaluateLoop:    "Run a generate→evaluate→revise loop between two agents for quality-critical output",
-		MsgToolHandoff:         "Transfer the conversation to another agent — the user will talk directly to that agent",
+		MsgToolSkillManage:     "Create, patch, or delete skills from conversation experience",
+		MsgToolPublishSkill:    "Register a skill directory in the system database, making it discoverable",
 		MsgToolTeamTasks:       "View, create, update, and complete tasks on the team task board",
-		MsgToolTeamMessage:     "Send a direct message or broadcast to teammates in the agent team",
+
+		MsgSkillNudgePostscript: "This task involved several steps. Want me to save the process as a reusable skill? Reply **\"save as skill\"** or **\"skip\"**.",
+		MsgSkillNudge70Pct:      "[System] You are at 70% of your iteration budget. Consider whether any patterns from this session would make a good skill.",
+		MsgSkillNudge90Pct:      "[System] You are at 90% of your iteration budget. If this session involved reusable patterns, consider saving them as a skill before completing.",
+
+		MsgInvalidRole: "invalid role: allowed values are owner, admin, operator, member, viewer",
+
+		MsgContactIDsRequired:  "contact_ids is required",
+		MsgMergeTargetRequired: "exactly one of tenant_user_id or create_user is required",
+		MsgTenantUserNotFound:  "tenant user not found",
+		MsgTenantMismatch:      "tenant user does not belong to this tenant",
+		MsgTenantScopeRequired: "tenant scope is required for this operation",
 	})
 }

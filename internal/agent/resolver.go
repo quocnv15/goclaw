@@ -14,7 +14,9 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	mcpbridge "github.com/nextlevelbuilder/goclaw/internal/mcp"
 	"github.com/nextlevelbuilder/goclaw/internal/media"
+	"github.com/nextlevelbuilder/goclaw/internal/providerresolve"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/sandbox"
 	"github.com/nextlevelbuilder/goclaw/internal/skills"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
@@ -34,10 +36,12 @@ type ResolverDeps struct {
 	OnEvent        func(AgentEvent)
 	TraceCollector *tracing.Collector
 
-	// Per-user file seeding + dynamic context loading
-	EnsureUserFiles   EnsureUserFilesFunc
+	// Per-user profile + file seeding + dynamic context loading
+	EnsureUserProfile EnsureUserProfileFunc
+	SeedUserFiles     SeedUserFilesFunc
 	ContextFileLoader ContextFileLoaderFunc
 	BootstrapCleanup  BootstrapCleanupFunc
+	CacheInvalidate   CacheInvalidateFunc
 
 	// Security
 	InjectionAction string // "log", "warn", "block", "off"
@@ -50,14 +54,15 @@ type ResolverDeps struct {
 	SandboxContainerDir    string
 	SandboxWorkspaceAccess string
 
-	// Dynamic custom tools
-	DynamicLoader *tools.DynamicToolLoader
-
 	// Inter-agent delegation
 	AgentLinkStore store.AgentLinkStore
 
 	// Agent teams
 	TeamStore store.TeamStore
+	DataDir   string // global workspace root for team workspace resolution
+
+	// Secure CLI credential store for credentialed exec
+	SecureCLIStore store.SecureCLIStore
 
 	// Builtin tool settings
 	BuiltinToolStore store.BuiltinToolStore
@@ -71,18 +76,36 @@ type ResolverDeps struct {
 	// Skill access store — for per-agent skill visibility filtering
 	SkillAccessStore store.SkillAccessStore
 
-	// Group file writer cache
-	GroupWriterCache *store.GroupWriterCache
+	// Config permission store for group file writer checks
+	ConfigPermStore store.ConfigPermissionStore
 
 	// Persistent media storage for cross-turn image/document access
 	MediaStore *media.Store
+
+	// Model pricing for cost tracking
+	ModelPricing map[string]*config.ModelPricing
+
+	// Tracing store for budget enforcement queries
+	TracingStore store.TracingStore
+
+	// Memory store for extractive memory fallback
+	MemoryStore store.MemoryStore
+
+	// Tenant store for workspace path resolution
+	TenantStore store.TenantStore
+
+	// Per-tenant tool/skill config overrides
+	BuiltinToolTenantCfgs store.BuiltinToolTenantConfigStore
+	SkillTenantCfgs       store.SkillTenantConfigStore
+
+	// Global workspace root (GOCLAW_WORKSPACE)
+	Workspace string
 }
 
 // NewManagedResolver creates a ResolverFunc that builds Loops from DB agent data.
 // Agents are defined in Postgres, not config.json.
 func NewManagedResolver(deps ResolverDeps) ResolverFunc {
-	return func(agentKey string) (Agent, error) {
-		ctx := context.Background()
+	return func(ctx context.Context, agentKey string) (Agent, error) {
 
 		// Support lookup by UUID (e.g. from cron jobs that store agent_id as UUID)
 		var ag *store.AgentData
@@ -100,15 +123,15 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 			return nil, fmt.Errorf("agent %s is inactive", agentKey)
 		}
 
-		// Resolve provider
-		provider, err := deps.ProviderReg.Get(ag.Provider)
+		// Resolve provider (tenant-aware: tries tenant-specific first, falls back to master)
+		provider, err := providerresolve.ResolveConfiguredProvider(deps.ProviderReg, ag)
 		if err != nil {
-			// Fallback to any available provider
-			names := deps.ProviderReg.List()
+			// Fallback to any available provider for this tenant
+			names := deps.ProviderReg.ListForTenant(ag.TenantID)
 			if len(names) == 0 {
 				return nil, fmt.Errorf("no providers configured for agent %s", agentKey)
 			}
-			provider, _ = deps.ProviderReg.Get(names[0])
+			provider, _ = deps.ProviderReg.GetForTenant(ag.TenantID, names[0])
 			slog.Warn("agent provider not found, using fallback",
 				"agent", agentKey, "wanted", ag.Provider, "using", names[0])
 			if tl := ag.ParseThinkingLevel(); tl != "" && tl != "off" {
@@ -124,45 +147,6 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 
 		// Load bootstrap files from DB
 		contextFiles := bootstrap.LoadFromStore(ctx, deps.AgentStore, ag.ID)
-
-		// Inject DELEGATION.md from delegation links (only if not already present in DB).
-		// Uses DELEGATION.md (not AGENTS.md) to avoid collision with per-user AGENTS.md
-		// which contains workspace instructions for open agents.
-		hasDelegation := false
-		if deps.AgentLinkStore != nil {
-			hasDelegationMD := false
-			for _, cf := range contextFiles {
-				if cf.Path == bootstrap.DelegationFile {
-					hasDelegationMD = true
-					break
-				}
-			}
-			if !hasDelegationMD {
-				if allTargets, err := deps.AgentLinkStore.DelegateTargets(ctx, ag.ID); err == nil && len(allTargets) > 0 {
-					// Exclude auto-created team links — team members coordinate via
-					// team_tasks/team_message, not delegate. Only explicitly created
-					// links trigger DELEGATION.md.
-					targets := filterManualLinks(allTargets)
-					if len(targets) > 0 && len(targets) <= 15 {
-						// Static list: all targets directly
-						hasDelegation = true
-						contextFiles = append(contextFiles, bootstrap.ContextFile{
-							Path:    bootstrap.DelegationFile,
-							Content: buildDelegateAgentsMD(targets),
-						})
-					} else if len(targets) > 15 {
-						// Too many targets: instruct agent to use delegate_search tool
-						hasDelegation = true
-						contextFiles = append(contextFiles, bootstrap.ContextFile{
-							Path:    bootstrap.DelegationFile,
-							Content: buildDelegateSearchInstruction(len(targets)),
-						})
-					}
-				}
-			} else {
-				hasDelegation = true
-			}
-		}
 
 		// Inject TEAM.md for all team members (lead + members) so every agent
 		// knows the team workflow: create/claim/complete tasks via team_tasks tool.
@@ -199,30 +183,21 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 		}
 
 		// Inject negative context so the model doesn't waste iterations probing
-		// unavailable capabilities (team_tasks, delegate_search, etc.).
-		// Note: team agents have delegation targets via team links (TEAM.md),
-		// so only inject "no delegation" when both hasDelegation and hasTeam are false.
-		if !hasTeam || (!hasDelegation && !hasTeam) {
-			var notes []string
-			if !hasTeam {
-				notes = append(notes, "You are NOT part of any team. Do not use team_tasks or team_message tools.")
-			}
-			if !hasDelegation && !hasTeam {
-				notes = append(notes, "You have NO delegation targets. Do not use spawn with agent parameter or delegate_search tools.")
-			}
+		// unavailable capabilities (team_tasks, etc.).
+		if !hasTeam {
 			contextFiles = append(contextFiles, bootstrap.ContextFile{
 				Path:    bootstrap.AvailabilityFile,
-				Content: strings.Join(notes, "\n"),
+				Content: "You are NOT part of any team. Do not use team_tasks tool.",
 			})
 		}
 
 		contextWindow := ag.ContextWindow
 		if contextWindow <= 0 {
-			contextWindow = 200000
+			contextWindow = config.DefaultContextWindow
 		}
 		maxIter := ag.MaxToolIterations
 		if maxIter <= 0 {
-			maxIter = 20
+			maxIter = config.DefaultMaxIterations
 		}
 
 		// Per-agent config overrides (fallback to global defaults from config.json)
@@ -237,33 +212,41 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 		sandboxEnabled := deps.SandboxEnabled
 		sandboxContainerDir := deps.SandboxContainerDir
 		sandboxWorkspaceAccess := deps.SandboxWorkspaceAccess
+		var sandboxCfgOverride *sandbox.Config
 		if c := ag.ParseSandboxConfig(); c != nil {
 			resolved := c.ToSandboxConfig()
 			sandboxContainerDir = resolved.ContainerWorkdir()
 			sandboxWorkspaceAccess = string(resolved.WorkspaceAccess)
+			sandboxCfgOverride = &resolved
 		}
 
-		// Expand ~ in workspace path and ensure directory exists
+		// Resolve tenant slug once for workspace + dataDir scoping.
+		var tenantSlug string
+		if ag.TenantID != store.MasterTenantID && ag.TenantID != uuid.Nil {
+			tenantSlug = resolveTenantSlug(deps.TenantStore, ag.TenantID)
+		}
+
+		// Expand ~ in workspace path and ensure directory exists.
+		// For non-master tenants, prefix workspace with tenant slug directory.
 		workspace := ag.Workspace
 		if workspace != "" {
 			workspace = config.ExpandHome(workspace)
 			if !filepath.IsAbs(workspace) {
 				workspace, _ = filepath.Abs(workspace)
 			}
+		}
+		if tenantSlug != "" {
+			if deps.Workspace != "" {
+				workspace = config.TenantWorkspace(deps.Workspace, ag.TenantID, tenantSlug)
+			}
+		}
+		if workspace != "" {
 			if err := os.MkdirAll(workspace, 0755); err != nil {
 				slog.Warn("failed to create agent workspace directory", "workspace", workspace, "agent", agentKey, "error", err)
 			}
 		}
 
-		// Per-agent custom tools (clone registry if agent has custom tools)
 		toolsReg := deps.Tools
-		if deps.DynamicLoader != nil {
-			if agentReg, err := deps.DynamicLoader.LoadForAgent(ctx, deps.Tools, ag.ID); err != nil {
-				slog.Warn("failed to load custom tools", "agent", agentKey, "error", err)
-			} else if agentReg != nil {
-				toolsReg = agentReg
-			}
-		}
 
 		// Per-agent MCP servers: connect to granted MCP servers and register their tools.
 		// Uses a per-agent MCP Manager that queries the MCPServerStore for accessible servers.
@@ -278,15 +261,17 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 				toolsReg = deps.Tools.Clone()
 			}
 			var mcpOpts []mcpbridge.ManagerOption
-		mcpOpts = append(mcpOpts, mcpbridge.WithStore(deps.MCPStore))
-		if deps.MCPPool != nil {
-			mcpOpts = append(mcpOpts, mcpbridge.WithPool(deps.MCPPool))
-		}
-		mcpMgr := mcpbridge.NewManager(toolsReg, mcpOpts...)
+			mcpOpts = append(mcpOpts, mcpbridge.WithStore(deps.MCPStore))
+			if deps.MCPPool != nil {
+				mcpOpts = append(mcpOpts, mcpbridge.WithPool(deps.MCPPool))
+			}
+			mcpMgr := mcpbridge.NewManager(toolsReg, mcpOpts...)
 			if err := mcpMgr.LoadForAgent(ctx, ag.ID, ""); err != nil {
 				slog.Warn("failed to load MCP servers for agent", "agent", agentKey, "error", err)
 			} else if mcpMgr.IsSearchMode() {
-				// Search mode: too many tools — register mcp_tool_search meta-tool
+				// Search mode: too many tools — register mcp_tool_search meta-tool.
+				// Also wire lazy activator so deferred tools can be called by name directly.
+				toolsReg.SetDeferredActivator(mcpMgr.ActivateToolIfDeferred)
 				searchTool := mcpbridge.NewMCPToolSearchTool(mcpMgr)
 				toolsReg.Register(searchTool)
 				hasMCPTools = true
@@ -323,7 +308,19 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 			}
 		}
 
-		// Managed mode: filter skills by visibility + agent grants.
+		// Load per-tenant tool exclusions (disabled tools for this agent's tenant)
+		var disabledTools map[string]bool
+		if deps.BuiltinToolTenantCfgs != nil && ag.TenantID != uuid.Nil {
+			if disabled, err := deps.BuiltinToolTenantCfgs.ListDisabled(ctx, ag.TenantID); err == nil && len(disabled) > 0 {
+				disabledTools = make(map[string]bool, len(disabled))
+				for _, name := range disabled {
+					disabledTools[name] = true
+				}
+				slog.Debug("tenant tool exclusions", "agent", agentKey, "tenant", ag.TenantID, "disabled", len(disabled))
+			}
+		}
+
+		// Filter skills by visibility + agent grants.
 		// Only public skills and explicitly granted internal skills appear in the system prompt.
 		var skillAllowList []string
 		if deps.SkillAccessStore != nil {
@@ -339,27 +336,43 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 			}
 		}
 
+		// Resolve tenant-scoped DataDir for team workspace resolution.
+		dataDir := deps.DataDir
+		if tenantSlug != "" {
+			dataDir = config.TenantDataDir(deps.DataDir, ag.TenantID, tenantSlug)
+		}
+
+		restrictVal := true // always restrict agents to their workspace
 		loop := NewLoop(LoopConfig{
 			ID:                     ag.AgentKey,
 			AgentUUID:              ag.ID,
+			TenantID:               ag.TenantID,
 			AgentType:              ag.AgentType,
 			Provider:               provider,
 			Model:                  ag.Model,
 			ContextWindow:          contextWindow,
+			MaxTokens:              ag.ParseMaxTokens(),
 			MaxIterations:          maxIter,
 			Workspace:              workspace,
+			DataDir:                dataDir,
+			RestrictToWs:           &restrictVal,
+			SubagentsCfg:           ag.ParseSubagentsConfig(),
+			MemoryCfg:              ag.ParseMemoryConfig(),
+			SandboxCfg:             sandboxCfgOverride,
 			Bus:                    deps.Bus,
 			Sessions:               deps.Sessions,
 			Tools:                  toolsReg,
 			ToolPolicy:             deps.ToolPolicy,
-			AgentToolPolicy:        agentToolPolicyForTeam(agentToolPolicyWithMCP(ag.ParseToolsConfig(), hasMCPTools), isTeamLead),
+			AgentToolPolicy:        agentToolPolicyForTeam(agentToolPolicyWithWorkspace(agentToolPolicyWithMCP(ag.ParseToolsConfig(), hasMCPTools), hasTeam), isTeamLead),
 			SkillsLoader:           deps.Skills,
 			SkillAllowList:         skillAllowList,
 			HasMemory:              hasMemory,
 			ContextFiles:           contextFiles,
-			EnsureUserFiles:        deps.EnsureUserFiles,
+			EnsureUserProfile:      deps.EnsureUserProfile,
+			SeedUserFiles:          deps.SeedUserFiles,
 			ContextFileLoader:      deps.ContextFileLoader,
 			BootstrapCleanup:       deps.BootstrapCleanup,
+			CacheInvalidate:        deps.CacheInvalidate,
 			OnEvent:                deps.OnEvent,
 			TraceCollector:         deps.TraceCollector,
 			InjectionAction:        deps.InjectionAction,
@@ -370,11 +383,21 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 			SandboxContainerDir:    sandboxContainerDir,
 			SandboxWorkspaceAccess: sandboxWorkspaceAccess,
 			BuiltinToolSettings:    builtinSettings,
+			DisabledTools:          disabledTools,
 			ThinkingLevel:          ag.ParseThinkingLevel(),
 			SelfEvolve:             ag.ParseSelfEvolve(),
-			GroupWriterCache:       deps.GroupWriterCache,
+			SkillEvolve:            ag.AgentType == store.AgentTypePredefined && ag.ParseSkillEvolve(),
+			SkillNudgeInterval:     ag.ParseSkillNudgeInterval(),
+			WorkspaceSharing:       ag.ParseWorkspaceSharing(),
+			ShellDenyGroups:        ag.ParseShellDenyGroups(),
+			ConfigPermStore:        deps.ConfigPermStore,
 			TeamStore:              deps.TeamStore,
+			SecureCLIStore:         deps.SecureCLIStore,
 			MediaStore:             deps.MediaStore,
+			ModelPricing:           deps.ModelPricing,
+			BudgetMonthlyCents:     derefInt(ag.BudgetMonthlyCents),
+			TracingStore:           deps.TracingStore,
+			MemoryStore:            deps.MemoryStore,
 		})
 
 		slog.Info("resolved agent from DB", "agent", agentKey, "model", ag.Model, "provider", ag.Provider)
@@ -384,10 +407,17 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 
 // InvalidateAgent removes an agent from the router cache, forcing re-resolution.
 // Used when agent config is updated via API.
+// Matches both plain key ("agentKey") and tenant-scoped key ("tenantID:agentKey")
+// because callers only pass the agentKey without tenant context.
 func (r *Router) InvalidateAgent(agentKey string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.agents, agentKey)
+	suffix := ":" + agentKey
+	for key := range r.agents {
+		if key == agentKey || strings.HasSuffix(key, suffix) {
+			delete(r.agents, key)
+		}
+	}
 	slog.Debug("invalidated agent cache", "agent", agentKey)
 }
 
@@ -400,3 +430,22 @@ func (r *Router) InvalidateAll() {
 	slog.Debug("invalidated all agent caches")
 }
 
+// resolveTenantSlug looks up the tenant slug for workspace path resolution.
+// Returns the tenant ID string as fallback if lookup fails.
+func resolveTenantSlug(ts store.TenantStore, tenantID uuid.UUID) string {
+	if ts == nil {
+		return tenantID.String()
+	}
+	tenant, err := ts.GetTenant(context.Background(), tenantID)
+	if err != nil || tenant == nil {
+		return tenantID.String()
+	}
+	return tenant.Slug
+}
+
+func derefInt(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
+}

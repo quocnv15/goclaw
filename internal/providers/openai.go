@@ -5,11 +5,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
-	"time"
 )
 
 // OpenAIProvider implements Provider for OpenAI-compatible APIs
@@ -20,6 +23,7 @@ type OpenAIProvider struct {
 	apiBase      string
 	chatPath     string // defaults to "/chat/completions"
 	defaultModel string
+	providerType string // DB provider_type (e.g. "gemini_native", "openai", "minimax_native")
 	client       *http.Client
 	retryConfig  RetryConfig
 }
@@ -36,7 +40,7 @@ func NewOpenAIProvider(name, apiKey, apiBase, defaultModel string) *OpenAIProvid
 		apiBase:      apiBase,
 		chatPath:     "/chat/completions",
 		defaultModel: defaultModel,
-		client:       &http.Client{Timeout: 300 * time.Second},
+		client:       &http.Client{Timeout: DefaultHTTPTimeout},
 		retryConfig:  DefaultRetryConfig(),
 	}
 }
@@ -52,6 +56,13 @@ func (p *OpenAIProvider) DefaultModel() string   { return p.defaultModel }
 func (p *OpenAIProvider) SupportsThinking() bool { return true }
 func (p *OpenAIProvider) APIKey() string         { return p.apiKey }
 func (p *OpenAIProvider) APIBase() string        { return p.apiBase }
+func (p *OpenAIProvider) ProviderType() string   { return p.providerType }
+
+// WithProviderType sets the DB provider_type for correct API endpoint routing in media tools.
+func (p *OpenAIProvider) WithProviderType(pt string) *OpenAIProvider {
+	p.providerType = pt
+	return p
+}
 
 // resolveModel returns the model ID to use for a request.
 // For OpenRouter, model IDs require a provider prefix (e.g. "anthropic/claude-sonnet-4-5-20250929").
@@ -70,7 +81,25 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 	model := p.resolveModel(req.Model)
 	body := p.buildRequestBody(model, req, false)
 
-	return RetryDo(ctx, p.retryConfig, func() (*ChatResponse, error) {
+	chatFn := p.chatRequestFn(ctx, body)
+
+	resp, err := RetryDo(ctx, p.retryConfig, chatFn)
+
+	// Auto-clamp max_tokens and retry once if the model rejects the value
+	if err != nil {
+		if clamped := clampMaxTokensFromError(err, body); clamped {
+			slog.Info("max_tokens clamped, retrying", "model", model, "limit", clampedLimit(body))
+			return RetryDo(ctx, p.retryConfig, chatFn)
+		}
+	}
+
+	return resp, err
+}
+
+// chatRequestFn returns a closure that performs a single non-streaming chat request.
+// Shared between initial attempt and post-clamp retry to avoid duplication.
+func (p *OpenAIProvider) chatRequestFn(ctx context.Context, body map[string]any) func() (*ChatResponse, error) {
+	return func() (*ChatResponse, error) {
 		respBody, err := p.doRequest(ctx, body)
 		if err != nil {
 			return nil, err
@@ -83,7 +112,7 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 		}
 
 		return p.parseResponse(&oaiResp), nil
-	})
+	}
 }
 
 func (p *OpenAIProvider) ChatStream(ctx context.Context, req ChatRequest, onChunk func(StreamChunk)) (*ChatResponse, error) {
@@ -94,6 +123,16 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ChatRequest, onChun
 	respBody, err := RetryDo(ctx, p.retryConfig, func() (io.ReadCloser, error) {
 		return p.doRequest(ctx, body)
 	})
+
+	// Auto-clamp max_tokens and retry once if the model rejects the value
+	if err != nil {
+		if clamped := clampMaxTokensFromError(err, body); clamped {
+			slog.Info("max_tokens clamped, retrying stream", "model", model, "limit", clampedLimit(body))
+			respBody, err = RetryDo(ctx, p.retryConfig, func() (io.ReadCloser, error) {
+				return p.doRequest(ctx, body)
+			})
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +142,7 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ChatRequest, onChun
 	accumulators := make(map[int]*toolCallAccumulator)
 
 	scanner := bufio.NewScanner(respBody)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 1MB max line for large tool call / thinking chunks
+	scanner.Buffer(make([]byte, 0, SSEScanBufInit), SSEScanBufMax)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data:") {
@@ -190,7 +229,10 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ChatRequest, onChun
 	for i := 0; i < len(accumulators); i++ {
 		acc := accumulators[i]
 		args := make(map[string]any)
-		_ = json.Unmarshal([]byte(acc.rawArgs), &args)
+		if err := json.Unmarshal([]byte(acc.rawArgs), &args); err != nil && acc.rawArgs != "" {
+			slog.Warn("openai_stream: failed to parse tool call arguments",
+				"tool", acc.Name, "raw_len", len(acc.rawArgs), "error", err)
+		}
 		acc.Arguments = args
 		if acc.thoughtSig != "" {
 			acc.Metadata = map[string]string{"thought_signature": acc.thoughtSig}
@@ -215,7 +257,15 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 	// don't return it (e.g. gemini-3-flash) will cause HTTP 400 if sent as-is.
 	// Tool results are folded into plain user messages to preserve context.
 	inputMessages := req.Messages
-	if strings.Contains(strings.ToLower(p.name), "gemini") {
+
+	// Compute provider capability once: does this endpoint support Google's thought_signature?
+	// We check providerType, name, apiBase, and the model string (robust detection for proxies/OpenRouter).
+	supportsThoughtSignature := strings.Contains(strings.ToLower(p.providerType), "gemini") ||
+		strings.Contains(strings.ToLower(p.name), "gemini") ||
+		strings.Contains(strings.ToLower(p.apiBase), "generativelanguage") ||
+		strings.Contains(strings.ToLower(model), "gemini")
+
+	if supportsThoughtSignature {
 		inputMessages = collapseToolCallsWithoutSig(inputMessages)
 	}
 
@@ -268,7 +318,11 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 					"arguments": string(argsJSON),
 				}
 				if sig := tc.Metadata["thought_signature"]; sig != "" {
-					fn["thought_signature"] = sig
+					// Only send thought_signature to providers that support it (Google/Gemini).
+					// Non-Google providers will reject the unknown field with 422 Unprocessable Entity.
+					if supportsThoughtSignature {
+						fn["thought_signature"] = sig
+					}
 				}
 				toolCalls[i] = map[string]any{
 					"id":       tc.ID,
@@ -284,6 +338,17 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 		}
 
 		msgs = append(msgs, msg)
+	}
+
+	// Safety net: strip trailing assistant message to prevent HTTP 400 from
+	// proxy providers (LiteLLM, OpenRouter) that don't support assistant prefill.
+	// This should rarely trigger — the agent loop ensures user message is last.
+	if len(msgs) > 0 {
+		if role, _ := msgs[len(msgs)-1]["role"].(string); role == "assistant" {
+			slog.Warn("openai: stripped trailing assistant message (unsupported prefill)",
+				"provider", p.name, "model", model)
+			msgs = msgs[:len(msgs)-1]
+		}
 	}
 
 	body := map[string]any{
@@ -305,10 +370,18 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 
 	// Merge options
 	if v, ok := req.Options[OptMaxTokens]; ok {
-		body["max_tokens"] = v
+		if strings.HasPrefix(model, "gpt-5") || strings.HasPrefix(model, "o1") || strings.HasPrefix(model, "o3") || strings.HasPrefix(model, "o4") {
+			body["max_completion_tokens"] = v
+		} else {
+			body["max_tokens"] = v
+		}
 	}
 	if v, ok := req.Options[OptTemperature]; ok {
-		body["temperature"] = v
+		// GPT-5 mini/nano and o-series models only support default temperature
+		skipTemp := strings.HasPrefix(model, "gpt-5-mini") || strings.HasPrefix(model, "gpt-5-nano") || strings.HasPrefix(model, "o1") || strings.HasPrefix(model, "o3") || strings.HasPrefix(model, "o4")
+		if !skipTemp {
+			body["temperature"] = v
+		}
 	}
 
 	// Inject reasoning_effort for o-series models (ignored by models that don't support it)
@@ -339,7 +412,12 @@ func (p *OpenAIProvider) doRequest(ctx context.Context, body any) (io.ReadCloser
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	// Azure OpenAI/Foundry support for now atleast
+	if strings.Contains(strings.ToLower(p.apiBase), "azure.com") {
+		httpReq.Header.Set("api-key", p.apiKey)
+	} else {
+		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	}
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
@@ -371,7 +449,10 @@ func (p *OpenAIProvider) parseResponse(resp *openAIResponse) *ChatResponse {
 
 		for _, tc := range msg.ToolCalls {
 			args := make(map[string]any)
-			_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil && tc.Function.Arguments != "" {
+				slog.Warn("openai: failed to parse tool call arguments",
+					"tool", tc.Function.Name, "raw_len", len(tc.Function.Arguments), "error", err)
+			}
 			call := ToolCall{
 				ID:        tc.ID,
 				Name:      strings.TrimSpace(tc.Function.Name),
@@ -403,4 +484,45 @@ func (p *OpenAIProvider) parseResponse(resp *openAIResponse) *ChatResponse {
 	}
 
 	return result
+}
+
+// maxTokensLimitRe matches "supports at most N completion tokens" from OpenAI 400 errors.
+var maxTokensLimitRe = regexp.MustCompile(`supports at most (\d+) completion tokens`)
+
+// clampMaxTokensFromError checks if an error is a 400 "max_tokens is too large" rejection.
+// If so, it parses the model's stated limit, clamps the body's max_tokens/max_completion_tokens,
+// and returns true so the caller can retry.
+func clampMaxTokensFromError(err error, body map[string]any) bool {
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.Status != http.StatusBadRequest {
+		return false
+	}
+	if !strings.Contains(httpErr.Body, "max_tokens") || !strings.Contains(httpErr.Body, "too large") {
+		return false
+	}
+
+	matches := maxTokensLimitRe.FindStringSubmatch(httpErr.Body)
+	if len(matches) < 2 {
+		return false
+	}
+	limit, parseErr := strconv.Atoi(matches[1])
+	if parseErr != nil || limit <= 0 {
+		return false
+	}
+
+	// Clamp whichever key is present
+	if _, ok := body["max_completion_tokens"]; ok {
+		body["max_completion_tokens"] = limit
+	} else {
+		body["max_tokens"] = limit
+	}
+	return true
+}
+
+// clampedLimit returns the clamped max_tokens or max_completion_tokens value for logging.
+func clampedLimit(body map[string]any) any {
+	if v, ok := body["max_completion_tokens"]; ok {
+		return v
+	}
+	return body["max_tokens"]
 }

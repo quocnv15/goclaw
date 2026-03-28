@@ -71,6 +71,10 @@ func (t *CreateAudioTool) Parameters() map[string]any {
 				"type":        "string",
 				"description": "Force a specific provider (e.g. 'minimax').",
 			},
+			"filename_hint": map[string]any{
+				"type":        "string",
+				"description": "Short descriptive filename (no extension). Example: 'epic-battle-theme', 'rain-ambience'.",
+			},
 		},
 		"required": []string{"prompt"},
 	}
@@ -95,6 +99,7 @@ func (t *CreateAudioTool) Execute(ctx context.Context, args map[string]any) *Res
 	lyrics, _ := args["lyrics"].(string)
 	instrumental, _ := args["instrumental"].(bool)
 	forceProvider, _ := args["provider"].(string)
+	filenameHint, _ := args["filename_hint"].(string)
 
 	var audioBytes []byte
 	var usage *providers.Usage
@@ -153,14 +158,20 @@ func (t *CreateAudioTool) Execute(ctx context.Context, args map[string]any) *Res
 	if err := os.MkdirAll(dateDir, 0755); err != nil {
 		return ErrorResult(fmt.Sprintf("failed to create output directory: %v", err))
 	}
-	audioPath := filepath.Join(dateDir, fmt.Sprintf("goclaw_gen_%d.mp3", time.Now().UnixNano()))
+	audioPath := filepath.Join(dateDir, mediaFileName(ctx, "audio", filenameHint, "mp3"))
 	if err := os.WriteFile(audioPath, audioBytes, 0644); err != nil {
 		return ErrorResult(fmt.Sprintf("failed to save generated audio: %v", err))
 	}
 
-	slog.Info("create_audio: audio saved", "path", audioPath, "provider", providerName, "type", audioType)
+	// Verify file was persisted.
+	if fi, err := os.Stat(audioPath); err != nil {
+		slog.Warn("create_audio: file missing immediately after write", "path", audioPath, "error", err)
+		return ErrorResult(fmt.Sprintf("generated audio file missing after write: %v", err))
+	} else {
+		slog.Info("create_audio: file saved", "path", audioPath, "size", fi.Size(), "data_len", len(audioBytes), "provider", providerName, "type", audioType)
+	}
 
-	result := &Result{ForLLM: fmt.Sprintf("MEDIA:%s", audioPath)}
+	result := &Result{ForLLM: fmt.Sprintf("MEDIA:%s\nUse the EXACT filename when referencing: %s", audioPath, filepath.Base(audioPath))}
 	result.Media = []bus.MediaFile{{Path: audioPath, MimeType: "audio/mpeg"}}
 	result.Deliverable = fmt.Sprintf("[Generated audio: %s]\nPrompt: %s", filepath.Base(audioPath), prompt)
 	result.Provider = providerName
@@ -173,12 +184,15 @@ func (t *CreateAudioTool) Execute(ctx context.Context, args map[string]any) *Res
 
 // callProvider dispatches to the correct music generation implementation based on provider type.
 func (t *CreateAudioTool) callProvider(ctx context.Context, cp credentialProvider, providerName, model string, params map[string]any) ([]byte, *providers.Usage, error) {
+	if cp == nil {
+		return nil, nil, fmt.Errorf("provider %q does not expose API credentials required for audio generation", providerName)
+	}
 	prompt := GetParamString(params, "prompt", "")
 
 	slog.Info("create_audio: calling music generation API",
 		"provider", providerName, "model", model)
 
-	switch ProviderTypeFromName(providerName) {
+	switch GetParamString(params, "_provider_type", providerTypeFromName(providerName)) {
 	case "minimax":
 		return callMinimaxMusicGen(ctx, cp.APIKey(), cp.APIBase(), model, prompt, params)
 	case "suno":

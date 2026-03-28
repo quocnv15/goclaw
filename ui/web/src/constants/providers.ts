@@ -1,9 +1,15 @@
+import { slugify } from "@/lib/slug";
+
 export interface ProviderTypeInfo {
   value: string;
   label: string;
   apiBase: string;
   placeholder: string;
 }
+
+type ProviderAliasSource = string | { name?: string | null };
+
+export const DEFAULT_CODEX_OAUTH_ALIAS = "openai-codex";
 
 export const PROVIDER_TYPES: ProviderTypeInfo[] = [
   { value: "chatgpt_oauth", label: "ChatGPT Subscription (OAuth)", apiBase: "", placeholder: "" },
@@ -26,4 +32,28 @@ export const PROVIDER_TYPES: ProviderTypeInfo[] = [
   { value: "ollama", label: "Ollama (Local)", apiBase: "http://localhost:11434/v1", placeholder: "" },
   { value: "ollama_cloud", label: "Ollama Cloud", apiBase: "https://ollama.com/v1", placeholder: "" },
   { value: "claude_cli", label: "Claude CLI (Local)", apiBase: "", placeholder: "" },
+  { value: "acp", label: "ACP Agent (Subprocess)", apiBase: "", placeholder: "claude" },
 ];
+
+function providerAliasName(value: ProviderAliasSource): string {
+  if (typeof value === "string") return value.trim().toLowerCase();
+  return value.name?.trim().toLowerCase() ?? "";
+}
+
+export function suggestUniqueProviderAlias(
+  existingProviders: ProviderAliasSource[],
+  options?: { baseAlias?: string; excludeName?: string },
+): string {
+  const baseAlias = slugify(options?.baseAlias ?? DEFAULT_CODEX_OAUTH_ALIAS) || DEFAULT_CODEX_OAUTH_ALIAS;
+  const taken = new Set(existingProviders.map(providerAliasName).filter(Boolean));
+  const excludeName = providerAliasName(options?.excludeName ?? "");
+
+  if (excludeName) taken.delete(excludeName);
+  if (!taken.has(baseAlias)) return baseAlias;
+
+  let suffix = 2;
+  while (taken.has(`${baseAlias}-${suffix}`)) {
+    suffix += 1;
+  }
+  return `${baseAlias}-${suffix}`;
+}

@@ -4,10 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"os"
-	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -17,7 +15,9 @@ import (
 const (
 	defaultFlushInterval = 5 * time.Second
 	defaultBufferSize    = 1000
-	previewMaxLen        = 500
+	previewMaxLen        = 40_000
+	traceRetention       = 7 * 24 * time.Hour // auto-delete traces older than 7 days
+	pruneInterval        = 8 * time.Hour
 )
 
 // SpanExporter is implemented by backends that receive span data alongside
@@ -82,6 +82,14 @@ func NewCollector(ts store.TracingStore) *Collector {
 
 // Verbose returns true if verbose tracing is enabled (full LLM input logging).
 func (c *Collector) Verbose() bool { return c.verbose }
+
+// PreviewMaxLen returns the max preview length: 200K when verbose, 500 otherwise.
+func (c *Collector) PreviewMaxLen() int {
+	if c.verbose {
+		return 200_000
+	}
+	return previewMaxLen
+}
 
 // SetExporter attaches an external span exporter (e.g. OpenTelemetry OTLP).
 // When set, spans are exported to the external backend during each flush cycle.
@@ -177,7 +185,7 @@ func (c *Collector) FinishTrace(ctx context.Context, traceID uuid.UUID, status s
 		updates["error"] = errMsg
 	}
 	if outputPreview != "" {
-		updates["output_preview"] = truncatePreview(outputPreview)
+		updates["output_preview"] = c.truncatePreviewStr(outputPreview)
 	}
 	if err := c.store.UpdateTrace(ctx, traceID, updates); err != nil {
 		slog.Warn("tracing: failed to finish trace", "trace_id", traceID, "error", err)
@@ -197,15 +205,38 @@ func (c *Collector) flushLoop() {
 	ticker := time.NewTicker(defaultFlushInterval)
 	defer ticker.Stop()
 
+	pruneTicker := time.NewTicker(pruneInterval)
+	defer pruneTicker.Stop()
+
+	// Run initial prune shortly after startup.
+	go c.pruneOldTraces()
+
 	for {
 		select {
 		case <-ticker.C:
 			c.flush()
+		case <-pruneTicker.C:
+			c.pruneOldTraces()
 		case <-c.stopCh:
-			// Drain remaining spans
 			c.flush()
 			return
 		}
+	}
+}
+
+// pruneOldTraces deletes traces and spans older than traceRetention.
+func (c *Collector) pruneOldTraces() {
+	cutoff := time.Now().UTC().Add(-traceRetention)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	deleted, err := c.store.DeleteTracesOlderThan(ctx, cutoff)
+	if err != nil {
+		slog.Warn("tracing: prune old traces failed", "error", err)
+		return
+	}
+	if deleted > 0 {
+		slog.Info("tracing: pruned old traces", "deleted", deleted, "older_than", cutoff.Format(time.RFC3339))
 	}
 }
 
@@ -288,15 +319,7 @@ doneUpdates:
 	}
 }
 
-// truncatePreview sanitizes and truncates a string to previewMaxLen bytes.
-func truncatePreview(s string) string {
-	s = strings.ToValidUTF8(s, "")
-	if len(s) <= previewMaxLen {
-		return s
-	}
-	maxLen := previewMaxLen
-	for maxLen > 0 && !utf8.RuneStart(s[maxLen]) {
-		maxLen--
-	}
-	return s[:maxLen] + "..."
+// truncatePreviewStr sanitizes and truncates a string by removing the middle.
+func (c *Collector) truncatePreviewStr(s string) string {
+	return TruncateMid(s, c.PreviewMaxLen())
 }

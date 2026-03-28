@@ -1,4 +1,4 @@
-import { useMemo, useEffect, useCallback, useRef } from "react";
+import { useMemo, useEffect, useCallback } from "react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -10,21 +10,23 @@ import {
   MiniMap,
   type Node,
   type Edge,
+  type ColorMode,
   Handle,
   Position,
 } from "@xyflow/react";
 import { forceSimulation, forceLink, forceManyBody, forceCenter, forceCollide, forceX, forceY, type SimulationNodeDatum } from "d3-force";
 import "@xyflow/react/dist/style.css";
 import { useTranslation } from "react-i18next";
+import { useUiStore } from "@/stores/use-ui-store";
 import type { KGEntity, KGRelation } from "@/types/knowledge-graph";
 
 // Color mapping for entity types
 const TYPE_COLORS: Record<string, { bg: string; border: string; text: string }> = {
-  person:       { bg: "#dbeafe", border: "#3b82f6", text: "#1e40af" },
+  person:       { bg: "#fde8d8", border: "#E85D24", text: "#7a2610" },
   project:      { bg: "#dcfce7", border: "#22c55e", text: "#166534" },
   task:         { bg: "#fef3c7", border: "#f59e0b", text: "#92400e" },
   event:        { bg: "#fce7f3", border: "#ec4899", text: "#9d174d" },
-  concept:      { bg: "#e0e7ff", border: "#6366f1", text: "#3730a3" },
+  concept:      { bg: "#fef5e0", border: "#F8D080", text: "#7a5010" },
   location:     { bg: "#ccfbf1", border: "#14b8a6", text: "#115e59" },
   organization: { bg: "#fee2e2", border: "#ef4444", text: "#991b1b" },
 };
@@ -86,13 +88,9 @@ function buildGraph(entities: KGEntity[], relations: KGRelation[]) {
   return { nodes, edges };
 }
 
-function applyForceLayout(
-  nodes: Node[],
-  edges: Edge[],
-  onUpdate: (positioned: Node[]) => void,
-  onSettled?: () => void,
-) {
-  if (nodes.length === 0) return () => {};
+/** Run d3-force simulation synchronously and return final positions (no per-tick renders). */
+function computeForceLayout(nodes: Node[], edges: Edge[]): Node[] {
+  if (nodes.length === 0) return nodes;
 
   const simNodes: SimNode[] = nodes.map((n) => ({ id: n.id, x: n.position.x, y: n.position.y }));
   const simLinks = edges.map((e) => ({ source: e.source, target: e.target }));
@@ -106,22 +104,17 @@ function applyForceLayout(
     .force("center", forceCenter(w / 2, h / 2))
     .force("x", forceX(w / 2).strength(0.05))
     .force("y", forceY(h / 2).strength(0.05))
-    .force("collide", forceCollide(55));
+    .force("collide", forceCollide(55))
+    .stop();
 
-  simulation.on("tick", () => {
-    const positioned = nodes.map((n, i) => ({
-      ...n,
-      position: { x: simNodes[i]!.x ?? 0, y: simNodes[i]!.y ?? 0 },
-    }));
-    onUpdate(positioned);
-  });
+  // Run simulation to completion synchronously (~300 ticks → 1 render instead of 300)
+  const ticks = Math.ceil(Math.log(simulation.alphaMin()) / Math.log(1 - simulation.alphaDecay()));
+  for (let i = 0; i < ticks; i++) simulation.tick();
 
-  simulation.on("end", () => onSettled?.());
-
-  // Run fast to settle
-  simulation.alpha(1).restart();
-
-  return () => simulation.stop();
+  return nodes.map((n, i) => ({
+    ...n,
+    position: { x: simNodes[i]!.x ?? 0, y: simNodes[i]!.y ?? 0 },
+  }));
 }
 
 interface KGGraphViewProps {
@@ -141,27 +134,23 @@ export function KGGraphView(props: KGGraphViewProps) {
 function KGGraphViewInner({ entities, relations, onEntityClick }: KGGraphViewProps) {
   const { t } = useTranslation("memory");
   const { fitView } = useReactFlow();
-  const { nodes: initialNodes, edges: initialEdges } = useMemo(
-    () => buildGraph(entities, relations),
-    [entities, relations],
-  );
+  const theme = useUiStore((s) => s.theme);
+  const colorMode: ColorMode = theme === "system" ? "system" : theme;
+  // Compute layout synchronously — no per-tick re-renders
+  const { layoutNodes, layoutEdges } = useMemo(() => {
+    const { nodes: rawNodes, edges: rawEdges } = buildGraph(entities, relations);
+    return { layoutNodes: computeForceLayout(rawNodes, rawEdges), layoutEdges: rawEdges };
+  }, [entities, relations]);
 
-  const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
-  const simRef = useRef<(() => void) | null>(null);
+  const [nodes, setNodes, onNodesChange] = useNodesState(layoutNodes);
+  const [edges, setEdges, onEdgesChange] = useEdgesState(layoutEdges);
 
-  // Fit view after simulation settles so the graph covers the viewport
-  const handleSettled = useCallback(() => {
-    requestAnimationFrame(() => fitView({ padding: 0.15, duration: 300 }));
-  }, [fitView]);
-
-  // Run force layout when data changes
+  // Sync when data changes
   useEffect(() => {
-    setEdges(initialEdges);
-    simRef.current?.();
-    simRef.current = applyForceLayout(initialNodes, initialEdges, setNodes, handleSettled);
-    return () => simRef.current?.();
-  }, [initialNodes, initialEdges, setNodes, setEdges, handleSettled]);
+    setNodes(layoutNodes);
+    setEdges(layoutEdges);
+    requestAnimationFrame(() => fitView({ padding: 0.15, duration: 300 }));
+  }, [layoutNodes, layoutEdges, setNodes, setEdges, fitView]);
 
   const handleNodeClick = useCallback(
     (_: React.MouseEvent, node: Node) => {
@@ -174,36 +163,40 @@ function KGGraphViewInner({ entities, relations, onEntityClick }: KGGraphViewPro
 
   if (entities.length === 0) {
     return (
-      <div className="flex items-center justify-center h-[400px] text-sm text-muted-foreground">
+      <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
         {t("kg.graphView.empty")}
       </div>
     );
   }
 
   return (
-    <div className="h-[500px] rounded-md border bg-background">
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        onNodeClick={handleNodeClick}
-        nodeTypes={nodeTypes}
-        fitView
-        minZoom={0.1}
-        maxZoom={3}
-        proOptions={{ hideAttribution: true }}
-      >
-        <Background gap={20} size={1} />
-        <Controls showInteractive={false} />
-        <MiniMap
-          nodeColor={(n) => {
-            const type = (n.data as any)?.type as string;
-            return (TYPE_COLORS[type] || DEFAULT_COLOR).border;
-          }}
-          maskColor="rgba(0,0,0,0.1)"
-        />
-      </ReactFlow>
+    <div className="flex h-full flex-col rounded-md border bg-background">
+      <div className="min-h-0 flex-1">
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          onNodeClick={handleNodeClick}
+          nodeTypes={nodeTypes}
+          colorMode={colorMode}
+          fitView
+          minZoom={0.1}
+          maxZoom={3}
+          proOptions={{ hideAttribution: true }}
+        >
+          <Background gap={20} size={1} />
+          <Controls showInteractive={false} />
+          <MiniMap
+            nodeColor={(n) => {
+              const type = (n.data as any)?.type as string;
+              return (TYPE_COLORS[type] || DEFAULT_COLOR).border;
+            }}
+            maskColor="rgba(0,0,0,0.1)"
+            style={{ width: 100, height: 75 }}
+          />
+        </ReactFlow>
+      </div>
 
       {/* Legend */}
       <div className="flex flex-wrap gap-2 px-3 py-2 border-t text-[10px]">

@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
+	"github.com/nextlevelbuilder/goclaw/internal/permissions"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
@@ -13,29 +14,27 @@ import (
 // ToolsInvokeHandler handles POST /v1/tools/invoke (direct tool invocation).
 type ToolsInvokeHandler struct {
 	registry   *tools.Registry
-	token      string
 	agentStore store.AgentStore // nil if not configured
 }
 
 // NewToolsInvokeHandler creates a handler for the tools invoke endpoint.
-func NewToolsInvokeHandler(registry *tools.Registry, token string, agentStore store.AgentStore) *ToolsInvokeHandler {
+func NewToolsInvokeHandler(registry *tools.Registry, agentStore store.AgentStore) *ToolsInvokeHandler {
 	return &ToolsInvokeHandler{
 		registry:   registry,
-		token:      token,
 		agentStore: agentStore,
 	}
 }
 
 type toolsInvokeRequest struct {
-	Tool       string                 `json:"tool"`
-	Action     string                 `json:"action,omitempty"`
-	Args       map[string]interface{} `json:"args"`
-	SessionKey string                 `json:"sessionKey,omitempty"`
-	AgentID    string                 `json:"agentId,omitempty"`
-	DryRun     bool                   `json:"dryRun,omitempty"`
-	Channel    string                 `json:"channel,omitempty"`  // tool context: channel name
-	ChatID     string                 `json:"chatId,omitempty"`   // tool context: chat ID
-	PeerKind   string                 `json:"peerKind,omitempty"` // tool context: "direct" or "group"
+	Tool       string         `json:"tool"`
+	Action     string         `json:"action,omitempty"`
+	Args       map[string]any `json:"args"`
+	SessionKey string         `json:"sessionKey,omitempty"`
+	AgentID    string         `json:"agentId,omitempty"`
+	DryRun     bool           `json:"dryRun,omitempty"`
+	Channel    string         `json:"channel,omitempty"`  // tool context: channel name
+	ChatID     string         `json:"chatId,omitempty"`   // tool context: chat ID
+	PeerKind   string         `json:"peerKind,omitempty"` // tool context: "direct" or "group"
 }
 
 func (h *ToolsInvokeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -46,12 +45,18 @@ func (h *ToolsInvokeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.token != "" {
-		if extractBearerToken(r) != h.token {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": i18n.T(locale, i18n.MsgUnauthorized)})
-			return
-		}
+	auth := resolveAuth(r)
+	if !auth.Authenticated {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": i18n.T(locale, i18n.MsgUnauthorized)})
+		return
 	}
+	if !permissions.HasMinRole(auth.Role, permissions.RoleOperator) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": i18n.T(locale, i18n.MsgPermissionDenied, r.URL.Path)})
+		return
+	}
+
+	// Inject tenant, role, user, and locale into context for downstream stores/tools.
+	r = r.WithContext(enrichContext(r.Context(), r, auth))
 
 	var req toolsInvokeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -75,7 +80,7 @@ func (h *ToolsInvokeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
 			"tool":        req.Tool,
 			"description": tool.Description(),
 			"parameters":  tool.Parameters(),
@@ -84,12 +89,9 @@ func (h *ToolsInvokeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Inject userID and agentID into context for interceptors (bootstrap, memory).
+	// Inject agentID into context for interceptors (bootstrap, memory).
+	// Note: userID, tenantID, role, locale already injected by enrichContext above.
 	ctx := r.Context()
-
-	if userID := extractUserID(r); userID != "" {
-		ctx = store.WithUserID(ctx, userID)
-	}
 
 	agentIDStr := req.AgentID
 	if agentIDStr == "" {
@@ -116,7 +118,7 @@ func (h *ToolsInvokeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Execute the tool
 	args := req.Args
 	if args == nil {
-		args = make(map[string]interface{})
+		args = make(map[string]any)
 	}
 
 	// If action is specified, add it to args
@@ -132,11 +134,11 @@ func (h *ToolsInvokeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"result": map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
+		"result": map[string]any{
 			"output":   result.ForLLM,
 			"forUser":  result.ForUser,
-			"metadata": map[string]interface{}{},
+			"metadata": map[string]any{},
 		},
 	})
 }
@@ -144,7 +146,7 @@ func (h *ToolsInvokeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func writeToolError(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"error": map[string]string{
 			"code":    code,
 			"message": message,

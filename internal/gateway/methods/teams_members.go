@@ -53,7 +53,7 @@ func (m *TeamsMethods) handleAddMember(ctx context.Context, client *gateway.Clie
 	}
 
 	// Resolve agent
-	ag, err := resolveAgentInfo(m.agentStore, params.Agent)
+	ag, err := resolveAgentInfo(ctx, m.agentStore, params.Agent)
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "agent: "+err.Error()))
 		return
@@ -93,6 +93,7 @@ func (m *TeamsMethods) handleAddMember(ctx context.Context, client *gateway.Clie
 
 	// Invalidate caches for all team members
 	m.invalidateTeamCaches(ctx, teamID)
+	emitAudit(m.eventBus, client, "team.member_added", "team", teamID.String())
 
 	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{"ok": true}))
 
@@ -183,6 +184,7 @@ func (m *TeamsMethods) handleRemoveMember(ctx context.Context, client *gateway.C
 		}
 	}
 
+	emitAudit(m.eventBus, client, "team.member_removed", "team", teamID.String())
 	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{"ok": true}))
 
 	// Emit team.member.removed event

@@ -3,19 +3,17 @@ package http
 import (
 	"net/http"
 
-	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // MemoryHandler handles memory document management endpoints.
 type MemoryHandler struct {
 	store store.MemoryStore
-	token string
 }
 
 // NewMemoryHandler creates a handler for memory management endpoints.
-func NewMemoryHandler(s store.MemoryStore, token string) *MemoryHandler {
-	return &MemoryHandler{store: s, token: token}
+func NewMemoryHandler(s store.MemoryStore) *MemoryHandler {
+	return &MemoryHandler{store: s}
 }
 
 // RegisterRoutes registers all memory routes on the given mux.
@@ -32,14 +30,5 @@ func (h *MemoryHandler) RegisterRoutes(mux *http.ServeMux) {
 }
 
 func (h *MemoryHandler) auth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if h.token != "" {
-			if extractBearerToken(r) != h.token {
-				locale := extractLocale(r)
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": i18n.T(locale, i18n.MsgUnauthorized)})
-				return
-			}
-		}
-		next(w, r)
-	}
+	return requireAuth("", next)
 }

@@ -29,6 +29,8 @@ func (l *Loop) Run(ctx context.Context, req RunRequest) (*RunResult, error) {
 		event.UserID = req.UserID
 		event.Channel = req.Channel
 		event.ChatID = req.ChatID
+		event.SessionKey = req.SessionKey
+		event.TenantID = store.TenantIDFromContext(ctx)
 		l.emit(event)
 	}
 
@@ -72,7 +74,7 @@ func (l *Loop) Run(ctx context.Context, req RunRequest) (*RunResult, error) {
 			UserID:       req.UserID,
 			Channel:      req.Channel,
 			Name:         traceName,
-			InputPreview: truncateStr(req.Message, 500),
+			InputPreview: truncateStr(req.Message, l.traceCollector.PreviewMaxLen()),
 			Status:       store.TraceStatusRunning,
 			StartTime:    now,
 			CreatedAt:    now,
@@ -81,15 +83,26 @@ func (l *Loop) Run(ctx context.Context, req RunRequest) (*RunResult, error) {
 		if l.agentUUID != uuid.Nil {
 			trace.AgentID = &l.agentUUID
 		}
-		// Link to parent trace if this is a delegated run
+		// Link to parent trace: delegation context or explicit LinkedTraceID (team task runs).
 		if delegateParent := tracing.DelegateParentTraceIDFromContext(ctx); delegateParent != uuid.Nil {
 			trace.ParentTraceID = &delegateParent
+		} else if req.LinkedTraceID != uuid.Nil {
+			trace.ParentTraceID = &req.LinkedTraceID
+		}
+		// Set team_id on trace for team-scoped runs.
+		if req.TeamID != "" {
+			if tid, err := uuid.Parse(req.TeamID); err == nil {
+				trace.TeamID = &tid
+			}
 		}
 		if err := l.traceCollector.CreateTrace(ctx, trace); err != nil {
 			slog.Warn("tracing: failed to create trace", "error", err)
 		} else {
 			ctx = tracing.WithTraceID(ctx, traceID)
 			ctx = tracing.WithCollector(ctx, l.traceCollector)
+			if trace.TeamID != nil {
+				ctx = tracing.WithTraceTeamID(ctx, *trace.TeamID)
+			}
 
 			// Pre-generate root "agent" span ID so LLM/tool spans can reference it as parent.
 			agentSpanID = store.GenNewID()
@@ -149,7 +162,7 @@ func (l *Loop) Run(ctx context.Context, req RunRequest) (*RunResult, error) {
 			traceCtx := ctx
 			traceStatus := store.TraceStatusError
 			if ctx.Err() != nil {
-				traceCtx = context.Background()
+				traceCtx = context.WithoutCancel(ctx)
 				traceStatus = store.TraceStatusCancelled
 			}
 			l.traceCollector.FinishTrace(traceCtx, traceID, traceStatus, err.Error(), "")
@@ -157,14 +170,27 @@ func (l *Loop) Run(ctx context.Context, req RunRequest) (*RunResult, error) {
 		return nil, err
 	}
 
+	completedPayload := map[string]any{"content": result.Content}
+	if result.Usage != nil {
+		completedPayload["usage"] = map[string]any{
+			"prompt_tokens":         result.Usage.PromptTokens,
+			"completion_tokens":     result.Usage.CompletionTokens,
+			"total_tokens":          result.Usage.TotalTokens,
+			"cache_creation_tokens": result.Usage.CacheCreationTokens,
+			"cache_read_tokens":     result.Usage.CacheReadTokens,
+		}
+	}
+	if len(result.Media) > 0 {
+		completedPayload["media"] = result.Media
+	}
 	emitRun(AgentEvent{
 		Type:    protocol.AgentEventRunCompleted,
 		AgentID: l.id,
 		RunID:   req.RunID,
-		Payload: map[string]any{"content": result.Content},
+		Payload: completedPayload,
 	})
 	if !isChildTrace && l.traceCollector != nil && traceID != uuid.Nil {
-		l.traceCollector.FinishTrace(ctx, traceID, store.TraceStatusCompleted, "", truncateStr(result.Content, 500))
+		l.traceCollector.FinishTrace(ctx, traceID, store.TraceStatusCompleted, "", truncateStr(result.Content, l.traceCollector.PreviewMaxLen()))
 	}
 	return result, nil
 }

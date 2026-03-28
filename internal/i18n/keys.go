@@ -94,11 +94,9 @@ const (
 	MsgAgentIsTeamLead      = "error.agent_is_team_lead"      // "agent is already the team lead"
 	MsgCannotRemoveTeamLead = "error.cannot_remove_team_lead" // "cannot remove the team lead"
 
-	// --- Delegations ---
-	MsgDelegationsUnavailable = "error.delegations_not_available" // "delegations not available"
-
 	// --- Channels ---
 	MsgCannotDeleteDefaultInst  = "error.cannot_delete_default_inst"  // "cannot delete default channel instance"
+	MsgCannotRemoveLastWriter   = "error.cannot_remove_last_writer"   // "cannot remove the last file writer"
 
 	// --- Skills ---
 	MsgSkillsUpdateNotSupported = "error.skills_update_not_supported" // "skills.update not supported for file-based skills"
@@ -132,6 +130,7 @@ const (
 	MsgStatusPhaseCompact  = "status.phase_compact"   // "Phase: Compacting context..."
 	MsgStatusPhaseDefault  = "status.phase_default"   // "Phase: Processing..."
 	MsgCancelledReply      = "status.cancelled"       // "✋ Cancelled. What would you like to do next?"
+	MsgInjectedAck         = "status.injected_ack"    // "Got it, I'll incorporate that into what I'm working on."
 
 	// --- Knowledge Graph ---
 	MsgEntityIDRequired           = "error.entity_id_required"            // "entity_id is required"
@@ -169,9 +168,22 @@ const (
 	MsgToolSpawn             = "core.tool.spawn"
 	MsgToolSkillSearch       = "core.tool.skill_search"
 	MsgToolUseSkill          = "core.tool.use_skill"
-	MsgToolDelegateSearch    = "core.tool.delegate_search"
-	MsgToolEvaluateLoop      = "core.tool.evaluate_loop"
-	MsgToolHandoff           = "core.tool.handoff"
+	MsgToolSkillManage       = "core.tool.skill_manage"
+	MsgToolPublishSkill      = "core.tool.publish_skill"
 	MsgToolTeamTasks         = "core.tool.team_tasks"
-	MsgToolTeamMessage       = "core.tool.team_message"
+
+	// Skill evolution nudges (user-facing)
+	MsgSkillNudgePostscript = "skill.nudge_postscript"
+	MsgSkillNudge70Pct      = "skill.nudge_70_pct"
+	MsgSkillNudge90Pct      = "skill.nudge_90_pct"
+
+	// --- Tenants ---
+	MsgInvalidRole = "error.invalid_role" // "invalid role: allowed values are owner, admin, operator, member, viewer"
+
+	// --- Contact merge ---
+	MsgContactIDsRequired  = "error.contact_ids_required"  // "contact_ids is required"
+	MsgMergeTargetRequired = "error.merge_target_required"  // "exactly one of tenant_user_id or create_user is required"
+	MsgTenantUserNotFound  = "error.tenant_user_not_found"  // "tenant user not found"
+	MsgTenantMismatch      = "error.tenant_mismatch"        // "tenant user does not belong to this tenant"
+	MsgTenantScopeRequired = "error.tenant_scope_required"  // "tenant scope is required for this operation"
 )

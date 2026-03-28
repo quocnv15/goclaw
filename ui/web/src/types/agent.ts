@@ -7,6 +7,8 @@ export interface ToolPolicyConfig {
   allow?: string[];
   deny?: string[];
   alsoAllow?: string[];
+  byProvider?: Record<string, { profile?: string; allow?: string[]; deny?: string[]; alsoAllow?: string[] }>;
+  toolCallPrefix?: string; // prefix to strip from model's tool call names
 }
 
 export interface SubagentsConfig {
@@ -62,18 +64,36 @@ export interface MemoryConfig {
   embedding_model?: string;
   max_results?: number;
   max_chunk_len?: number;
+  chunk_overlap?: number;
   vector_weight?: number;
   text_weight?: number;
+  min_score?: number;
 }
 
-export interface QualityGateConfig {
-  event: string;
-  type: "agent" | "command";
-  agent?: string;
-  command?: string;
-  block_on_failure: boolean;
-  max_retries?: number;
-  timeout_seconds?: number;
+export interface WorkspaceSharingConfig {
+  shared_dm?: boolean;
+  shared_group?: boolean;
+  shared_users?: string[];
+  share_memory?: boolean;
+}
+
+export type ChatGPTOAuthRoutingStrategy =
+  | "manual"
+  | "primary_first"
+  | "round_robin"
+  | "priority_order";
+
+export type EffectiveChatGPTOAuthRoutingStrategy =
+  | "primary_first"
+  | "round_robin"
+  | "priority_order";
+
+export type ChatGPTOAuthRoutingOverrideMode = "inherit" | "custom";
+
+export interface ChatGPTOAuthRoutingConfig {
+  override_mode?: ChatGPTOAuthRoutingOverrideMode;
+  strategy?: ChatGPTOAuthRoutingStrategy;
+  extra_provider_names?: string[];
 }
 
 export interface AgentData {
@@ -102,6 +122,8 @@ export interface AgentData {
   compaction_config?: CompactionConfig | null;
   context_pruning?: ContextPruningConfig | null;
   other_config?: Record<string, unknown> | null;
+  budget_monthly_cents?: number | null;
+  tenant_id?: string;
 }
 
 export interface AgentShareData {

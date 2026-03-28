@@ -8,11 +8,14 @@ import {
   CheckCircle2,
   XCircle,
   Minus,
+  Tag,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { HealthPayload, ChannelStatusEntry } from "./types";
+import type { RuntimeInfo } from "@/pages/skills/hooks/use-runtimes";
 import { formatUptime } from "./hooks/use-live-uptime";
+import { cleanVersion } from "@/lib/clean-version";
 
 function StatusDot({ ok }: { ok: boolean | undefined }) {
   if (ok === undefined)
@@ -58,6 +61,7 @@ export function SystemHealthCard({
   sessions,
   clientCount,
   channelEntries,
+  runtimeEntries,
 }: {
   health: HealthPayload | null;
   liveUptime: number | undefined;
@@ -65,14 +69,36 @@ export function SystemHealthCard({
   sessions: number;
   clientCount: number;
   channelEntries: [string, ChannelStatusEntry][];
+  runtimeEntries?: RuntimeInfo[];
 }) {
   const { t } = useTranslation("overview");
   return (
     <Card className="gap-4">
       <CardHeader>
-        <CardTitle className="text-base flex items-center gap-2">
-          <Monitor className="h-4 w-4" /> {t("systemHealth.title")}
-        </CardTitle>
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-base flex items-center gap-2">
+            <Monitor className="h-4 w-4" /> {t("systemHealth.title")}
+          </CardTitle>
+          {health?.version && (
+            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <Tag className="h-3 w-3" />
+              <span className="font-medium">{cleanVersion(health.version)}</span>
+              {health.updateAvailable === false && (
+                <CheckCircle2 className="h-3 w-3 text-emerald-500" />
+              )}
+              {health.updateAvailable && health.updateUrl && (
+                <a
+                  href={health.updateUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="ml-1 text-primary hover:underline"
+                >
+                  {health.latestVersion} →
+                </a>
+              )}
+            </div>
+          )}
+        </div>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -119,6 +145,30 @@ export function SystemHealthCard({
             value={String(clientCount)}
           />
         </div>
+
+        {runtimeEntries && runtimeEntries.length > 0 && (
+          <div className="border-t pt-4">
+            <p className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wider">
+              {t("systemHealth.runtimes")}
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {runtimeEntries.map((rt) => (
+                <span
+                  key={rt.name}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-muted/50 px-2 py-1 text-xs"
+                >
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${rt.available ? "bg-emerald-500" : "bg-red-400"}`}
+                  />
+                  {rt.name}
+                  {rt.version && (
+                    <span className="text-muted-foreground">{rt.version}</span>
+                  )}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
 
         {channelEntries.length > 0 && (
           <div className="border-t pt-4">

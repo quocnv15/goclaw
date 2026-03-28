@@ -2,11 +2,13 @@ package gateway
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +29,11 @@ import (
 )
 
 // Server is the main gateway server handling WebSocket and HTTP connections.
+// routeRegistrar is implemented by all HTTP API handlers that register routes on a mux.
+type routeRegistrar interface {
+	RegisterRoutes(mux *http.ServeMux)
+}
+
 type Server struct {
 	cfg      *config.Config
 	eventPub bus.EventPublisher
@@ -35,41 +42,37 @@ type Server struct {
 	tools    *tools.Registry
 	router   *MethodRouter
 
+	// HTTP API handlers — all implement routeRegistrar.
+	// Registered via Set*Handler() setters, routes added in BuildMux() via single loop.
+	handlers []routeRegistrar
+
+	// Non-handler dependencies (don't implement RegisterRoutes)
 	policyEngine   *permissions.PolicyEngine
 	pairingService store.PairingStore
-	agentsHandler  *httpapi.AgentsHandler // agent CRUD API
-	skillsHandler  *httpapi.SkillsHandler // skill management API
-	tracesHandler  *httpapi.TracesHandler // LLM trace listing API
-	mcpHandler         *httpapi.MCPHandler         // MCP server management API
-	customToolsHandler      *httpapi.CustomToolsHandler      // custom tool CRUD API
-	channelInstancesHandler *httpapi.ChannelInstancesHandler // channel instance CRUD API
-	providersHandler        *httpapi.ProvidersHandler        // provider CRUD API
-	delegationsHandler      *httpapi.DelegationsHandler      // delegation history API
-	builtinToolsHandler     *httpapi.BuiltinToolsHandler     // builtin tool management API
-	pendingMessagesHandler  *httpapi.PendingMessagesHandler  // pending messages API
-	memoryHandler           *httpapi.MemoryHandler           // memory management API
-	kgHandler               *httpapi.KnowledgeGraphHandler   // knowledge graph API
-	oauthHandler            *httpapi.OAuthHandler            // OAuth endpoints
-	filesHandler            *httpapi.FilesHandler            // workspace file serving
-	storageHandler          *httpapi.StorageHandler          // storage file management
-	mediaUploadHandler      *httpapi.MediaUploadHandler      // media upload endpoint
-	mediaServeHandler       *httpapi.MediaServeHandler       // media serve endpoint
-	agentStore         store.AgentStore             // for context injection in tools_invoke
-	msgBus             *bus.MessageBus              // for MCP bridge media delivery
+	apiKeyStore    store.APIKeyStore  // for API key auth lookup
+	agentStore     store.AgentStore   // for context injection in tools_invoke
+	msgBus         *bus.MessageBus    // for MCP bridge media delivery
 
 	upgrader    websocket.Upgrader
 	rateLimiter *RateLimiter
 	clients     map[string]*Client
 	mu          sync.RWMutex
 
-	startedAt time.Time
-	version   string
-	db        interface{ PingContext(context.Context) error } // for health check DB ping
+	startedAt      time.Time
+	version        string
+	db             interface{ PingContext(context.Context) error } // for health check DB ping
+	updateChecker  *UpdateChecker
 
-	logTee *LogTee // optional; auto-unsubscribes clients on disconnect
+	logTee   *LogTee                  // optional; auto-unsubscribes clients on disconnect
+	postTurn tools.PostTurnProcessor // optional; for team task dispatch in HTTP API paths
 
 	httpServer *http.Server
 	mux        *http.ServeMux
+}
+
+// SetPostTurnProcessor sets the post-turn processor for team task dispatch in HTTP API handlers.
+func (s *Server) SetPostTurnProcessor(pt tools.PostTurnProcessor) {
+	s.postTurn = pt
 }
 
 // NewServer creates a new gateway server.
@@ -144,130 +147,64 @@ func (s *Server) BuildMux() *http.ServeMux {
 
 	// OpenAI-compatible chat completions
 	isManaged := s.agentStore != nil
-	chatHandler := httpapi.NewChatCompletionsHandler(s.agents, s.sessions, s.cfg.Gateway.Token, isManaged)
+	chatHandler := httpapi.NewChatCompletionsHandler(s.agents, s.sessions, isManaged)
 	if s.rateLimiter.Enabled() {
 		chatHandler.SetRateLimiter(s.rateLimiter.Allow)
+	}
+	if s.postTurn != nil {
+		chatHandler.SetPostTurnProcessor(s.postTurn)
 	}
 	mux.Handle("/v1/chat/completions", chatHandler)
 
 	// OpenResponses protocol
-	responsesHandler := httpapi.NewResponsesHandler(s.agents, s.sessions, s.cfg.Gateway.Token)
+	responsesHandler := httpapi.NewResponsesHandler(s.agents, s.sessions)
+	if s.postTurn != nil {
+		responsesHandler.SetPostTurnProcessor(s.postTurn)
+	}
 	mux.Handle("/v1/responses", responsesHandler)
 
 	// Direct tool invocation
 	if s.tools != nil {
-		toolsHandler := httpapi.NewToolsInvokeHandler(s.tools, s.cfg.Gateway.Token, s.agentStore)
+		toolsHandler := httpapi.NewToolsInvokeHandler(s.tools, s.agentStore)
 		mux.Handle("/v1/tools/invoke", toolsHandler)
 	}
 
-	// Managed mode: agent CRUD + shares API
-	if s.agentsHandler != nil {
-		s.agentsHandler.RegisterRoutes(mux)
-	}
-
-	// Managed mode: skill management API
-	if s.skillsHandler != nil {
-		s.skillsHandler.RegisterRoutes(mux)
-	}
-
-	// Managed mode: LLM trace listing API
-	if s.tracesHandler != nil {
-		s.tracesHandler.RegisterRoutes(mux)
-	}
-
-	// Managed mode: MCP server management API
-	if s.mcpHandler != nil {
-		s.mcpHandler.RegisterRoutes(mux)
-	}
-
-	// Managed mode: custom tool CRUD API
-	if s.customToolsHandler != nil {
-		s.customToolsHandler.RegisterRoutes(mux)
-	}
-
-	// Managed mode: channel instance CRUD API
-	if s.channelInstancesHandler != nil {
-		s.channelInstancesHandler.RegisterRoutes(mux)
-	}
-
-	// Managed mode: provider & model CRUD API
-	if s.providersHandler != nil {
-		s.providersHandler.RegisterRoutes(mux)
-	}
-
-	// Managed mode: delegation history API
-	if s.delegationsHandler != nil {
-		s.delegationsHandler.RegisterRoutes(mux)
-	}
-
-	// Managed mode: builtin tool management API
-	if s.builtinToolsHandler != nil {
-		s.builtinToolsHandler.RegisterRoutes(mux)
-	}
-
-	// Managed mode: pending messages API
-	if s.pendingMessagesHandler != nil {
-		s.pendingMessagesHandler.RegisterRoutes(mux)
-	}
-
-	// Memory management API
-	if s.memoryHandler != nil {
-		s.memoryHandler.RegisterRoutes(mux)
-	}
-
-	// Knowledge graph API
-	if s.kgHandler != nil {
-		s.kgHandler.RegisterRoutes(mux)
-	}
-
-	// Workspace file serving (available in all modes)
-	if s.filesHandler != nil {
-		s.filesHandler.RegisterRoutes(mux)
-	}
-
-	// Storage file management (browse/delete workspace files)
-	if s.storageHandler != nil {
-		s.storageHandler.RegisterRoutes(mux)
-	}
-
-	// Media upload endpoint (available in all modes)
-	if s.mediaUploadHandler != nil {
-		s.mediaUploadHandler.RegisterRoutes(mux)
-	}
-
-	// Media serve endpoint (available in all modes)
-	if s.mediaServeHandler != nil {
-		s.mediaServeHandler.RegisterRoutes(mux)
-	}
-
-	// OAuth endpoints (available in all modes)
-	if s.oauthHandler != nil {
-		s.oauthHandler.RegisterRoutes(mux)
+	// Register all HTTP API handlers (agents, skills, teams, storage, etc.)
+	for _, h := range s.handlers {
+		if h != nil {
+			h.RegisterRoutes(mux)
+		}
 	}
 
 	// MCP bridge: expose GoClaw tools to Claude CLI via streamable-http.
 	// Only listens on localhost (CLI runs on the same machine).
-	// Protected by gateway token when configured.
-	// Agent context (X-Agent-ID, X-User-ID) is injected from request headers.
+	// Protected by gateway token; disabled when no token is configured to
+	// prevent unauthenticated tool invocations if port is exposed.
 	if s.tools != nil {
-		bridgeHandler := mcpbridge.NewBridgeServer(s.tools, "1.0.0", s.msgBus)
-		var handler http.Handler = bridgeContextMiddleware(s.cfg.Gateway.Token, bridgeHandler)
 		if s.cfg.Gateway.Token != "" {
-			handler = tokenAuthMiddleware(s.cfg.Gateway.Token, handler)
+			bridgeHandler := mcpbridge.NewBridgeServer(s.tools, "1.0.0", s.msgBus)
+			handler := tokenAuthMiddleware(s.cfg.Gateway.Token,
+				bridgeContextMiddleware(s.cfg.Gateway.Token, bridgeHandler))
+			mux.Handle("/mcp/bridge", handler)
 		} else {
-			slog.Warn("security.mcp_bridge: no gateway token configured, MCP bridge tools are unauthenticated")
+			slog.Warn("security.mcp_bridge_disabled: no gateway token configured, MCP bridge is disabled")
+			mux.HandleFunc("/mcp/bridge", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"error":"mcp bridge disabled: set GOCLAW_GATEWAY_TOKEN to enable"}`))
+			})
 		}
-		mux.Handle("/mcp/bridge", handler)
 	}
 
 	s.mux = mux
 	return mux
 }
 
-// bridgeContextMiddleware extracts X-Agent-ID and X-User-ID headers from the
-// MCP bridge request and injects them into the context so bridge tools can
-// access agent/user scope. When a gateway token is configured, the context
-// headers must be accompanied by a valid X-Bridge-Sig HMAC to prevent forgery.
+// bridgeContextMiddleware extracts X-Agent-ID, X-User-ID, and X-Workspace headers
+// from the MCP bridge request and injects them into the context so bridge tools can
+// access agent/user scope and resolve workspace-relative paths.
+// When a gateway token is configured, the context headers must be accompanied by
+// a valid X-Bridge-Sig HMAC to prevent forgery.
 func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
@@ -276,17 +213,26 @@ func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handle
 		channel := r.Header.Get("X-Channel")
 		chatID := r.Header.Get("X-Chat-ID")
 		peerKind := r.Header.Get("X-Peer-Kind")
+		workspace := r.Header.Get("X-Workspace")
 
 		if agentIDStr != "" || userID != "" {
-			// Verify HMAC signature over all context fields when gateway token is configured
-			if gatewayToken != "" {
-				sig := r.Header.Get("X-Bridge-Sig")
-				if !providers.VerifyBridgeContext(gatewayToken, agentIDStr, userID, channel, chatID, peerKind, sig) {
-					slog.Warn("security.mcp_bridge: invalid bridge context signature",
-						"agent_id", agentIDStr, "user_id", userID)
-					http.Error(w, `{"error":"invalid bridge context signature"}`, http.StatusForbidden)
-					return
-				}
+			// Reject context headers when no gateway token — prevents unauthenticated impersonation.
+			if gatewayToken == "" {
+				slog.Warn("security.mcp_bridge: no gateway token, ignoring context headers",
+					"agent_id", agentIDStr, "user_id", userID)
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Verify HMAC signature over all context fields.
+			tenantIDStr := r.Header.Get("X-Tenant-ID")
+			sig := r.Header.Get("X-Bridge-Sig")
+			ok, tenantVerified := providers.VerifyBridgeContext(gatewayToken, agentIDStr, userID, channel, chatID, peerKind, workspace, tenantIDStr, sig)
+			if !ok {
+				slog.Warn("security.mcp_bridge: invalid bridge context signature",
+					"agent_id", agentIDStr, "user_id", userID)
+				http.Error(w, `{"error":"invalid bridge context signature"}`, http.StatusForbidden)
+				return
 			}
 
 			if agentIDStr != "" {
@@ -296,6 +242,13 @@ func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handle
 			}
 			if userID != "" {
 				ctx = store.WithUserID(ctx, userID)
+			}
+			// Only inject tenant_id when HMAC actually covers it (level 1).
+			// Fallback levels (pre-tenantID sessions) must not trust unsigned tenant headers.
+			if tenantVerified && tenantIDStr != "" {
+				if tid, err := uuid.Parse(tenantIDStr); err == nil {
+					ctx = store.WithTenantID(ctx, tid)
+				}
 			}
 		}
 
@@ -309,6 +262,11 @@ func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handle
 		if peerKind != "" {
 			ctx = tools.WithToolPeerKind(ctx, peerKind)
 		}
+		// Inject workspace so bridge tools (read_image, read_file, etc.) can resolve paths.
+		// Only when agent context is present (HMAC-protected) to prevent unauthenticated path injection.
+		if workspace != "" && (agentIDStr != "" || userID != "") {
+			ctx = tools.WithToolWorkspace(ctx, workspace)
+		}
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -318,7 +276,8 @@ func bridgeContextMiddleware(gatewayToken string, next http.Handler) http.Handle
 func tokenAuthMiddleware(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != token {
+		provided := strings.TrimPrefix(auth, "Bearer ")
+		if !strings.HasPrefix(auth, "Bearer ") || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
@@ -330,10 +289,16 @@ func tokenAuthMiddleware(token string, next http.Handler) http.Handler {
 func (s *Server) Start(ctx context.Context) error {
 	mux := s.BuildMux()
 
+	// Wrap with CORS for desktop dev mode (Wails serves frontend on different port).
+	var handler http.Handler = mux
+	if os.Getenv("GOCLAW_DESKTOP") == "1" {
+		handler = desktopCORS(mux)
+	}
+
 	addr := fmt.Sprintf("%s:%d", s.cfg.Gateway.Host, s.cfg.Gateway.Port)
 	s.httpServer = &http.Server{
 		Addr:    addr,
-		Handler: mux,
+		Handler: handler,
 	}
 
 	slog.Info("gateway starting", "addr", addr)
@@ -402,61 +367,126 @@ func (s *Server) SetPolicyEngine(pe *permissions.PolicyEngine) { s.policyEngine 
 func (s *Server) SetPairingService(ps store.PairingStore) { s.pairingService = ps }
 
 // SetAgentsHandler sets the agent CRUD handler.
-func (s *Server) SetAgentsHandler(h *httpapi.AgentsHandler) { s.agentsHandler = h }
+func (s *Server) SetAgentsHandler(h *httpapi.AgentsHandler) { s.handlers = append(s.handlers, h) }
 
 // SetSkillsHandler sets the skill management handler.
-func (s *Server) SetSkillsHandler(h *httpapi.SkillsHandler) { s.skillsHandler = h }
+func (s *Server) SetSkillsHandler(h *httpapi.SkillsHandler) { s.handlers = append(s.handlers, h) }
 
 // SetTracesHandler sets the LLM trace listing handler.
-func (s *Server) SetTracesHandler(h *httpapi.TracesHandler) { s.tracesHandler = h }
+func (s *Server) SetTracesHandler(h *httpapi.TracesHandler) { s.handlers = append(s.handlers, h) }
+
+// SetWakeHandler sets the external wake/trigger handler.
+func (s *Server) SetWakeHandler(h *httpapi.WakeHandler) { s.handlers = append(s.handlers, h) }
 
 // SetMCPHandler sets the MCP server management handler.
-func (s *Server) SetMCPHandler(h *httpapi.MCPHandler) { s.mcpHandler = h }
-
-// SetCustomToolsHandler sets the custom tool CRUD handler.
-func (s *Server) SetCustomToolsHandler(h *httpapi.CustomToolsHandler) { s.customToolsHandler = h }
+func (s *Server) SetMCPHandler(h *httpapi.MCPHandler) { s.handlers = append(s.handlers, h) }
+func (s *Server) SetMCPUserCredentialsHandler(h *httpapi.MCPUserCredentialsHandler) {
+	s.handlers = append(s.handlers, h)
+}
 
 // SetChannelInstancesHandler sets the channel instance CRUD handler.
 func (s *Server) SetChannelInstancesHandler(h *httpapi.ChannelInstancesHandler) {
-	s.channelInstancesHandler = h
+	s.handlers = append(s.handlers, h)
 }
 
 // SetProvidersHandler sets the provider CRUD handler.
-func (s *Server) SetProvidersHandler(h *httpapi.ProvidersHandler) { s.providersHandler = h }
+func (s *Server) SetProvidersHandler(h *httpapi.ProvidersHandler) {
+	s.handlers = append(s.handlers, h)
+}
 
-// SetDelegationsHandler sets the delegation history handler.
-func (s *Server) SetDelegationsHandler(h *httpapi.DelegationsHandler) { s.delegationsHandler = h }
+// SetTeamEventsHandler sets the team event history handler.
+func (s *Server) SetTeamEventsHandler(h *httpapi.TeamEventsHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetTeamAttachmentsHandler sets the team attachment download handler.
+func (s *Server) SetTeamAttachmentsHandler(h *httpapi.TeamAttachmentsHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetWorkspaceUploadHandler sets the team workspace file upload handler.
+func (s *Server) SetWorkspaceUploadHandler(h *httpapi.WorkspaceUploadHandler) {
+	s.handlers = append(s.handlers, h)
+}
 
 // SetPendingMessagesHandler sets the pending messages handler.
 func (s *Server) SetPendingMessagesHandler(h *httpapi.PendingMessagesHandler) {
-	s.pendingMessagesHandler = h
+	s.handlers = append(s.handlers, h)
 }
 
 // SetBuiltinToolsHandler sets the builtin tool management handler.
 func (s *Server) SetBuiltinToolsHandler(h *httpapi.BuiltinToolsHandler) {
-	s.builtinToolsHandler = h
+	s.handlers = append(s.handlers, h)
+}
+
+// SetSecureCLIHandler sets the secure CLI credential CRUD handler.
+func (s *Server) SetSecureCLIHandler(h *httpapi.SecureCLIHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetPackagesHandler sets the runtime package management handler.
+func (s *Server) SetPackagesHandler(h *httpapi.PackagesHandler) {
+	s.handlers = append(s.handlers, h)
 }
 
 // SetOAuthHandler sets the OAuth handler (available in all modes).
-func (s *Server) SetOAuthHandler(h *httpapi.OAuthHandler) { s.oauthHandler = h }
+func (s *Server) SetOAuthHandler(h *httpapi.OAuthHandler) { s.handlers = append(s.handlers, h) }
+
+// SetAPIKeysHandler sets the API key management handler.
+func (s *Server) SetAPIKeysHandler(h *httpapi.APIKeysHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetTenantsHandler sets the tenant management handler.
+func (s *Server) SetTenantsHandler(h *httpapi.TenantsHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetAPIKeyStore sets the API key store for token-based auth lookup.
+func (s *Server) SetAPIKeyStore(st store.APIKeyStore) { s.apiKeyStore = st }
 
 // SetFilesHandler sets the workspace file serving handler.
-func (s *Server) SetFilesHandler(h *httpapi.FilesHandler) { s.filesHandler = h }
+func (s *Server) SetFilesHandler(h *httpapi.FilesHandler) { s.handlers = append(s.handlers, h) }
 
 // SetStorageHandler sets the storage file management handler.
-func (s *Server) SetStorageHandler(h *httpapi.StorageHandler) { s.storageHandler = h }
+func (s *Server) SetStorageHandler(h *httpapi.StorageHandler) { s.handlers = append(s.handlers, h) }
 
 // SetMediaUploadHandler sets the media upload handler.
-func (s *Server) SetMediaUploadHandler(h *httpapi.MediaUploadHandler) { s.mediaUploadHandler = h }
+func (s *Server) SetMediaUploadHandler(h *httpapi.MediaUploadHandler) {
+	s.handlers = append(s.handlers, h)
+}
 
 // SetMediaServeHandler sets the media serve handler.
-func (s *Server) SetMediaServeHandler(h *httpapi.MediaServeHandler) { s.mediaServeHandler = h }
+func (s *Server) SetMediaServeHandler(h *httpapi.MediaServeHandler) {
+	s.handlers = append(s.handlers, h)
+}
 
 // SetMemoryHandler sets the memory management handler.
-func (s *Server) SetMemoryHandler(h *httpapi.MemoryHandler) { s.memoryHandler = h }
+func (s *Server) SetMemoryHandler(h *httpapi.MemoryHandler) { s.handlers = append(s.handlers, h) }
 
 // SetKnowledgeGraphHandler sets the knowledge graph handler.
-func (s *Server) SetKnowledgeGraphHandler(h *httpapi.KnowledgeGraphHandler) { s.kgHandler = h }
+func (s *Server) SetKnowledgeGraphHandler(h *httpapi.KnowledgeGraphHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetActivityHandler sets the activity audit log handler.
+func (s *Server) SetActivityHandler(h *httpapi.ActivityHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetSystemConfigsHandler sets the system configs handler.
+func (s *Server) SetSystemConfigsHandler(h *httpapi.SystemConfigsHandler) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetUsageHandler sets the usage analytics handler.
+func (s *Server) SetUsageHandler(h *httpapi.UsageHandler) { s.handlers = append(s.handlers, h) }
+
+// SetDocsHandler sets the OpenAPI spec + Swagger UI handler.
+func (s *Server) SetDocsHandler(h *httpapi.DocsHandler) { s.handlers = append(s.handlers, h) }
+
+// SetEditionHandler sets the edition info handler.
+func (s *Server) SetEditionHandler(h *httpapi.EditionHandler) { s.handlers = append(s.handlers, h) }
 
 // SetAgentStore sets the agent store for context injection in tools_invoke.
 func (s *Server) SetAgentStore(as store.AgentStore) { s.agentStore = as }
@@ -475,6 +505,13 @@ func (s *Server) StartedAt() time.Time { return s.startedAt }
 
 // Version returns the server version string.
 func (s *Server) Version() string { return s.version }
+
+// StartUpdateChecker starts a background goroutine that periodically checks
+// GitHub for new releases and caches the result for the health endpoint.
+func (s *Server) StartUpdateChecker(ctx context.Context) {
+	s.updateChecker = NewUpdateChecker(s.version)
+	s.updateChecker.Start(ctx)
+}
 
 // ClientList returns a snapshot of all connected clients.
 func (s *Server) ClientList() []*Client {
@@ -520,12 +557,11 @@ func (s *Server) registerClient(c *Client) {
 	defer s.mu.Unlock()
 	s.clients[c.id] = c
 
-	// Subscribe to bus events for this client (skip internal cache events)
+	// Subscribe to bus events with per-user/team filtering.
 	s.eventPub.Subscribe(c.id, func(event bus.Event) {
-		if strings.HasPrefix(event.Name, "cache.") {
-			return // internal event, don't forward to WS clients
+		if clientCanReceiveEvent(c, event) {
+			c.SendEvent(*protocol.NewEvent(event.Name, event.Payload))
 		}
-		c.SendEvent(*protocol.NewEvent(event.Name, event.Payload))
 	})
 
 	slog.Info("client connected", "id", c.id)
@@ -555,17 +591,23 @@ func StartTestServer(s *Server, ctx context.Context) (addr string, start func())
 	mux.HandleFunc("/health", s.handleHealth)
 
 	isManaged := s.agentStore != nil
-	chatHandler := httpapi.NewChatCompletionsHandler(s.agents, s.sessions, s.cfg.Gateway.Token, isManaged)
+	chatHandler := httpapi.NewChatCompletionsHandler(s.agents, s.sessions, isManaged)
 	if s.rateLimiter.Enabled() {
 		chatHandler.SetRateLimiter(s.rateLimiter.Allow)
 	}
+	if s.postTurn != nil {
+		chatHandler.SetPostTurnProcessor(s.postTurn)
+	}
 	mux.Handle("/v1/chat/completions", chatHandler)
 
-	responsesHandler := httpapi.NewResponsesHandler(s.agents, s.sessions, s.cfg.Gateway.Token)
+	responsesHandler := httpapi.NewResponsesHandler(s.agents, s.sessions)
+	if s.postTurn != nil {
+		responsesHandler.SetPostTurnProcessor(s.postTurn)
+	}
 	mux.Handle("/v1/responses", responsesHandler)
 
 	if s.tools != nil {
-		toolsHandler := httpapi.NewToolsInvokeHandler(s.tools, s.cfg.Gateway.Token, s.agentStore)
+		toolsHandler := httpapi.NewToolsInvokeHandler(s.tools, s.agentStore)
 		mux.Handle("/v1/tools/invoke", toolsHandler)
 	}
 
@@ -588,4 +630,19 @@ func StartTestServer(s *Server, ctx context.Context) (addr string, start func())
 	}
 
 	return addr, start
+}
+
+// desktopCORS wraps a handler with permissive CORS headers for desktop dev mode.
+// Only active when GOCLAW_DESKTOP=1 (set by desktop app.go).
+func desktopCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-GoClaw-Tenant-Id, X-GoClaw-User-Id")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

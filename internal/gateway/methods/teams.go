@@ -3,12 +3,14 @@ package methods
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
+	"github.com/nextlevelbuilder/goclaw/internal/permissions"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
@@ -20,10 +22,12 @@ type TeamsMethods struct {
 	linkStore   store.AgentLinkStore // for auto-creating bidirectional links
 	agentRouter *agent.Router        // for cache invalidation
 	msgBus      *bus.MessageBus      // for pub/sub cache invalidation
+	eventBus    bus.EventPublisher
+	dataDir string // workspace data directory for resolving file paths
 }
 
-func NewTeamsMethods(teamStore store.TeamStore, agentStore store.AgentStore, linkStore store.AgentLinkStore, agentRouter *agent.Router, msgBus *bus.MessageBus) *TeamsMethods {
-	return &TeamsMethods{teamStore: teamStore, agentStore: agentStore, linkStore: linkStore, agentRouter: agentRouter, msgBus: msgBus}
+func NewTeamsMethods(teamStore store.TeamStore, agentStore store.AgentStore, linkStore store.AgentLinkStore, agentRouter *agent.Router, msgBus *bus.MessageBus, eventBus bus.EventPublisher, dataDir string) *TeamsMethods {
+	return &TeamsMethods{teamStore: teamStore, agentStore: agentStore, linkStore: linkStore, agentRouter: agentRouter, msgBus: msgBus, eventBus: eventBus, dataDir: dataDir}
 }
 
 // emitTeamCacheInvalidate broadcasts a cache invalidation event for team data.
@@ -43,10 +47,23 @@ func (m *TeamsMethods) Register(router *gateway.MethodRouter) {
 	router.Register(protocol.MethodTeamsGet, m.handleGet)
 	router.Register(protocol.MethodTeamsDelete, m.handleDelete)
 	router.Register(protocol.MethodTeamsTaskList, m.handleTaskList)
+	router.Register(protocol.MethodTeamsTaskActiveBySession, m.handleTaskActiveBySession)
+	router.Register(protocol.MethodTeamsTaskApprove, m.handleTaskApprove)
+	router.Register(protocol.MethodTeamsTaskReject, m.handleTaskReject)
 	router.Register(protocol.MethodTeamsMembersAdd, m.handleAddMember)
 	router.Register(protocol.MethodTeamsMembersRemove, m.handleRemoveMember)
 	router.Register(protocol.MethodTeamsUpdate, m.handleUpdate)
 	router.Register(protocol.MethodTeamsKnownUsers, m.handleKnownUsers)
+	router.Register(protocol.MethodTeamsScopes, m.handleScopes)
+
+	// Workspace handlers
+	m.RegisterWorkspace(router)
+
+	// Events handlers
+	router.Register(protocol.MethodTeamsEventsList, m.handleEventsList)
+
+	// Task detail handlers
+	m.RegisterTasks(router)
 }
 
 // --- List ---
@@ -58,7 +75,14 @@ func (m *TeamsMethods) handleList(ctx context.Context, client *gateway.Client, r
 		return
 	}
 
-	teams, err := m.teamStore.ListTeams(ctx)
+	var teams []store.TeamData
+	var err error
+	if permissions.HasMinRole(client.Role(), permissions.RoleAdmin) {
+		teams, err = m.teamStore.ListTeams(ctx)
+	} else {
+		callerID := store.UserIDFromContext(ctx)
+		teams, err = m.teamStore.ListUserTeams(ctx, callerID)
+	}
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, err.Error()))
 		return
@@ -101,18 +125,29 @@ func (m *TeamsMethods) handleCreate(ctx context.Context, client *gateway.Client,
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "lead")))
 		return
 	}
+	if len(params.Members) == 0 {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "at least 1 member is required"))
+		return
+	}
 
 	// Resolve lead agent
-	leadAgent, err := resolveAgentInfo(m.agentStore, params.Lead)
+	leadAgent, err := resolveAgentInfo(ctx, m.agentStore, params.Lead)
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "lead agent: "+err.Error()))
+		return
+	}
+
+	// Enforce single-team leadership: an agent can only lead one team.
+	if existingTeam, _ := m.teamStore.GetTeamForAgent(ctx, leadAgent.ID); existingTeam != nil && existingTeam.LeadAgentID == leadAgent.ID {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest,
+			fmt.Sprintf("agent %q already leads team %q — each agent can only lead one team", params.Lead, existingTeam.Name)))
 		return
 	}
 
 	// Resolve member agents
 	var memberAgents []*store.AgentData
 	for _, memberKey := range params.Members {
-		ag, err := resolveAgentInfo(m.agentStore, memberKey)
+		ag, err := resolveAgentInfo(ctx, m.agentStore, memberKey)
 		if err != nil {
 			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "member agent "+memberKey+": "+err.Error()))
 			return
@@ -156,14 +191,10 @@ func (m *TeamsMethods) handleCreate(ctx context.Context, client *gateway.Client,
 		m.autoCreateTeamLinks(ctx, team.ID, leadAgent, memberAgents, client.UserID())
 	}
 
-	// Invalidate agent caches so TEAM.md gets injected
-	if m.agentRouter != nil {
-		m.agentRouter.InvalidateAgent(leadAgent.AgentKey)
-		for _, ag := range memberAgents {
-			m.agentRouter.InvalidateAgent(ag.AgentKey)
-		}
-	}
+	// Invalidate agent + team tool caches so TEAM.md gets injected
+	m.invalidateTeamCaches(ctx, team.ID)
 
+	emitAudit(m.eventBus, client, "team.created", "team", team.ID.String())
 	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"team": team,
 	}))

@@ -48,7 +48,7 @@ export function MemoryDocumentDialog({ open, onOpenChange, agentId, document }: 
       setDetail(res);
       setContent(res.content);
     } catch {
-      toast.error(i18next.t("memory:toast.failedCreate"));
+      toast.error(i18next.t("memory:toast.docLoadFailed"));
     } finally {
       setLoadingDetail(false);
     }
@@ -98,7 +98,7 @@ export function MemoryDocumentDialog({ open, onOpenChange, agentId, document }: 
       toast.success(i18next.t("memory:documentDialog.title"), document.path);
       onOpenChange(false);
     } catch (err) {
-      toast.error(i18next.t("memory:toast.failedCreate"), err instanceof Error ? err.message : "");
+      toast.error(i18next.t("memory:toast.docUpdateFailed"), err instanceof Error ? err.message : "");
     } finally {
       setSaving(false);
     }
@@ -108,7 +108,7 @@ export function MemoryDocumentDialog({ open, onOpenChange, agentId, document }: 
 
   return (
     <Dialog open={open} onOpenChange={(v) => !saving && onOpenChange(v)}>
-      <DialogContent className="max-w-4xl max-h-[85vh] flex flex-col">
+      <DialogContent aria-describedby={undefined} className="max-w-4xl max-h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <span className="font-mono text-sm">{document?.path}</span>
@@ -136,7 +136,7 @@ export function MemoryDocumentDialog({ open, onOpenChange, agentId, document }: 
           </button>
         </div>
 
-        <div className="flex-1 min-h-0 overflow-y-auto py-2 px-1 -mx-1">
+        <div className="flex-1 min-h-0 overflow-y-auto py-2 -mx-4 px-4 sm:-mx-6 sm:px-6">
           {tab === "content" && (
             <div className="grid gap-3">
               {detail && (

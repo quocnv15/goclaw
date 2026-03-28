@@ -22,21 +22,21 @@ import {
 } from "@/components/ui/select";
 import type { ProviderData, ProviderInput } from "./hooks/use-providers";
 import { slugify, isValidSlug } from "@/lib/slug";
-import { PROVIDER_TYPES } from "@/constants/providers";
+import { DEFAULT_CODEX_OAUTH_ALIAS, PROVIDER_TYPES, suggestUniqueProviderAlias } from "@/constants/providers";
 import { OAuthSection } from "./provider-oauth-section";
 import { CLISection } from "./provider-cli-section";
+import { ACPSection } from "./provider-acp-section";
+import { Loader2 } from "lucide-react";
 
 interface ProviderFormDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  provider: ProviderData | null; // null = create mode
   onSubmit: (data: ProviderInput) => Promise<unknown>;
   existingProviders?: ProviderData[];
 }
 
-export function ProviderFormDialog({ open, onOpenChange, provider, onSubmit, existingProviders = [] }: ProviderFormDialogProps) {
+export function ProviderFormDialog({ open, onOpenChange, onSubmit, existingProviders = [] }: ProviderFormDialogProps) {
   const { t } = useTranslation("providers");
-  const isEdit = !!provider;
   const queryClient = useQueryClient();
   const [name, setName] = useState("");
   const [displayName, setDisplayName] = useState("");
@@ -47,32 +47,35 @@ export function ProviderFormDialog({ open, onOpenChange, provider, onSubmit, exi
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  // Only one Claude CLI provider allowed per instance
-  const hasClaudeCLI = !isEdit && existingProviders.some((p) => p.provider_type === "claude_cli");
+  // ACP fields
+  const [acpBinary, setAcpBinary] = useState("");
+  const [acpArgs, setAcpArgs] = useState("");
+  const [acpIdleTTL, setAcpIdleTTL] = useState("");
+  const [acpPermMode, setAcpPermMode] = useState("approve-all");
+  const [acpWorkDir, setAcpWorkDir] = useState("");
+
+  const hasClaudeCLI = existingProviders.some((p) => p.provider_type === "claude_cli");
 
   const isOAuth = providerType === "chatgpt_oauth";
   const isCLI = providerType === "claude_cli";
+  const isACP = providerType === "acp";
 
   useEffect(() => {
     if (open) {
       setError("");
-      if (provider) {
-        setName(provider.name);
-        setDisplayName(provider.display_name || "");
-        setProviderType(provider.provider_type);
-        setApiBase(provider.api_base || "");
-        setApiKey(provider.api_key || "");
-        setEnabled(provider.enabled);
-      } else {
-        setName("");
-        setDisplayName("");
-        setProviderType("openai_compat");
-        setApiBase("");
-        setApiKey("");
-        setEnabled(true);
-      }
+      setName("");
+      setDisplayName("");
+      setProviderType("openai_compat");
+      setApiBase("");
+      setApiKey("");
+      setEnabled(true);
+      setAcpBinary("");
+      setAcpArgs("");
+      setAcpIdleTTL("");
+      setAcpPermMode("approve-all");
+      setAcpWorkDir("");
     }
-  }, [open, provider]);
+  }, [open]);
 
   const handleSubmit = async () => {
     if (!name.trim() || !providerType) return;
@@ -86,7 +89,20 @@ export function ProviderFormDialog({ open, onOpenChange, provider, onSubmit, exi
         enabled,
       };
 
-      // Only include api_key if it's a real value (not the mask)
+      if (isACP) {
+        data.api_base = acpBinary.trim() || undefined;
+        const settings: Record<string, unknown> = {};
+        if (acpArgs.trim()) {
+          settings.args = acpArgs.trim().split(/\s+/);
+        }
+        if (acpIdleTTL.trim()) settings.idle_ttl = acpIdleTTL.trim();
+        if (acpPermMode) settings.perm_mode = acpPermMode;
+        if (acpWorkDir.trim()) settings.work_dir = acpWorkDir.trim();
+        if (Object.keys(settings).length > 0) {
+          data.settings = settings;
+        }
+      }
+
       if (apiKey && apiKey !== "***") {
         data.api_key = apiKey;
       }
@@ -102,47 +118,63 @@ export function ProviderFormDialog({ open, onOpenChange, provider, onSubmit, exi
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[85vh] flex flex-col">
+      <DialogContent className="flex max-h-[85vh] flex-col">
         <DialogHeader>
-          <DialogTitle>{isEdit ? t("form.editTitle") : t("form.createTitle")}</DialogTitle>
-          <DialogDescription>{t("form.configure")}</DialogDescription>
+          <DialogTitle>{t("form.createTitle")}</DialogTitle>
+          <DialogDescription>{isOAuth ? t("form.configureOauth") : t("form.configure")}</DialogDescription>
         </DialogHeader>
-        <div className="space-y-4 py-4 px-0.5 -mx-0.5 overflow-y-auto min-h-0">
-          {/* Provider type selector — always shown in create mode */}
-          {!isEdit && (
-            <ProviderTypeSelect
-              value={providerType}
-              hasClaudeCLI={hasClaudeCLI}
-              alreadyAddedLabel={t("form.alreadyAdded")}
-              providerTypeLabel={t("form.providerType")}
-              onChange={(v) => {
-                setProviderType(v);
-                const preset = PROVIDER_TYPES.find((pt) => pt.value === v);
-                setApiBase(preset?.apiBase || "");
-                if (v === "chatgpt_oauth") {
-                  setName("openai-codex");
-                  setDisplayName("ChatGPT (OAuth)");
-                } else {
-                  if (name === "openai-codex") setName("");
-                  if (displayName === "ChatGPT (OAuth)") setDisplayName("");
+        <div className="-mx-4 min-h-0 overflow-y-auto px-4 py-4 sm:-mx-6 sm:px-6 space-y-4">
+          <ProviderTypeSelect
+            value={providerType}
+            hasClaudeCLI={hasClaudeCLI}
+            alreadyAddedLabel={t("form.alreadyAdded")}
+            providerTypeLabel={t("form.providerType")}
+            onChange={(v) => {
+              setProviderType(v);
+              const preset = PROVIDER_TYPES.find((pt) => pt.value === v);
+              setApiBase(preset?.apiBase || "");
+              if (v === "chatgpt_oauth") {
+                if (!name || providerType !== "chatgpt_oauth") {
+                  setName(suggestUniqueProviderAlias(existingProviders));
                 }
-              }}
-            />
-          )}
+                if (displayName === "ChatGPT (OAuth)") setDisplayName("");
+              } else {
+                if (name === DEFAULT_CODEX_OAUTH_ALIAS) setName("");
+              }
+            }}
+          />
 
           {isOAuth ? (
             <>
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <div className="space-y-2">
-                  <Label>{t("form.nameFixed")}</Label>
-                  <Input value="openai-codex" disabled />
+                  <Label htmlFor="oauth-name">{t("form.oauthAlias")}</Label>
+                  <Input
+                    id="oauth-name"
+                    value={name}
+                    onChange={(e) => setName(slugify(e.target.value))}
+                    placeholder={t("form.oauthAliasPlaceholder")}
+                    className="text-base md:text-sm"
+                  />
                 </div>
                 <div className="space-y-2">
-                  <Label>{t("form.displayName")}</Label>
-                  <Input value="ChatGPT (OAuth)" disabled />
+                  <Label htmlFor="oauth-display-name">{t("form.displayName")}</Label>
+                  <Input
+                    id="oauth-display-name"
+                    value={displayName}
+                    onChange={(e) => setDisplayName(e.target.value)}
+                    placeholder={t("form.oauthDisplayNamePlaceholder")}
+                    className="text-base md:text-sm"
+                  />
                 </div>
               </div>
-              <OAuthSection onSuccess={() => { queryClient.invalidateQueries({ queryKey: ["providers"] }); onOpenChange(false); }} />
+              <OAuthSection
+                providerName={name}
+                displayName={displayName}
+                apiBase={apiBase}
+                authenticatedActionLabel={t("form.close")}
+                onSuccess={() => { queryClient.invalidateQueries({ queryKey: ["providers"] }); onOpenChange(false); }}
+              />
             </>
           ) : (
             <>
@@ -154,7 +186,7 @@ export function ProviderFormDialog({ open, onOpenChange, provider, onSubmit, exi
                     value={name}
                     onChange={(e) => setName(slugify(e.target.value))}
                     placeholder={t("form.namePlaceholder")}
-                    disabled={isEdit}
+                    className="text-base md:text-sm"
                   />
                   <p className="text-xs text-muted-foreground">{t("form.nameHint")}</p>
                 </div>
@@ -165,33 +197,29 @@ export function ProviderFormDialog({ open, onOpenChange, provider, onSubmit, exi
                     value={displayName}
                     onChange={(e) => setDisplayName(e.target.value)}
                     placeholder={t("form.displayNamePlaceholder")}
+                    className="text-base md:text-sm"
                   />
                 </div>
               </div>
 
-              {isEdit && (
-                <div className="space-y-2">
-                  <Label>{t("form.providerType")}</Label>
-                  <Select value={providerType} onValueChange={setProviderType}>
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {PROVIDER_TYPES.filter((pt) => pt.value !== "chatgpt_oauth").map((pt) => (
-                        <SelectItem key={pt.value} value={pt.value}>
-                          {pt.label}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              )}
-
-              {/* Claude CLI section */}
               {isCLI && <CLISection open={open} />}
 
-              {/* Standard provider fields (not shown for Claude CLI) */}
-              {!isCLI && (
+              {isACP && (
+                <ACPSection
+                  binary={acpBinary}
+                  onBinaryChange={setAcpBinary}
+                  args={acpArgs}
+                  onArgsChange={setAcpArgs}
+                  idleTTL={acpIdleTTL}
+                  onIdleTTLChange={setAcpIdleTTL}
+                  permMode={acpPermMode}
+                  onPermModeChange={setAcpPermMode}
+                  workDir={acpWorkDir}
+                  onWorkDirChange={setAcpWorkDir}
+                />
+              )}
+
+              {!isCLI && !isACP && (
                 <>
                   <div className="space-y-2">
                     <Label htmlFor="apiBase">{t("form.apiBase")}</Label>
@@ -200,6 +228,7 @@ export function ProviderFormDialog({ open, onOpenChange, provider, onSubmit, exi
                       value={apiBase}
                       onChange={(e) => setApiBase(e.target.value)}
                       placeholder={PROVIDER_TYPES.find((pt) => pt.value === providerType)?.placeholder || PROVIDER_TYPES.find((pt) => pt.value === providerType)?.apiBase || "https://api.example.com/v1"}
+                      className="text-base md:text-sm"
                     />
                   </div>
 
@@ -210,13 +239,9 @@ export function ProviderFormDialog({ open, onOpenChange, provider, onSubmit, exi
                       type="password"
                       value={apiKey}
                       onChange={(e) => setApiKey(e.target.value)}
-                      placeholder={isEdit ? t("form.apiKeyEditPlaceholder") : t("form.apiKeyPlaceholder")}
+                      placeholder={t("form.apiKeyPlaceholder")}
+                      className="text-base md:text-sm"
                     />
-                    {isEdit && apiKey === "***" && (
-                      <p className="text-xs text-muted-foreground">
-                        {t("form.apiKeySetHint")}
-                      </p>
-                    )}
                   </div>
                 </>
               )}
@@ -239,10 +264,10 @@ export function ProviderFormDialog({ open, onOpenChange, provider, onSubmit, exi
             <Button
               onClick={handleSubmit}
               disabled={!name.trim() || !isValidSlug(name) || !providerType || loading}
+              className="gap-1"
             >
-              {loading
-                ? (isEdit ? t("form.saving") : t("form.creating"))
-                : isEdit ? t("form.save") : t("form.create")}
+              {loading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+              {loading ? t("form.creating") : t("form.create")}
             </Button>
           )}
         </DialogFooter>
@@ -250,8 +275,6 @@ export function ProviderFormDialog({ open, onOpenChange, provider, onSubmit, exi
     </Dialog>
   );
 }
-
-// --- Provider type select dropdown ---
 
 function ProviderTypeSelect({ value, hasClaudeCLI, alreadyAddedLabel, providerTypeLabel, onChange }: {
   value: string;

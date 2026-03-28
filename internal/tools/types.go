@@ -3,6 +3,8 @@ package tools
 import (
 	"context"
 
+	"github.com/google/uuid"
+
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
@@ -50,9 +52,14 @@ type InterceptorAware interface {
 	SetMemoryInterceptor(*MemoryInterceptor)
 }
 
-// GroupWriterAware tools receive a GroupWriterCache for group permission checks.
-type GroupWriterAware interface {
-	SetGroupWriterCache(*store.GroupWriterCache)
+// ConfigPermAware tools receive a ConfigPermissionStore for group permission checks.
+type ConfigPermAware interface {
+	SetConfigPermStore(store.ConfigPermissionStore)
+}
+
+// WorkspaceInterceptorAware tools can receive a WorkspaceInterceptor for team workspace validation.
+type WorkspaceInterceptorAware interface {
+	SetWorkspaceInterceptor(*WorkspaceInterceptor)
 }
 
 // MemoryStoreAware tools can receive a MemoryStore for Postgres queries.
@@ -92,6 +99,22 @@ type ChannelSender func(ctx context.Context, channel, chatID, content string) er
 // ChannelSenderAware tools can receive a channel sender function.
 type ChannelSenderAware interface {
 	SetChannelSender(ChannelSender)
+}
+
+// ChannelTenantChecker returns the tenant UUID for a channel instance.
+// Used by the message tool to prevent cross-tenant sends.
+// Returns (tenantID, exists). Zero tenantID means legacy/config-based channel.
+type ChannelTenantChecker func(channelName string) (tenantID uuid.UUID, exists bool)
+
+// ChannelTenantCheckerAware tools can receive a channel tenant checker.
+type ChannelTenantCheckerAware interface {
+	SetChannelTenantChecker(ChannelTenantChecker)
+}
+
+// ChannelAware is optionally implemented by tools that only work on specific channel types.
+// Tools implementing this are filtered out when the current channel type doesn't match.
+type ChannelAware interface {
+	RequiredChannelTypes() []string
 }
 
 // ToProviderDef converts a Tool to a providers.ToolDefinition for LLM APIs.
