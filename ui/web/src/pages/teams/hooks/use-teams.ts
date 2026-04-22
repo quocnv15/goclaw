@@ -256,10 +256,10 @@ export function useTeams() {
     [ws],
   );
 
-  const updateTeamSettings = useCallback(
-    async (teamId: string, settings: TeamAccessSettings) => {
+  const updateTeam = useCallback(
+    async (teamId: string, patch: { name?: string; description?: string; settings?: TeamAccessSettings }) => {
       try {
-        await ws.call(Methods.TEAMS_UPDATE, { teamId, settings });
+        await ws.call(Methods.TEAMS_UPDATE, { teamId, ...patch });
         toast.success(i18next.t("teams:toast.updated"));
       } catch (err) {
         toast.error(i18next.t("teams:toast.failedUpdate"), userFriendlyError(err));
@@ -269,21 +269,10 @@ export function useTeams() {
     [ws],
   );
 
-  const getKnownUsers = useCallback(
-    async (teamId: string): Promise<string[]> => {
-      const res = await ws.call<{ users: string[] }>(
-        Methods.TEAMS_KNOWN_USERS,
-        { teamId },
-      );
-      return res.users ?? [];
-    },
-    [ws],
-  );
-
   return {
     teams, loading, load, createTeam, deleteTeam, getTeam, getTeamTasks, getTeamScopes,
     getTaskDetail, getTaskLight, approveTask, rejectTask, addTaskComment, getTaskComments, getTaskEvents,
     createTask, deleteTask, deleteTasksBulk, assignTask,
-    addMember, removeMember, updateTeamSettings, getKnownUsers,
+    addMember, removeMember, updateTeam,
   };
 }

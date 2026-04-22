@@ -46,9 +46,6 @@ func Default() *Config {
 			RateLimitRPM:    20,
 		},
 		Tools: ToolsConfig{
-			Web: WebToolsConfig{
-				DuckDuckGo: DuckDuckGoConfig{Enabled: true, MaxResults: 5},
-			},
 			Browser: BrowserToolConfig{
 				Enabled:  true,
 				Headless: true,
@@ -71,7 +68,6 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			cfg.applyEnvOverrides()
-			cfg.applyContextPruningDefaults()
 			return cfg, nil
 		}
 		return nil, fmt.Errorf("read config: %w", err)
@@ -82,7 +78,6 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg.applyEnvOverrides()
-	cfg.applyContextPruningDefaults()
 	return cfg, nil
 }
 
@@ -122,7 +117,7 @@ func (c *Config) applyEnvOverrides() {
 	envStr("GOCLAW_LARK_APP_SECRET", &c.Channels.Feishu.AppSecret)
 	envStr("GOCLAW_LARK_ENCRYPT_KEY", &c.Channels.Feishu.EncryptKey)
 	envStr("GOCLAW_LARK_VERIFICATION_TOKEN", &c.Channels.Feishu.VerificationToken)
-	envStr("GOCLAW_WHATSAPP_BRIDGE_URL", &c.Channels.WhatsApp.BridgeURL)
+	// WhatsApp no longer needs bridge_url — runs natively via whatsmeow.
 	envStr("GOCLAW_SLACK_BOT_TOKEN", &c.Channels.Slack.BotToken)
 	envStr("GOCLAW_SLACK_APP_TOKEN", &c.Channels.Slack.AppToken)
 	envStr("GOCLAW_SLACK_USER_TOKEN", &c.Channels.Slack.UserToken)
@@ -146,9 +141,7 @@ func (c *Config) applyEnvOverrides() {
 	if c.Channels.Feishu.AppID != "" && c.Channels.Feishu.AppSecret != "" {
 		c.Channels.Feishu.Enabled = true
 	}
-	if c.Channels.WhatsApp.BridgeURL != "" {
-		c.Channels.WhatsApp.Enabled = true
-	}
+	// WhatsApp is enabled via config or DB instances (no bridge_url needed).
 	if c.Channels.Slack.BotToken != "" && c.Channels.Slack.AppToken != "" {
 		c.Channels.Slack.Enabled = true
 	}
@@ -216,6 +209,17 @@ func (c *Config) applyEnvOverrides() {
 		c.Gateway.OwnerIDs = ids
 	}
 
+	// Allowed origins from env (comma-separated, whitespace-trimmed)
+	if v := os.Getenv("GOCLAW_ALLOWED_ORIGINS"); v != "" {
+		var origins []string
+		for origin := range strings.SplitSeq(v, ",") {
+			if trimmed := strings.TrimSpace(origin); trimmed != "" {
+				origins = append(origins, trimmed)
+			}
+		}
+		c.Gateway.AllowedOrigins = origins
+	}
+
 	// Tailscale (tsnet)
 	envStr("GOCLAW_TSNET_HOSTNAME", &c.Tailscale.Hostname)
 	envStr("GOCLAW_TSNET_AUTH_KEY", &c.Tailscale.AuthKey)
@@ -273,29 +277,6 @@ func (c *Config) applyEnvOverrides() {
 	}
 }
 
-// applyContextPruningDefaults auto-enables context pruning when the Anthropic
-// provider is configured, matching TS applyContextPruningDefaults() in
-// src/config/defaults.ts.
-//
-// Go port does not have OAuth vs API-key distinction — we always treat it as
-// API-key mode.
-func (c *Config) applyContextPruningDefaults() {
-	// Only apply when Anthropic is configured.
-	if c.Providers.Anthropic.APIKey == "" {
-		return
-	}
-
-	defaults := &c.Agents.Defaults
-
-	// Auto-enable context pruning if mode not explicitly set.
-	if defaults.ContextPruning == nil {
-		defaults.ContextPruning = &ContextPruningConfig{
-			Mode: "cache-ttl",
-		}
-	} else if defaults.ContextPruning.Mode == "" {
-		defaults.ContextPruning.Mode = "cache-ttl"
-	}
-}
 
 // Save writes the config to a JSON file.
 func Save(path string, cfg *Config) error {
@@ -419,7 +400,6 @@ func (c *Config) ResolveDisplayName(agentID string) string {
 // Call this after modifying config to restore runtime secrets from env vars.
 func (c *Config) ApplyEnvOverrides() {
 	c.applyEnvOverrides()
-	c.applyContextPruningDefaults()
 }
 
 // ExpandHome replaces leading ~ with the user home directory.

@@ -10,6 +10,8 @@ import (
 
 // buildFilteredTools resolves the per-iteration tool definitions based on policy,
 // disabled tools, bootstrap mode, skill visibility, channel type, and iteration budget.
+// Per-user MCP tools must be registered in the Registry before calling this function
+// (via getUserMCPTools) so they are included in policy filtering and execution.
 // Returns tool definitions for the provider, an allowed-tools map for execution validation,
 // and the (potentially modified) messages slice when final-iteration stripping appends a hint.
 func (l *Loop) buildFilteredTools(req *RunRequest, hadBootstrap bool, iteration, maxIter int, messages []providers.Message) ([]providers.ToolDefinition, map[string]bool, []providers.Message) {
@@ -24,6 +26,20 @@ func (l *Loop) buildFilteredTools(req *RunRequest, hadBootstrap bool, iteration,
 		}
 	} else {
 		toolDefs = l.tools.ProviderDefs()
+	}
+
+	// V3 orchestration mode filtering: hide tools the agent shouldn't see.
+	// spawn: no delegate/team_tasks. delegate: no team_tasks. team: all.
+	if orchDeny := orchModeDenyTools(l.orchMode); len(orchDeny) > 0 {
+		filtered := toolDefs[:0:0]
+		for _, td := range toolDefs {
+			if !orchDeny[td.Function.Name] {
+				filtered = append(filtered, td)
+			} else {
+				delete(allowedTools, td.Function.Name)
+			}
+		}
+		toolDefs = filtered
 	}
 
 	// Per-tenant tool exclusions: remove tools disabled for this agent's tenant.

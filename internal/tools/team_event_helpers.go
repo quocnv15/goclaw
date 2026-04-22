@@ -90,6 +90,16 @@ func WithChatID(id string) TaskEventOption {
 	return func(p *protocol.TeamTaskEventPayload) { p.ChatID = id }
 }
 
+// WithPeerKind sets PeerKind on the payload for correct session routing (#266).
+func WithPeerKind(pk string) TaskEventOption {
+	return func(p *protocol.TeamTaskEventPayload) { p.PeerKind = pk }
+}
+
+// WithLocalKey sets LocalKey on the payload for forum topic routing.
+func WithLocalKey(lk string) TaskEventOption {
+	return func(p *protocol.TeamTaskEventPayload) { p.LocalKey = lk }
+}
+
 // WithCommentText sets CommentText on the payload.
 func WithCommentText(t string) TaskEventOption {
 	return func(p *protocol.TeamTaskEventPayload) { p.CommentText = t }
@@ -103,13 +113,15 @@ func WithProgress(percent int, step string) TaskEventOption {
 	}
 }
 
-// WithContextInfo extracts UserID, Channel, and ChatID from the context
+// WithContextInfo extracts UserID, Channel, ChatID, and PeerKind from the context
 // using standard tool context accessors.
 func WithContextInfo(ctx context.Context) TaskEventOption {
 	return func(p *protocol.TeamTaskEventPayload) {
 		p.UserID = store.UserIDFromContext(ctx)
 		p.Channel = ToolChannelFromCtx(ctx)
 		p.ChatID = ToolChatIDFromCtx(ctx)
+		p.PeerKind = ToolPeerKindFromCtx(ctx)
+		p.LocalKey = ToolLocalKeyFromCtx(ctx)
 	}
 }
 

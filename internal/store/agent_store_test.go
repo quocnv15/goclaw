@@ -6,13 +6,159 @@ import (
 	"testing"
 )
 
+func TestParseReasoningConfigDefaultsToOff(t *testing.T) {
+	agent := &AgentData{}
+
+	got := agent.ParseReasoningConfig()
+	if got.OverrideMode != ReasoningOverrideInherit {
+		t.Fatalf("OverrideMode = %q, want %q", got.OverrideMode, ReasoningOverrideInherit)
+	}
+	if got.Effort != "off" {
+		t.Fatalf("Effort = %q, want off", got.Effort)
+	}
+	if got.Fallback != ReasoningFallbackDowngrade {
+		t.Fatalf("Fallback = %q, want %q", got.Fallback, ReasoningFallbackDowngrade)
+	}
+	if got.Source != ReasoningSourceUnset {
+		t.Fatalf("Source = %q, want %q", got.Source, ReasoningSourceUnset)
+	}
+}
+
+func TestParseReasoningConfigUsesLegacyThinkingLevel(t *testing.T) {
+	agent := &AgentData{
+		ThinkingLevel: "medium",
+	}
+
+	got := agent.ParseReasoningConfig()
+	if got.Effort != "medium" {
+		t.Fatalf("Effort = %q, want medium", got.Effort)
+	}
+	if got.OverrideMode != ReasoningOverrideCustom {
+		t.Fatalf("OverrideMode = %q, want %q", got.OverrideMode, ReasoningOverrideCustom)
+	}
+	if got.Source != ReasoningSourceLegacy {
+		t.Fatalf("Source = %q, want %q", got.Source, ReasoningSourceLegacy)
+	}
+}
+
+func TestParseReasoningConfigPrefersAdvancedSettings(t *testing.T) {
+	agent := &AgentData{
+		ThinkingLevel:   "high",
+		ReasoningConfig: json.RawMessage(`{"effort": "xhigh", "fallback": "provider_default"}`),
+	}
+
+	got := agent.ParseReasoningConfig()
+	if got.Effort != "xhigh" {
+		t.Fatalf("Effort = %q, want xhigh", got.Effort)
+	}
+	if got.OverrideMode != ReasoningOverrideCustom {
+		t.Fatalf("OverrideMode = %q, want %q", got.OverrideMode, ReasoningOverrideCustom)
+	}
+	if got.Fallback != ReasoningFallbackProviderDefault {
+		t.Fatalf("Fallback = %q, want %q", got.Fallback, ReasoningFallbackProviderDefault)
+	}
+	if got.Source != ReasoningSourceAdvanced {
+		t.Fatalf("Source = %q, want %q", got.Source, ReasoningSourceAdvanced)
+	}
+}
+
+func TestParseReasoningConfigKeepsLegacyEffortWhenAdvancedOnlySetsFallback(t *testing.T) {
+	agent := &AgentData{
+		ThinkingLevel:   "medium",
+		ReasoningConfig: json.RawMessage(`{"fallback": "off"}`),
+	}
+
+	got := agent.ParseReasoningConfig()
+	if got.Effort != "medium" {
+		t.Fatalf("Effort = %q, want medium", got.Effort)
+	}
+	if got.Fallback != ReasoningFallbackDisable {
+		t.Fatalf("Fallback = %q, want %q", got.Fallback, ReasoningFallbackDisable)
+	}
+}
+
+func TestParseReasoningConfigPreservesExplicitInherit(t *testing.T) {
+	agent := &AgentData{
+		ThinkingLevel:   "high",
+		ReasoningConfig: json.RawMessage(`{"override_mode": "inherit"}`),
+	}
+
+	got := agent.ParseReasoningConfig()
+	if got.OverrideMode != ReasoningOverrideInherit {
+		t.Fatalf("OverrideMode = %q, want %q", got.OverrideMode, ReasoningOverrideInherit)
+	}
+	if got.Effort != "off" {
+		t.Fatalf("Effort = %q, want off", got.Effort)
+	}
+	if got.Source != ReasoningSourceUnset {
+		t.Fatalf("Source = %q, want %q", got.Source, ReasoningSourceUnset)
+	}
+}
+
+func TestParseProviderReasoningConfigNormalizesDefaults(t *testing.T) {
+	settings := json.RawMessage(`{
+		"reasoning_defaults": {"effort": " xhigh ", "fallback": "provider_default"}
+	}`)
+
+	got := ParseProviderReasoningConfig(settings)
+	if got == nil {
+		t.Fatal("ParseProviderReasoningConfig() = nil, want config")
+	}
+	if got.Effort != "xhigh" {
+		t.Fatalf("Effort = %q, want xhigh", got.Effort)
+	}
+	if got.Fallback != ReasoningFallbackProviderDefault {
+		t.Fatalf("Fallback = %q, want %q", got.Fallback, ReasoningFallbackProviderDefault)
+	}
+}
+
+func TestResolveEffectiveReasoningConfigUsesProviderDefaults(t *testing.T) {
+	got := ResolveEffectiveReasoningConfig(
+		&ProviderReasoningConfig{Effort: "medium", Fallback: ReasoningFallbackDisable},
+		AgentReasoningConfig{OverrideMode: ReasoningOverrideInherit},
+	)
+
+	if got.OverrideMode != ReasoningOverrideInherit {
+		t.Fatalf("OverrideMode = %q, want %q", got.OverrideMode, ReasoningOverrideInherit)
+	}
+	if got.Effort != "medium" {
+		t.Fatalf("Effort = %q, want medium", got.Effort)
+	}
+	if got.Fallback != ReasoningFallbackDisable {
+		t.Fatalf("Fallback = %q, want %q", got.Fallback, ReasoningFallbackDisable)
+	}
+	if got.Source != ReasoningSourceProviderDefault {
+		t.Fatalf("Source = %q, want %q", got.Source, ReasoningSourceProviderDefault)
+	}
+}
+
+func TestResolveEffectiveReasoningConfigPreservesCustomAgentReasoning(t *testing.T) {
+	got := ResolveEffectiveReasoningConfig(
+		&ProviderReasoningConfig{Effort: "medium", Fallback: ReasoningFallbackDisable},
+		AgentReasoningConfig{
+			OverrideMode: ReasoningOverrideCustom,
+			Effort:       "xhigh",
+			Fallback:     ReasoningFallbackProviderDefault,
+			Source:       ReasoningSourceAdvanced,
+		},
+	)
+
+	if got.OverrideMode != ReasoningOverrideCustom {
+		t.Fatalf("OverrideMode = %q, want %q", got.OverrideMode, ReasoningOverrideCustom)
+	}
+	if got.Effort != "xhigh" {
+		t.Fatalf("Effort = %q, want xhigh", got.Effort)
+	}
+	if got.Source != ReasoningSourceAdvanced {
+		t.Fatalf("Source = %q, want %q", got.Source, ReasoningSourceAdvanced)
+	}
+}
+
 func TestParseChatGPTOAuthRoutingNormalizesNames(t *testing.T) {
 	agent := &AgentData{
-		OtherConfig: json.RawMessage(`{
-			"chatgpt_oauth_routing": {
-				"strategy": "round_robin",
-				"extra_provider_names": [" openai-codex-backup ", "", "openai-codex-backup", "openai-codex-team"]
-			}
+		ChatGPTOAuthRouting: json.RawMessage(`{
+			"strategy": "round_robin",
+			"extra_provider_names": [" openai-codex-backup ", "", "openai-codex-backup", "openai-codex-team"]
 		}`),
 	}
 
@@ -35,11 +181,9 @@ func TestParseChatGPTOAuthRoutingNormalizesNames(t *testing.T) {
 
 func TestParseChatGPTOAuthRoutingFallsBackToManual(t *testing.T) {
 	agent := &AgentData{
-		OtherConfig: json.RawMessage(`{
-			"chatgpt_oauth_routing": {
-				"strategy": "something_else",
-				"extra_provider_names": ["openai-codex-backup"]
-			}
+		ChatGPTOAuthRouting: json.RawMessage(`{
+			"strategy": "something_else",
+			"extra_provider_names": ["openai-codex-backup"]
 		}`),
 	}
 
@@ -54,11 +198,9 @@ func TestParseChatGPTOAuthRoutingFallsBackToManual(t *testing.T) {
 
 func TestParseChatGPTOAuthRoutingManualWithoutExtrasPreservesExplicitSingleAccount(t *testing.T) {
 	agent := &AgentData{
-		OtherConfig: json.RawMessage(`{
-			"chatgpt_oauth_routing": {
-				"strategy": "manual",
-				"extra_provider_names": []
-			}
+		ChatGPTOAuthRouting: json.RawMessage(`{
+			"strategy": "manual",
+			"extra_provider_names": []
 		}`),
 	}
 
@@ -76,10 +218,8 @@ func TestParseChatGPTOAuthRoutingManualWithoutExtrasPreservesExplicitSingleAccou
 
 func TestParseChatGPTOAuthRoutingPreservesExplicitInheritMode(t *testing.T) {
 	agent := &AgentData{
-		OtherConfig: json.RawMessage(`{
-			"chatgpt_oauth_routing": {
-				"override_mode": "inherit"
-			}
+		ChatGPTOAuthRouting: json.RawMessage(`{
+			"override_mode": "inherit"
 		}`),
 	}
 
@@ -110,6 +250,38 @@ func TestResolveEffectiveChatGPTOAuthRoutingUsesProviderDefaultsWhenAgentUnset(t
 	}
 	if !reflect.DeepEqual(got.ExtraProviderNames, []string{"codex-work"}) {
 		t.Fatalf("ExtraProviderNames = %#v, want %#v", got.ExtraProviderNames, []string{"codex-work"})
+	}
+}
+
+func TestResolveEffectiveChatGPTOAuthRoutingAllowsInheritWithoutSavedProviderPool(t *testing.T) {
+	override := &ChatGPTOAuthRoutingConfig{
+		OverrideMode: ChatGPTOAuthOverrideInherit,
+	}
+
+	got := ResolveEffectiveChatGPTOAuthRouting(nil, override)
+	if got != nil {
+		t.Fatalf("ResolveEffectiveChatGPTOAuthRouting() = %#v, want nil", got)
+	}
+}
+
+func TestResolveEffectiveChatGPTOAuthRoutingInheritForwardsProviderDefaults(t *testing.T) {
+	defaults := &ChatGPTOAuthRoutingConfig{
+		Strategy:           ChatGPTOAuthStrategyRoundRobin,
+		ExtraProviderNames: []string{"codex-work"},
+	}
+	override := &ChatGPTOAuthRoutingConfig{
+		OverrideMode: ChatGPTOAuthOverrideInherit,
+	}
+
+	got := ResolveEffectiveChatGPTOAuthRouting(defaults, override)
+	if got == nil {
+		t.Fatal("ResolveEffectiveChatGPTOAuthRouting() = nil, want config forwarding provider defaults")
+	}
+	if got.Strategy != ChatGPTOAuthStrategyRoundRobin {
+		t.Fatalf("Strategy = %q, want %q", got.Strategy, ChatGPTOAuthStrategyRoundRobin)
+	}
+	if !reflect.DeepEqual(got.ExtraProviderNames, []string{"codex-work"}) {
+		t.Fatalf("ExtraProviderNames = %#v, want provider defaults", got.ExtraProviderNames)
 	}
 }
 

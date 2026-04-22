@@ -98,6 +98,14 @@ func (m *TeamToolManager) ProcessPendingTasks(ctx context.Context, teamID uuid.U
 			slog.Warn("post_turn: assign failed", "task_id", task.ID, "error", err)
 			continue
 		}
+		taskPeerKind := ""
+		if pk, ok := task.Metadata[TaskMetaPeerKind].(string); ok {
+			taskPeerKind = pk
+		}
+		taskLocalKey := ""
+		if lk, ok := task.Metadata[TaskMetaLocalKey].(string); ok {
+			taskLocalKey = lk
+		}
 		m.broadcastTeamEvent(ctx, protocol.EventTeamTaskDispatched, BuildTaskEventPayload(
 			teamID.String(), task.ID.String(),
 			store.TeamTaskStatusInProgress,
@@ -106,6 +114,8 @@ func (m *TeamToolManager) ProcessPendingTasks(ctx context.Context, teamID uuid.U
 			WithOwnerAgentKey(m.agentKeyFromID(ctx, *task.OwnerAgentID)),
 			WithChannel(task.Channel),
 			WithChatID(task.ChatID),
+			WithPeerKind(taskPeerKind),
+			WithLocalKey(taskLocalKey),
 		))
 		// Restore leader's trace context from task metadata (ctx here is the
 		// consumer goroutine context which has no trace after the turn ends).
@@ -177,6 +187,7 @@ func (m *TeamToolManager) notifyLeaderCycleError(ctx context.Context, teamID uui
 		ChatID:   chatID,
 		AgentID:  leadAgent.AgentKey,
 		UserID:   team.CreatedBy,
+		PeerKind: ToolPeerKindFromCtx(ctx),
 		TenantID: store.TenantIDFromContext(ctx),
 		Content:  content,
 	})

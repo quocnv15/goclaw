@@ -3,6 +3,7 @@ package bus
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -12,6 +13,7 @@ import (
 type MediaFile struct {
 	Path     string `json:"path"`
 	MimeType string `json:"mime_type,omitempty"` // e.g. "application/pdf", "image/jpeg"
+	Filename string `json:"filename,omitempty"`  // original user-provided filename, e.g. "Báo cáo Q4.pdf"; empty → UUID fallback in persistMedia
 }
 
 // InboundMessage represents a message received from a channel (Telegram, Discord, etc.)
@@ -33,11 +35,14 @@ type InboundMessage struct {
 
 // OutboundMessage represents a message to be sent to a channel.
 type OutboundMessage struct {
-	Channel  string            `json:"channel"`
-	ChatID   string            `json:"chat_id"`
-	Content  string            `json:"content"`
-	Media    []MediaAttachment `json:"media,omitempty"`    // optional media attachments
-	Metadata map[string]string `json:"metadata,omitempty"` // channel-specific metadata
+	Channel         string            `json:"channel"`
+	ChatID          string            `json:"chat_id"`
+	Content         string            `json:"content"`
+	Media           []MediaAttachment `json:"media,omitempty"`              // optional media attachments
+	Metadata        map[string]string `json:"metadata,omitempty"`           // channel-specific metadata
+	TenantID        uuid.UUID         `json:"tenant_id,omitempty"`          // tenant scope for per-tenant TTS
+	AgentID         uuid.UUID         `json:"agent_id,omitempty"`           // agent scope for per-agent TTS voice override
+	AgentOtherConfig []byte           `json:"agent_other_config,omitempty"` // agent's other_config for TTS voice/model
 }
 
 // MediaAttachment represents a media file to be sent with a message.
@@ -98,6 +103,7 @@ const (
 	TopicSystemConfigChanged   = "system_config:changed"
 	TopicPairingRevoked        = "pairing:revoked"
 	TopicAgentStatusChanged    = "agent:status_changed"
+	TopicAgentDeleted          = "agent:deleted"
 )
 
 // EventPairingRevoked is the event name broadcast when a paired device is revoked.
@@ -119,6 +125,13 @@ type AgentStatusChangedPayload struct {
 	NewStatus string `json:"new_status"`
 }
 
+// AgentDeletedPayload carries agent deletion info for async cleanup (e.g. orphaned provider removal).
+type AgentDeletedPayload struct {
+	AgentKey string    `json:"agent_key"`
+	Provider string    `json:"provider,omitempty"` // provider name for orphan cleanup
+	TenantID uuid.UUID `json:"tenant_id,omitempty"`
+}
+
 // AuditEventPayload carries audit log data emitted by handlers.
 // A single subscriber persists these to the activity_logs table.
 type AuditEventPayload struct {
@@ -133,10 +146,16 @@ type AuditEventPayload struct {
 }
 
 // CacheInvalidatePayload signals cache layers to evict stale entries.
-// Used with protocol.EventCacheInvalidate events.
+// Used with protocol.EventCacheInvalidate events. Events are delivered
+// in-process via MessageBus and never marshaled to the wire, so the json
+// tags are documentation-only (and omitempty on uuid.UUID is a no-op
+// because uuid.UUID is [16]byte — all-zero arrays don't count as empty).
 type CacheInvalidatePayload struct {
 	Kind string `json:"kind"` // CacheKind* constants
 	Key  string `json:"key"`  // agent_key, agent_id, etc. Empty = invalidate all
+	// TenantID scopes the invalidation to a single tenant. uuid.Nil means
+	// global (master admin action) — subscribers treat it as "invalidate all".
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 // MessageHandler handles an inbound message from a specific channel.
@@ -159,4 +178,16 @@ type MessageRouter interface {
 	ConsumeInbound(ctx context.Context) (InboundMessage, bool)
 	PublishOutbound(msg OutboundMessage)
 	SubscribeOutbound(ctx context.Context) (OutboundMessage, bool)
+}
+
+// IsInternalSender returns true if the senderID belongs to an internal system
+// component (not a real channel user). These should not be stored as contacts
+// and must be rejected by per-user permission checks in group contexts (#915).
+func IsInternalSender(senderID string) bool {
+	return strings.HasPrefix(senderID, "system:") ||
+		strings.HasPrefix(senderID, "notification:") ||
+		strings.HasPrefix(senderID, "teammate:") ||
+		strings.HasPrefix(senderID, "ticker:") ||
+		strings.HasPrefix(senderID, "subagent:") ||
+		senderID == "session_send_tool"
 }
