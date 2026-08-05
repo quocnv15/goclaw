@@ -40,6 +40,8 @@ services:
     env_file:
       - path: .env
         required: false
+      - path: .env.local
+        required: false
     environment:
       - GOCLAW_HOST=0.0.0.0
       - GOCLAW_PORT=18790
@@ -54,7 +56,7 @@ services:
       - BITRIX24_DEBUG_UNREDACTED_TOKEN=${BITRIX24_DEBUG_UNREDACTED_TOKEN:-0}
     volumes:
       - goclaw-data:/app/data
-      - goclaw-workspace:/app/workspace
+      - /Volumes/Workspace:/app/workspace
     extra_hosts:
       - "host.docker.internal:host-gateway"
     security_opt:
@@ -81,7 +83,6 @@ services:
 
 volumes:
   goclaw-data:
-  goclaw-workspace:
 
 networks:
   goclaw-net:

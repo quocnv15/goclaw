@@ -306,13 +306,14 @@ func (s *SQLiteMCPServerStore) scanAccessibleRows(rows *sql.Rows) ([]store.MCPAc
 		var displayName, command, url, apiKey, toolPrefix *string
 		var args, headers, env *[]byte
 		var toolAllowJSON, toolDenyJSON *[]byte
+		var settingsJSON []byte
 
 		createdAt, updatedAt := scanTimePair()
 		if err := rows.Scan(
 			&srv.ID, &srv.Name, &displayName, &srv.Transport, &command,
 			&args, &url, &headers, &env,
 			&apiKey, &toolPrefix, &srv.TimeoutSec,
-			&srv.Settings, &srv.Enabled, &srv.CreatedBy, createdAt, updatedAt,
+			&settingsJSON, &srv.Enabled, &srv.CreatedBy, createdAt, updatedAt,
 			&toolAllowJSON, &toolDenyJSON,
 		); err != nil {
 			continue
@@ -326,6 +327,7 @@ func (s *SQLiteMCPServerStore) scanAccessibleRows(rows *sql.Rows) ([]store.MCPAc
 		srv.Args = derefBytes(args)
 		srv.Headers = s.decryptJSON(derefBytes(headers))
 		srv.Env = s.decryptJSON(derefBytes(env))
+		srv.Settings = settingsJSON
 		if apiKey != nil && *apiKey != "" && s.encKey != "" {
 			if decrypted, err := crypto.Decrypt(*apiKey, s.encKey); err == nil {
 				srv.APIKey = decrypted

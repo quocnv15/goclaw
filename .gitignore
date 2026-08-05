@@ -115,3 +115,6 @@ ui/web/nginx.staging.conf
 **/debug-*.log
 /*.sql
 scripts/docker-patch-*.sql
+gateway.log
+goclaw-cli
+goclaw-mac
